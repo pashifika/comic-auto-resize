@@ -18,6 +18,7 @@
 package images
 
 import (
+	"errors"
 	"image"
 	"io"
 
@@ -26,7 +27,8 @@ import (
 
 type Images interface {
 	Identify(path string, buf mem.FakeReader) error
-	Resize(src image.Image) (dest image.Image, err error)
+	Decoder(path string, r io.Reader) (image.Image, error)
+	Resize(path string, src image.Image) (image.Image, error)
 }
 
 type Decoder interface {
@@ -45,3 +47,12 @@ type Encoder interface {
 type MatchResult interface {
 	Matched(header []byte) bool
 }
+
+// errors
+
+var (
+	ErrUnknownDecoder  = errors.New("unknown decoder")
+	ErrUnknownIdentify = errors.New("unknown identify")
+	ErrUnknownImage    = errors.New("unknown image")
+	ErrRatioValueSmall = errors.New("resize ratio value too small")
+)

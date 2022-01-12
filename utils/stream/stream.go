@@ -20,6 +20,7 @@ package stream
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 
 	"github.com/pashifika/comic-auto-resize/utils/errgroup"
@@ -87,7 +88,17 @@ func (s *Stream) Convert(ctx context.Context, eg *errgroup.Group) error {
 				root := root
 				eg.Go(func() error {
 					buf := s.images[root]
-					return s.Image.Identify(root, buf)
+					err := s.Image.Identify(root, buf)
+					if err != nil {
+						return err
+					}
+					_, _ = buf.Seek(0, io.SeekStart)
+					src, err := s.Image.Decoder(root, buf)
+					if err != nil {
+						return err
+					}
+					_, err = s.Image.Resize(root, src)
+					return err
 				})
 			}
 		}
