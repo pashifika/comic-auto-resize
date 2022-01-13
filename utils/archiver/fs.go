@@ -28,10 +28,10 @@ import (
 	"sync"
 
 	"github.com/mholt/archiver/v4"
+	"github.com/pashifika/util/errgroup"
 	"github.com/pashifika/util/mem"
 
 	"github.com/pashifika/comic-auto-resize/utils/config"
-	"github.com/pashifika/comic-auto-resize/utils/errgroup"
 	"github.com/pashifika/comic-auto-resize/utils/images"
 	"github.com/pashifika/comic-auto-resize/utils/log"
 )

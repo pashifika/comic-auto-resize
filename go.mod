@@ -6,7 +6,7 @@ require (
 	github.com/jessevdk/go-flags v1.5.0
 	github.com/mholt/archiver/v4 v4.0.0-alpha.2
 	github.com/pashifika/resize v0.0.0-20220113112049-f2d23e2995be
-	github.com/pashifika/util v0.2.2
+	github.com/pashifika/util v0.2.3
 	github.com/pixiv/go-libjpeg v0.0.0-20190822045933-3da21a74767d
 	golang.org/x/text v0.3.7
 )
