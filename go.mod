@@ -5,7 +5,7 @@ go 1.17
 require (
 	github.com/jessevdk/go-flags v1.5.0
 	github.com/mholt/archiver/v4 v4.0.0-alpha.2
-	github.com/pashifika/util v0.2.1
+	github.com/pashifika/util v0.2.2
 	github.com/pixiv/go-libjpeg v0.0.0-20190822045933-3da21a74767d
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
 	golang.org/x/text v0.3.7
@@ -28,5 +28,3 @@ require (
 )
 
 replace github.com/mholt/archiver/v4 v4.0.0-alpha.2 => ../archiver/
-
-replace github.com/pashifika/util v0.2.1 => ../util/

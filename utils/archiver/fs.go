@@ -20,6 +20,7 @@ package archiver
 import (
 	"context"
 	"errors"
+	"io"
 	"io/fs"
 	//osPath "path"
 	"path/filepath"
@@ -111,9 +112,9 @@ func (f *FileSystem) FindAll(ctx context.Context, eg *errgroup.Group) error {
 					if err != nil {
 						return err
 					}
-					image := &images.ImageData{
-						SingleFakeIO: mem.NewSingleFakeIO(info.Size(), false),
-					}
+					buf := &mem.FakeIO{}
+					buf.Grow(int(info.Size()))
+					image := &images.ImageData{FakeIO: buf}
 					f.archivers = append(f.archivers, archiver.File{
 						FileInfo:      info,
 						NameInArchive: path,
@@ -151,9 +152,12 @@ func (f *FileSystem) FindAll(ctx context.Context, eg *errgroup.Group) error {
 					return err
 				}
 				image := f.Cache.GetImageBuffer(file.NameInArchive)
-				_, err = af.Read(image.Buf)
+				n, err := io.Copy(image, af)
 				if err != nil {
 					return err
+				}
+				if n != image.Size() {
+					return ErrArchiverReadSize
 				}
 				f.Cache.Send() <- file.NameInArchive
 			}
@@ -163,3 +167,7 @@ func (f *FileSystem) FindAll(ctx context.Context, eg *errgroup.Group) error {
 
 	return err
 }
+
+var (
+	ErrArchiverReadSize = errors.New("archiver file error, can not read all bytes")
+)

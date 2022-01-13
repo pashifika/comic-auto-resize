@@ -24,7 +24,12 @@ import (
 )
 
 type ImageData struct {
-	*mem.SingleFakeIO
+	*mem.FakeIO
+}
+
+func (f *ImageData) Close() error {
+	f.Reset()
+	return nil
 }
 
 func (f *ImageData) Open() (io.ReadCloser, error) {
