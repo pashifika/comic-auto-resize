@@ -25,6 +25,8 @@ import (
 	"github.com/jessevdk/go-flags"
 	"github.com/pashifika/resize"
 	"github.com/pashifika/util/files"
+
+	"github.com/pashifika/comic-auto-resize/utils/log"
 )
 
 type Config struct {
@@ -68,7 +70,8 @@ func InitFlags() Config {
 	parser := flags.NewParser(&opts, flags.Default)
 	args, err := parser.Parse()
 	if err != nil {
-		panic(err)
+		log.Debug("%s", err)
+		os.Exit(10)
 	}
 	parser.Usage = "[OPTIONS] (archiver file / directory)"
 

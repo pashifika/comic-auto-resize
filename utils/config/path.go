@@ -30,7 +30,7 @@ type path struct {
 
 func (p *path) UnmarshalFlag(value string) error {
 	if p.CheckExists && files.Exists(value) {
-		return fmt.Errorf("%s is exists", value)
+		return fmt.Errorf("\n  %s is exists", value)
 	}
 	p.Value = value
 	return nil

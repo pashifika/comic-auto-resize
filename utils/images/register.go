@@ -19,6 +19,8 @@ package images
 
 import (
 	"strings"
+
+	"github.com/pashifika/comic-auto-resize/utils/log"
 )
 
 // RegisterDecoder registers decoder. It should be called during init.
@@ -26,7 +28,7 @@ import (
 func RegisterDecoder(decoder Decoder) {
 	name := strings.TrimLeft(strings.ToLower(decoder.Name()), ".")
 	if _, ok := decoders[name]; ok {
-		panic("decoder " + name + " is already registered")
+		log.Panic("decoder " + name + " is already registered")
 	}
 	decoders[name] = decoder
 }

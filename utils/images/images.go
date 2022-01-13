@@ -126,7 +126,7 @@ func (p *Processing) Resize(path string, src image.Image) (image.Image, error) {
 	if reW <= 500 || reH <= 100 {
 		return nil, ErrRatioValueSmall
 	}
-	log.Debug("resize to: width=%d height=%d", reW, reH)
+	log.Debug("path: %s  resize to: width=%d height=%d", path, reW, reH)
 
 	return resize.Resize(reW, reH, src, p.resizeMode), nil
 }

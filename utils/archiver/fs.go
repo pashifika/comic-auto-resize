@@ -83,7 +83,6 @@ func (f *FileSystem) FindAll(ctx context.Context, eg *errgroup.Group) error {
 		if err != nil {
 			return err
 		}
-		//nameInArchive := osPath.Join(rootInArchive, strings.TrimPrefix(filename, rootOnDisk))
 		if d.IsDir() {
 			switch path {
 			case ".git":

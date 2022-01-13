@@ -52,7 +52,7 @@ func (c *charset) UnmarshalFlag(value string) error {
 			case "ko", "ko-kr":
 				charList = append(charList, korean.EUCKR)
 			default:
-				err = fmt.Errorf("%s charset is not supported", str)
+				err = fmt.Errorf("\n  %s charset is not supported", str)
 				break
 			}
 			checkMap[str] = true
@@ -77,7 +77,7 @@ func (c charset) MarshalFlag() (string, error) {
 		case korean.EUCKR:
 			str = "ko"
 		default:
-			return "", fmt.Errorf("%v is unknown charset", e)
+			return "", fmt.Errorf("\n  %v is unknown charset", e)
 		}
 		if _, ok := checkMap[str]; ok {
 			// Duplicate deletion process
