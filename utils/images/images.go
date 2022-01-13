@@ -32,8 +32,9 @@ import (
 )
 
 type Processing struct {
-	_mu       sync.RWMutex
-	imageInfo map[string]imageInfo // key is file root
+	_mu        sync.RWMutex
+	imageInfo  map[string]imageInfo // key is file root
+	resizeMode resize.InterpolationFunction
 
 	ratio int
 }
@@ -49,6 +50,7 @@ func NewImageProcess() *Processing {
 
 func (p *Processing) Init(conf config.Config) {
 	p.ratio = conf.Ratio
+	p.resizeMode = conf.ResizeMode
 	jpeg := plugs.NewJpeg(
 		conf.Quality, conf.Jpeg.OptimizeCoding, conf.Jpeg.ProgressiveMode,
 		conf.Jpeg.DCTMethod,
@@ -120,7 +122,7 @@ func (p *Processing) Resize(path string, src image.Image) (image.Image, error) {
 	}
 	fmt.Printf("resize: width=%d height=%d\n", reW, reH)
 
-	return resize.Resize(reW, reH, src, resize.Lanczos3), nil
+	return resize.Resize(reW, reH, src, p.resizeMode), nil
 }
 
 func (p *Processing) Extensions() []string {

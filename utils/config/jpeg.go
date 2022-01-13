@@ -18,8 +18,6 @@
 package config
 
 import (
-	"errors"
-
 	"github.com/pixiv/go-libjpeg/jpeg"
 )
 
@@ -34,7 +32,7 @@ func (dct *DCTMethod) UnmarshalFlag(value string) error {
 	case "islow":
 		*dct = (DCTMethod)(jpeg.DCTISlow)
 	default:
-		return errors.New("not supported")
+		return ErrNotSupported
 	}
 	return nil
 }
@@ -52,7 +50,7 @@ func (dct DCTMethod) MarshalFlag() (string, error) {
 	case jpeg.DCTISlow:
 		str = "islow"
 	default:
-		err = errors.New("unknown type")
+		err = ErrUnknownType
 	}
 	return str, err
 }
