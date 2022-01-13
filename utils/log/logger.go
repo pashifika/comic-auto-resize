@@ -61,8 +61,10 @@ func Error(format string, a ...interface{}) {
 
 func Fatal(format string, a ...interface{}) {
 	_, _ = stdLog.stdErr.WriteString("[FATAL] " + fmt.Sprintf(format, a...) + "\n")
+	os.Exit(1)
 }
 
 func Panic(format string, a ...interface{}) {
 	_, _ = stdLog.stdErr.WriteString("[PANIC] " + fmt.Sprintf(format, a...) + "\n")
+	os.Exit(111)
 }

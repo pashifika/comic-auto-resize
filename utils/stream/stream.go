@@ -87,18 +87,22 @@ func (s *Stream) Convert(ctx context.Context, eg *errgroup.Group) error {
 			default:
 				root := root
 				eg.Go(func() error {
-					buf := s.images[root]
+					buf := s.GetImageBuffer(root)
 					err := s.Image.Identify(root, buf)
 					if err != nil {
 						return err
 					}
 					_, _ = buf.Seek(0, io.SeekStart)
 					src, err := s.Image.Decoder(root, buf)
+					buf.Reset() // delete cache image file
 					if err != nil {
 						return err
 					}
-					_, err = s.Image.Resize(root, src)
-					return err
+					src, err = s.Image.Resize(root, src)
+					if err != nil {
+						return err
+					}
+					return s.Image.Encoder(buf, src)
 				})
 			}
 		}

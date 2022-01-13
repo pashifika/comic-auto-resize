@@ -23,7 +23,7 @@ import (
 	"os"
 
 	"github.com/jessevdk/go-flags"
-	"github.com/nfnt/resize"
+	"github.com/pashifika/resize"
 	"github.com/pashifika/util/files"
 )
 

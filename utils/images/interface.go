@@ -29,6 +29,7 @@ type Images interface {
 	Identify(path string, buf mem.FakeReader) error
 	Decoder(path string, r io.Reader) (image.Image, error)
 	Resize(path string, src image.Image) (image.Image, error)
+	Encoder(w io.Writer, src image.Image) error
 }
 
 type Decoder interface {

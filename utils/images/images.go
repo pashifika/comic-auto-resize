@@ -18,12 +18,12 @@
 package images
 
 import (
-	"fmt"
 	"image"
 	"io"
+	"strconv"
 	"sync"
 
-	"github.com/nfnt/resize"
+	"github.com/pashifika/resize"
 	"github.com/pashifika/util/mem"
 
 	"github.com/pashifika/comic-auto-resize/utils/config"
@@ -42,6 +42,12 @@ type Processing struct {
 type imageInfo struct {
 	engine string
 	conf   image.Config
+}
+
+func (i imageInfo) String() string {
+	return "{engine:" + i.engine +
+		", w:" + strconv.Itoa(i.conf.Width) +
+		", h:" + strconv.Itoa(i.conf.Height) + "}"
 }
 
 func NewImageProcess() *Processing {
@@ -78,7 +84,7 @@ func (p *Processing) Identify(path string, buf mem.FakeReader) error {
 		p._mu.Lock()
 		p.imageInfo[path] = imageInfo{engine: name, conf: cfg}
 		p._mu.Unlock()
-		log.Debug("path:%s, image.Config:%v", path, cfg)
+		log.Debug("path: %s  image.Config=%s", path, p.imageInfo[path])
 		return nil
 	}
 	return ErrUnknownImage
@@ -120,9 +126,16 @@ func (p *Processing) Resize(path string, src image.Image) (image.Image, error) {
 	if reW <= 500 || reH <= 100 {
 		return nil, ErrRatioValueSmall
 	}
-	fmt.Printf("resize: width=%d height=%d\n", reW, reH)
+	log.Debug("resize to: width=%d height=%d", reW, reH)
 
 	return resize.Resize(reW, reH, src, p.resizeMode), nil
+}
+
+func (p *Processing) Encoder(w io.Writer, src image.Image) error {
+	if encoder == nil {
+		log.Panic("not find encoder")
+	}
+	return encoder.Encode(w, src)
 }
 
 func (p *Processing) Extensions() []string {

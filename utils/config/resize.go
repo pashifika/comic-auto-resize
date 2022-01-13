@@ -18,7 +18,7 @@
 package config
 
 import (
-	"github.com/nfnt/resize"
+	"github.com/pashifika/resize"
 )
 
 type interpolation struct {
