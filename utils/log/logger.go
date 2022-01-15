@@ -20,11 +20,14 @@ package log
 import (
 	"fmt"
 	"os"
+	"sync"
 )
 
 type Logger struct {
 	stdOut, stdErr *os.File
-	debug          bool
+
+	mu    sync.Mutex
+	debug bool
 }
 
 var stdLog *Logger
@@ -43,28 +46,40 @@ func SetDebug(mode bool) {
 
 func Debug(format string, a ...interface{}) {
 	if stdLog.debug {
+		stdLog.mu.Lock()
 		_, _ = stdLog.stdOut.WriteString("[DEBUG] " + fmt.Sprintf(format, a...) + "\n")
+		stdLog.mu.Unlock()
 	}
 }
 
 func Info(format string, a ...interface{}) {
+	stdLog.mu.Lock()
 	_, _ = stdLog.stdOut.WriteString("[INFO] " + fmt.Sprintf(format, a...) + "\n")
+	stdLog.mu.Unlock()
 }
 
 func Warn(format string, a ...interface{}) {
+	stdLog.mu.Lock()
 	_, _ = stdLog.stdErr.WriteString("[WARN] " + fmt.Sprintf(format, a...) + "\n")
+	stdLog.mu.Unlock()
 }
 
 func Error(format string, a ...interface{}) {
+	stdLog.mu.Lock()
 	_, _ = stdLog.stdErr.WriteString("[ERROR] " + fmt.Sprintf(format, a...) + "\n")
+	stdLog.mu.Unlock()
 }
 
 func Fatal(format string, a ...interface{}) {
+	stdLog.mu.Lock()
 	_, _ = stdLog.stdErr.WriteString("[FATAL] " + fmt.Sprintf(format, a...) + "\n")
+	stdLog.mu.Unlock()
 	os.Exit(1)
 }
 
 func Panic(format string, a ...interface{}) {
+	stdLog.mu.Lock()
 	_, _ = stdLog.stdErr.WriteString("[PANIC] " + fmt.Sprintf(format, a...) + "\n")
+	stdLog.mu.Unlock()
 	os.Exit(111)
 }
