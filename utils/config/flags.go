@@ -54,7 +54,7 @@ type options struct {
 type imageJpeg struct {
 	OptimizeCoding  bool      `long:"optimizer" default-mask:"true" description:"perform optimization of entropy encoding parameters."`
 	ProgressiveMode bool      `long:"progressive" default-mask:"true" description:"create progressive JPEG file."`
-	DCTMethod       DCTMethod `long:"dct" default:"float" choice:"float" choice:"ifast" choice:"islow" description:"set JPEG encoder DCT/IDCT method." long-description:"FLOAT is floating-point: accurate, fast on fast HW. IFAST is faster, less accurate integer method. ISLOW is slow but accurate integer algorithm."`
+	DCTMethod       DCTMethod `long:"dct" default:"ifast" choice:"float" choice:"ifast" choice:"islow" description:"set JPEG encoder DCT/IDCT method." long-description:"FLOAT is floating-point: accurate, fast on fast HW. IFAST is faster, less accurate integer method. ISLOW is slow but accurate integer algorithm."`
 }
 
 type developer struct {
