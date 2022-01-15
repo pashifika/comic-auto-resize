@@ -19,8 +19,8 @@ package config
 
 import (
 	"errors"
-	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/jessevdk/go-flags"
 	"github.com/pashifika/resize"
@@ -70,8 +70,7 @@ func InitFlags() Config {
 	parser := flags.NewParser(&opts, flags.Default)
 	args, err := parser.Parse()
 	if err != nil {
-		log.Debug("%s", err)
-		os.Exit(10)
+		os.Exit(flags.HelpFlag)
 	}
 	parser.Usage = "[OPTIONS] (archiver file / directory)"
 
@@ -80,9 +79,14 @@ func InitFlags() Config {
 		parser.WriteHelp(os.Stderr)
 		os.Exit(flags.HelpFlag)
 	}
-	input := args[0]
+	var input string
+	input, err = filepath.Abs(args[0])
+	if err != nil {
+		log.Error("%s", args[0])
+		os.Exit(flags.IgnoreUnknown)
+	}
 	if !files.Exists(input) {
-		_, _ = os.Stderr.WriteString(fmt.Sprintf("%s does not exist", input))
+		log.Error("%s does not exist", input)
 		os.Exit(flags.IgnoreUnknown)
 	}
 

@@ -19,6 +19,7 @@ package config
 
 import (
 	"fmt"
+	"path/filepath"
 
 	"github.com/pashifika/util/files"
 )
@@ -29,10 +30,14 @@ type path struct {
 }
 
 func (p *path) UnmarshalFlag(value string) error {
-	if p.CheckExists && files.Exists(value) {
-		return fmt.Errorf("\n  %s is exists", value)
+	fp, err := filepath.Abs(value)
+	if err != nil {
+		return err
 	}
-	p.Value = value
+	if p.CheckExists && files.Exists(fp) {
+		return fmt.Errorf("\n  %s is exists", fp)
+	}
+	p.Value = fp
 	return nil
 }
 
