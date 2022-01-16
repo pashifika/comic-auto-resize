@@ -27,7 +27,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/mholt/archiver/v4"
+	"github.com/pashifika/compress"
+	_ "github.com/pashifika/compress/_7zip"
+	_ "github.com/pashifika/compress/rar"
+	_ "github.com/pashifika/compress/zip"
 	"github.com/pashifika/util/errgroup"
 	"github.com/pashifika/util/mem"
 
@@ -37,10 +40,9 @@ import (
 )
 
 type FileSystem struct {
-	fsys       fs.FS
 	_mu        sync.Mutex
-	compressor archiver.Archiver
-	archivers  []archiver.File
+	compressor *compress.FileSystem
+	archivers  []file
 	rootName   string
 	savePath   string
 	deleteOrg  bool
@@ -59,27 +61,26 @@ type stream interface {
 }
 
 func NewFileSystem(conf config.Config) *FileSystem {
-	archiver.AutoEncodings = conf.AutoEncodings
+	vfs := &compress.FileSystem{
+		Charset:     conf.AutoEncodings,
+		SkipCharErr: false,
+	}
 	return &FileSystem{
-		savePath:  conf.OutPut,
-		deleteOrg: conf.DeleteInput,
+		compressor: vfs,
+		savePath:   conf.OutPut,
+		deleteOrg:  conf.DeleteInput,
 	}
 }
 
 // Open is set archiver path or local directory path
-func (f *FileSystem) Open(root string) (err error) {
-	f.fsys, err = archiver.FileSystem(root)
-	if err == nil {
-		f._mu = sync.Mutex{}
-		f.rootName = filepath.Base(root)
-		f.archivers = []archiver.File{}
+func (f *FileSystem) Open(ctx context.Context, root string, eg *errgroup.Group) error {
+	fsys, err := f.compressor.Open(root)
+	if err != nil {
+		return err
 	}
-	return
-}
-
-func (f *FileSystem) FindAll(ctx context.Context, eg *errgroup.Group) error {
-	// Generate a list of files to be converted
-	err := fs.WalkDir(f.fsys, ".", func(path string, d fs.DirEntry, err error) error {
+	f.archivers = []file{}
+	f.rootName = filepath.Base(root)
+	err = fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -87,6 +88,8 @@ func (f *FileSystem) FindAll(ctx context.Context, eg *errgroup.Group) error {
 			switch path {
 			case ".git":
 				return fs.SkipDir
+			case compress.DefaultArchiverRoot:
+				return nil
 			default:
 				var info fs.FileInfo
 				info, err = d.Info()
@@ -96,10 +99,9 @@ func (f *FileSystem) FindAll(ctx context.Context, eg *errgroup.Group) error {
 				if info.Name() == f.rootName {
 					return nil
 				}
-				f.archivers = append(f.archivers, archiver.File{
-					FileInfo:      info,
-					NameInArchive: path,
-					Open:          nil,
+				f.archivers = append(f.archivers, file{
+					FileInfo: info,
+					root:     path,
 				})
 			}
 		} else {
@@ -114,10 +116,12 @@ func (f *FileSystem) FindAll(ctx context.Context, eg *errgroup.Group) error {
 					buf := &mem.FakeIO{}
 					buf.Grow(int(info.Size()))
 					image := &images.ImageData{FakeIO: buf}
-					f.archivers = append(f.archivers, archiver.File{
-						FileInfo:      info,
-						NameInArchive: path,
-						Open:          image.Open,
+					f.archivers = append(f.archivers, file{
+						FileInfo: info,
+						root:     path,
+						read:     image.Read,
+						write:    image.Write,
+						close:    image.Close,
 					})
 					f.Cache.NewImage(image, path)
 				}
@@ -132,6 +136,7 @@ func (f *FileSystem) FindAll(ctx context.Context, eg *errgroup.Group) error {
 		defer func() {
 			f.Cache.WaitGroupDone()
 			f.Cache.CloseSend()
+			_ = f.compressor.Close()
 		}()
 		for _, file := range f.archivers {
 			select {
@@ -146,19 +151,20 @@ func (f *FileSystem) FindAll(ctx context.Context, eg *errgroup.Group) error {
 				if file.IsDir() {
 					continue
 				}
-				af, err := f.fsys.Open(file.NameInArchive)
+				af, err := fsys.Open(file.root)
 				if err != nil {
 					return err
 				}
-				image := f.Cache.GetImageBuffer(file.NameInArchive)
+				image := f.Cache.GetImageBuffer(file.root)
 				n, err := io.Copy(image, af)
+				_ = af.Close()
 				if err != nil {
 					return err
 				}
 				if n != image.Size() {
 					return ErrArchiverReadSize
 				}
-				f.Cache.Send() <- file.NameInArchive
+				f.Cache.Send() <- file.root
 			}
 		}
 		return nil

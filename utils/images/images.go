@@ -92,8 +92,8 @@ func (p *Processing) Identify(path string, buf mem.FakeReader) error {
 
 func (p *Processing) Decoder(path string, r io.Reader) (image.Image, error) {
 	p._mu.RLock()
-	defer p._mu.RUnlock()
 	info, ok := p.imageInfo[path]
+	p._mu.RUnlock()
 	if !ok {
 		return nil, ErrUnknownIdentify
 	}
@@ -111,6 +111,7 @@ func (p *Processing) Resize(path string, src image.Image) (image.Image, error) {
 	p._mu.RLock()
 	info, ok := p.imageInfo[path]
 	if !ok {
+		p._mu.RUnlock()
 		return nil, ErrUnknownIdentify
 	}
 	width := info.conf.Width

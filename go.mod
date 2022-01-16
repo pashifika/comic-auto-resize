@@ -4,7 +4,7 @@ go 1.17
 
 require (
 	github.com/jessevdk/go-flags v1.5.0
-	github.com/mholt/archiver/v4 v4.0.0-alpha.2
+	github.com/pashifika/compress v0.0.0-00010101000000-000000000000
 	github.com/pashifika/resize v0.0.0-20220113112049-f2d23e2995be
 	github.com/pashifika/util v0.2.3
 	github.com/pixiv/go-libjpeg v0.0.0-20190822045933-3da21a74767d
@@ -12,18 +12,20 @@ require (
 )
 
 require (
-	github.com/andybalholm/brotli v1.0.4 // indirect
-	github.com/dsnet/compress v0.0.2-0.20210315054119-f66993602bf5 // indirect
-	github.com/golang/snappy v0.0.4 // indirect
-	github.com/klauspost/compress v1.13.6 // indirect
-	github.com/klauspost/pgzip v1.2.5 // indirect
+	github.com/bodgit/plumbing v1.1.0 // indirect
+	github.com/bodgit/sevenzip v1.1.1 // indirect
+	github.com/bodgit/windows v1.0.0 // indirect
+	github.com/connesc/cipherio v0.2.1 // indirect
+	github.com/hashicorp/errwrap v1.0.0 // indirect
+	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/nwaples/rardecode/v2 v2.0.0-beta.2 // indirect
-	github.com/pierrec/lz4/v4 v4.1.12 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/therootcompany/xz v1.0.1 // indirect
 	github.com/ulikunitz/xz v0.5.10 // indirect
+	go4.org v0.0.0-20200411211856-f5505b9728dd // indirect
 	golang.org/x/net v0.0.0-20211216030914-fe4d6282115f // indirect
 	golang.org/x/sys v0.0.0-20210423082822-04245dca01da // indirect
 )
 
 replace github.com/mholt/archiver/v4 v4.0.0-alpha.2 => ../archiver/
+
+replace github.com/pashifika/compress => ../compress/
