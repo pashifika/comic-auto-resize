@@ -62,6 +62,9 @@ func (p *Processing) Init(conf config.Config) {
 		conf.Jpeg.DCTMethod,
 	)
 	RegisterDecoder(jpeg)
+	RegisterDecoder(plugs.NewBmp())
+	RegisterDecoder(plugs.NewPng())
+	RegisterDecoder(plugs.NewWebp())
 
 	RegisterEncoder(jpeg)
 }
