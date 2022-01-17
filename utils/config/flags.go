@@ -21,6 +21,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/jessevdk/go-flags"
 	"github.com/pashifika/resize"
@@ -33,7 +34,7 @@ type Config struct {
 	AutoEncodings charset
 	Input         string
 	DeleteInput   bool
-	OutPut        string
+	Output        string
 	Ratio         int
 	Quality       int
 	ResizeMode    resize.InterpolationFunction
@@ -43,10 +44,11 @@ type Config struct {
 
 type options struct {
 	AutoEncodings charset       `long:"charset" default:"ja,zh" optional:"yes" description:"decode zip file charset."`
-	OutPut        path          `short:"o" long:"out" description:"set output file path, not empty to delete original file."`
+	DeleteInput   bool          `long:"delete-org" default-mask:"false" description:"enable delete original file."`
+	Output        path          `short:"o" long:"out" description:"set output file path (default is add suffix '_resize' to file name)."`
 	Ratio         pctInt        `short:"r" long:"ratio" default:"70" description:"set resize ratio."`
 	Quality       pctInt        `short:"q" long:"quality" default:"90" description:"set encoder quality."`
-	ResizeMode    interpolation `long:"resize-mode" default:"lanczos3" description:"set resize interpolation mode." long-description:"supported the: nearest-neighbor, bilinear, bicubic, mitchell-netravali, lanczos2, lanczos3."`
+	ResizeMode    interpolation `long:"resize-mode" default:"lanczos3" description:"set resize interpolation mode.\nSupported:\n nearest-neighbor, bilinear, bicubic,\n mitchell-netravali, lanczos2, lanczos3."`
 	Jpeg          imageJpeg     `group:"Jpeg Options"`
 	Developer     developer     `group:"Developer Options"`
 }
@@ -54,16 +56,17 @@ type options struct {
 type imageJpeg struct {
 	OptimizeCoding  bool      `long:"optimizer" default-mask:"true" description:"perform optimization of entropy encoding parameters."`
 	ProgressiveMode bool      `long:"progressive" default-mask:"true" description:"create progressive JPEG file."`
-	DCTMethod       DCTMethod `long:"dct" default:"ifast" choice:"float" choice:"ifast" choice:"islow" description:"set JPEG encoder DCT/IDCT method." long-description:"FLOAT is floating-point: accurate, fast on fast HW. IFAST is faster, less accurate integer method. ISLOW is slow but accurate integer algorithm."`
+	DCTMethod       DCTMethod `long:"dct" default:"ifast" choice:"float" choice:"ifast" choice:"islow" description:"set JPEG encoder DCT/IDCT method.\n FLOAT is floating-point: accurate, fast on fast HW.\n IFAST is faster, less accurate integer method.\n ISLOW is slow but accurate integer algorithm."`
 }
 
 type developer struct {
-	Debug bool `long:"debug" default-mask:"false" description:"enable debug mode"`
+	ShowTime bool `long:"show-time" default-mask:"false" description:"enable show execution time."`
+	Debug    bool `long:"debug" default-mask:"false" description:"enable debug mode."`
 }
 
 func InitFlags() Config {
 	opts := options{
-		OutPut:  path{CheckExists: true},
+		Output:  path{CheckExists: true},
 		Ratio:   pctInt{Default: 70},
 		Quality: pctInt{Default: 90},
 	}
@@ -72,7 +75,7 @@ func InitFlags() Config {
 	if err != nil {
 		os.Exit(flags.HelpFlag)
 	}
-	parser.Usage = "[OPTIONS] (archiver file / directory)"
+	parser.Usage = "[OPTIONS] (archiver file / directory)\nVersion: " + version
 
 	// Parser input file
 	if len(args) != 1 {
@@ -90,19 +93,26 @@ func InitFlags() Config {
 		os.Exit(flags.IgnoreUnknown)
 	}
 
-	// Parser OutPutDir
-	var deleteInput bool
-	outPut := opts.OutPut.Value
-	if opts.OutPut.Value == "" {
-		deleteInput = true
-		outPut = input
+	// Parser OutPut file path
+	output := opts.Output.Value
+	if opts.Output.Value == "" {
+		orgBase := filepath.Base(input)
+		orgExt := filepath.Ext(orgBase)
+		output = filepath.Join(
+			filepath.Dir(input),
+			strings.TrimSuffix(orgBase, orgExt)+"_resize"+orgExt,
+		)
+		if files.Exists(output) {
+			log.Error("%s is exists", output)
+			os.Exit(flags.IgnoreUnknown)
+		}
 	}
 
 	return Config{
 		AutoEncodings: opts.AutoEncodings,
 		Input:         input,
-		DeleteInput:   deleteInput,
-		OutPut:        outPut,
+		DeleteInput:   opts.DeleteInput,
+		Output:        output,
 		Ratio:         opts.Ratio.Value,
 		Quality:       opts.Quality.Value,
 		ResizeMode:    opts.ResizeMode.Value,

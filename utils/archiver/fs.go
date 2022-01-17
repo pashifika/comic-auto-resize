@@ -22,13 +22,11 @@ import (
 	"errors"
 	"io"
 	"io/fs"
-	//osPath "path"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/pashifika/compress"
-	_ "github.com/pashifika/compress/_7zip"
 	_ "github.com/pashifika/compress/rar"
 	_ "github.com/pashifika/compress/zip"
 	"github.com/pashifika/util/errgroup"
@@ -67,7 +65,7 @@ func NewFileSystem(conf config.Config) *FileSystem {
 	}
 	return &FileSystem{
 		compressor: vfs,
-		savePath:   conf.OutPut,
+		savePath:   conf.Output,
 		deleteOrg:  conf.DeleteInput,
 	}
 }
@@ -91,18 +89,21 @@ func (f *FileSystem) Open(ctx context.Context, root string, eg *errgroup.Group) 
 			case compress.DefaultArchiverRoot:
 				return nil
 			default:
-				var info fs.FileInfo
-				info, err = d.Info()
-				if err != nil {
-					return err
-				}
-				if info.Name() == f.rootName {
-					return nil
-				}
-				f.archivers = append(f.archivers, file{
-					FileInfo: info,
-					root:     path,
-				})
+				return nil
+				// --- Directory doesn't make sense when std_zip is compressed?
+				// --- Only need root to set the right zip will create the directory itself?
+				//var info fs.FileInfo
+				//info, err = d.Info()
+				//if err != nil {
+				//	return err
+				//}
+				//if info.Name() == f.rootName {
+				//	return nil
+				//}
+				//f.archivers = append(f.archivers, file{
+				//	FileInfo: info,
+				//	root:     path,
+				//})
 			}
 		} else {
 			// Image file filter

@@ -4,7 +4,7 @@ go 1.17
 
 require (
 	github.com/jessevdk/go-flags v1.5.0
-	github.com/pashifika/compress v0.0.0-00010101000000-000000000000
+	github.com/pashifika/compress v0.1.4
 	github.com/pashifika/resize v0.0.0-20220113112049-f2d23e2995be
 	github.com/pashifika/util v0.2.3
 	github.com/pixiv/go-libjpeg v0.0.0-20190822045933-3da21a74767d
@@ -25,7 +25,3 @@ require (
 	golang.org/x/net v0.0.0-20211216030914-fe4d6282115f // indirect
 	golang.org/x/sys v0.0.0-20210423082822-04245dca01da // indirect
 )
-
-replace github.com/mholt/archiver/v4 v4.0.0-alpha.2 => ../archiver/
-
-replace github.com/pashifika/compress => ../compress/
