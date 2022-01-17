@@ -43,17 +43,7 @@ func (j WEBP) HeaderLen() int { return len(_webpHeader) }
 
 func (j WEBP) Extensions() []string { return _webpExtensions }
 
-func (j WEBP) Matched(header []byte) bool {
-	if len(_webpHeader) != len(header) {
-		return false
-	}
-	for i, c := range header {
-		if _webpHeader[i] != c && _webpHeader[i] != '?' {
-			return false
-		}
-	}
-	return true
-}
+func (j WEBP) Matched(header []byte) bool { return match(_webpHeader, header) }
 
 // DecodeConfig returns the color model and dimensions of a WEBP image without decoding the entire image.
 func (j WEBP) DecodeConfig(r io.Reader) (config image.Config, err error) {
@@ -64,4 +54,17 @@ func (j WEBP) DecodeConfig(r io.Reader) (config image.Config, err error) {
 // Output image has YCbCr colors or 8bit Grayscale.
 func (j WEBP) Decode(r io.Reader) (dest image.Image, err error) {
 	return webp.Decode(r)
+}
+
+// Match reports whether magic matches b. Magic may contain "?" wildcards.
+func match(magic string, b []byte) bool {
+	if len(magic) != len(b) {
+		return false
+	}
+	for i, c := range b {
+		if magic[i] != c && magic[i] != '?' {
+			return false
+		}
+	}
+	return true
 }

@@ -18,7 +18,6 @@
 package plugs
 
 import (
-	"bytes"
 	"image"
 	"io"
 
@@ -44,9 +43,7 @@ func (j BMP) HeaderLen() int { return len(_bmpHeader) }
 
 func (j BMP) Extensions() []string { return _bmpExtensions }
 
-func (j BMP) Matched(header []byte) bool {
-	return bytes.Equal(_bmpHeader, header)
-}
+func (j BMP) Matched(header []byte) bool { return match(_webpHeader, header) }
 
 // DecodeConfig returns the color model and dimensions of a BMP image without decoding the entire image.
 func (j BMP) DecodeConfig(r io.Reader) (config image.Config, err error) {
