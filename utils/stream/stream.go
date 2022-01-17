@@ -91,19 +91,23 @@ func (s *Stream) Convert(ctx context.Context, eg *errgroup.Group) error {
 					buf := s.GetImageBuffer(root)
 					err := s.Image.Identify(root, buf)
 					if err != nil {
-						return err
+						return errWrap("image.Identify", root, err)
 					}
 					_, _ = buf.Seek(0, io.SeekStart)
 					src, err := s.Image.Decoder(root, buf)
 					buf.Reset() // delete cache image file
 					if err != nil {
-						return err
+						return errWrap("image.Decoder", root, err)
 					}
 					src, err = s.Image.Resize(root, src)
 					if err != nil {
-						return err
+						return errWrap("image.Resize", root, err)
 					}
-					return s.Image.Encoder(buf, src)
+					err = s.Image.Encoder(buf, src)
+					if err != nil {
+						return errWrap("image.Encoder", root, err)
+					}
+					return nil
 				})
 			}
 		}
@@ -111,4 +115,8 @@ func (s *Stream) Convert(ctx context.Context, eg *errgroup.Group) error {
 
 	s.wg.Wait()
 	return eg.Wait()
+}
+
+func errWrap(fn, root string, err error) error {
+	return errors.New(fn + ": " + root + " error, " + err.Error())
 }
