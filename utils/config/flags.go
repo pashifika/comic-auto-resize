@@ -75,7 +75,7 @@ func InitFlags() Config {
 	if err != nil {
 		os.Exit(flags.HelpFlag)
 	}
-	parser.Usage = "[OPTIONS] (archiver file / directory)\nVersion: " + version
+	parser.Usage = "[OPTIONS] (compressed file / directory)\nVersion: " + version
 
 	// Parser input file
 	if len(args) != 1 {

@@ -1,5 +1,11 @@
-This is a manga archiver file auto-resize tool
-==============================================
+This is a manga compressed file auto-resize tool
+================================================
+
+Are you still bothered by the size of your comic compressed files?<br>
+Still doing the tedious operation of decompressing files -> other software processing images -> repacking compressed files?<br>
+This tool will do the above work for you, from the open file all processing is done in memory!<br>
+(Make sure your PC / Mac has enough memory for large files.)
+
 
 ## Image format support
 
@@ -10,11 +16,21 @@ This is a manga archiver file auto-resize tool
 | bmp    | true    | false   | local | go std lib                                               |
 | webp   | true    | false   | local | go std lib(incomplete? bug with mozjpeg encoder)         |
 
+
+## Archiver format support
+
+| Format | Test  | Charset | Decoder | Encoder | Password | Info                                                 |
+|--------|-------|---------|---------|---------|----------|------------------------------------------------------|
+| zip    | local | true    | true    | true    | false    | used go std                                          |
+| rar    | local | false   | true    | false   | false    | [rardecode/v2](https://github.com/nwaples/rardecode) |
+
+Rar file password is support for the next version.
+
 Usage:
 ------
 
 ```
-  comic-auto-resize [OPTIONS] (archiver file / directory)
+  comic-auto-resize [OPTIONS] (compressed file / directory)
 Version: v1.0.1
 
 Application Options:
