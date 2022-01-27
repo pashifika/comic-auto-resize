@@ -58,7 +58,7 @@ func main() {
 
 	now := time.Now()
 	eg, ctx := errgroup.WithContext(context.Background(), cpus)
-	err := fs.Open(ctx, conf.Input, eg)
+	err := fs.Open(ctx, conf.Input, conf.Passwd, eg)
 	if err != nil {
 		log.Fatal("%s", err)
 	}

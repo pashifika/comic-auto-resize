@@ -17,7 +17,7 @@ This tool will do the above work for you, from the open file all processing is d
 | webp   | true    | false   | local | go std lib(incomplete? bug with mozjpeg encoder)         |
 
 
-## Archiver format support
+## Compressed format support
 
 | Format | Test  | Charset | Decoder | Encoder | Password | Info                                                 |
 |--------|-------|---------|---------|---------|----------|------------------------------------------------------|

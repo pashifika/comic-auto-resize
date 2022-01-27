@@ -33,6 +33,7 @@ import (
 type Config struct {
 	AutoEncodings charset
 	Input         string
+	Passwd        string
 	DeleteInput   bool
 	Output        string
 	Ratio         int
@@ -45,6 +46,7 @@ type Config struct {
 type options struct {
 	AutoEncodings charset       `long:"charset" default:"ja,zh" optional:"yes" description:"decode zip file charset."`
 	DeleteInput   bool          `long:"delete-org" default-mask:"false" description:"enable delete original file."`
+	Passwd        string        `long:"pwd" description:"enter the password of the compressed file."`
 	Output        path          `short:"o" long:"out" description:"set output file path (default is add suffix '_resize' to file name)."`
 	Ratio         pctInt        `short:"r" long:"ratio" default:"70" description:"set resize ratio."`
 	Quality       pctInt        `short:"q" long:"quality" default:"90" description:"set encoder quality."`
@@ -111,6 +113,7 @@ func InitFlags() Config {
 	return Config{
 		AutoEncodings: opts.AutoEncodings,
 		Input:         input,
+		Passwd:        opts.Passwd,
 		DeleteInput:   opts.DeleteInput,
 		Output:        output,
 		Ratio:         opts.Ratio.Value,

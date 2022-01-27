@@ -71,8 +71,8 @@ func NewFileSystem(conf config.Config) *FileSystem {
 }
 
 // Open is set archiver path or local directory path
-func (f *FileSystem) Open(ctx context.Context, root string, eg *errgroup.Group) error {
-	fsys, err := f.compressor.Open(root)
+func (f *FileSystem) Open(ctx context.Context, root, pwd string, eg *errgroup.Group) error {
+	fsys, err := f.compressor.OpenWithPwd(root, pwd)
 	if err != nil {
 		return err
 	}
