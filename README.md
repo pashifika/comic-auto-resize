@@ -22,9 +22,9 @@ This tool will do the above work for you, from the open file all processing is d
 | Format | Test  | Charset | Decoder | Encoder | Password | Info                                                 |
 |--------|-------|---------|---------|---------|----------|------------------------------------------------------|
 | zip    | local | true    | true    | true    | false    | used go std                                          |
-| rar    | local | false   | true    | false   | false    | [rardecode/v2](https://github.com/nwaples/rardecode) |
+| rar    | local | false   | true    | false   | true     | [rardecode/v2](https://github.com/nwaples/rardecode) |
 
-Rar file password is support for the next version.
+~~Rar file password is support for the next version.~~ (support in v1.1.0)
 
 Usage:
 ------
