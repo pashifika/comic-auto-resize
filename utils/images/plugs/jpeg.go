@@ -22,7 +22,7 @@ import (
 	"image"
 	"io"
 
-	"github.com/pixiv/go-libjpeg/jpeg"
+	"github.com/pashifika/go-libjpeg/jpeg"
 
 	"github.com/pashifika/comic-auto-resize/utils/config"
 )

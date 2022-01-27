@@ -18,7 +18,7 @@
 package config
 
 import (
-	"github.com/pixiv/go-libjpeg/jpeg"
+	"github.com/pashifika/go-libjpeg/jpeg"
 )
 
 type DCTMethod jpeg.DCTMethod
