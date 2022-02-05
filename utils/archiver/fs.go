@@ -40,7 +40,7 @@ import (
 type FileSystem struct {
 	_mu        sync.Mutex
 	compressor *compress.FileSystem
-	archivers  []file
+	archivers  []*file
 	rootName   string
 	savePath   string
 	deleteOrg  bool
@@ -52,6 +52,7 @@ type FileSystem struct {
 type stream interface {
 	NewImage(image *images.ImageData, root string)
 	GetImageBuffer(root string) *images.ImageData
+	ImageExtension() string
 	Send() chan<- string
 	WaitGroupAdd(delta int)
 	WaitGroupDone()
@@ -76,7 +77,7 @@ func (f *FileSystem) Open(ctx context.Context, root, pwd string, eg *errgroup.Gr
 	if err != nil {
 		return err
 	}
-	f.archivers = []file{}
+	f.archivers = []*file{}
 	f.rootName = filepath.Base(root)
 	err = fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -108,7 +109,8 @@ func (f *FileSystem) Open(ctx context.Context, root, pwd string, eg *errgroup.Gr
 		} else {
 			// Image file filter
 			for _, ext := range f.Extensions {
-				if ext == filepath.Ext(strings.ToLower(path)) {
+				fileExt := filepath.Ext(strings.ToLower(path))
+				if ext == fileExt {
 					var info fs.FileInfo
 					info, err = d.Info()
 					if err != nil {
@@ -117,8 +119,9 @@ func (f *FileSystem) Open(ctx context.Context, root, pwd string, eg *errgroup.Gr
 					buf := &mem.FakeIO{}
 					buf.Grow(int(info.Size()))
 					image := &images.ImageData{FakeIO: buf}
-					f.archivers = append(f.archivers, file{
+					f.archivers = append(f.archivers, &file{
 						FileInfo: info,
+						ext:      fileExt,
 						root:     path,
 						read:     image.Read,
 						write:    image.Write,

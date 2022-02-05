@@ -149,3 +149,7 @@ func (p *Processing) Extensions() []string {
 	}
 	return extList
 }
+
+func (p *Processing) TargetExtension() string {
+	return encoder.Name()
+}

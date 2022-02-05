@@ -30,6 +30,7 @@ type Images interface {
 	Decoder(path string, r io.Reader) (image.Image, error)
 	Resize(path string, src image.Image) (image.Image, error)
 	Encoder(w io.Writer, src image.Image) error
+	TargetExtension() string
 }
 
 type Decoder interface {
@@ -42,6 +43,7 @@ type Decoder interface {
 }
 
 type Encoder interface {
+	Name() string
 	Encode(w io.Writer, src image.Image) (err error)
 }
 

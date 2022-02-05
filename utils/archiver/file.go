@@ -19,15 +19,22 @@ package archiver
 
 import (
 	"io/fs"
+	"strings"
 )
 
 type file struct {
 	fs.FileInfo
 
+	ext   string
 	root  string
 	read  func(p []byte) (n int, err error)
 	write func(p []byte) (n int, err error)
 	close func() error
+}
+
+func (f *file) RenameExt(ext string) {
+	str := strings.TrimSuffix(f.root, f.ext) + ext
+	f.root = str
 }
 
 func (f file) Stat() (fs.FileInfo, error) { return f.FileInfo, nil }

@@ -61,6 +61,9 @@ func (s *Stream) GetImageBuffer(root string) *images.ImageData {
 	return s.images[root]
 }
 
+// ImageExtension return image file name extension
+func (s *Stream) ImageExtension() string { return s.Image.TargetExtension() }
+
 // Send is request to image conversion process
 func (s *Stream) Send() chan<- string { return s.send }
 

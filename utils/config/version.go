@@ -17,4 +17,4 @@
  */
 package config
 
-const version = "v1.1.0"
+const version = "v1.1.1"

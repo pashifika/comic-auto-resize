@@ -32,6 +32,7 @@ func (f *FileSystem) SaveToDisk() error {
 	}
 	entries := make([]compress.ArchiverFile, len(f.archivers))
 	for i, af := range f.archivers {
+		af.RenameExt(f.Cache.ImageExtension())
 		entries[i] = af
 	}
 	ext := strings.TrimLeft(filepath.Ext(f.savePath), ".")
