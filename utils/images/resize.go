@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	_defaultWidth = 1440
+	_defaultWidth = 1280
 	//_resizeThreshold = 0.01
 )
 
