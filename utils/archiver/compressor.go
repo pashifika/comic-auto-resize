@@ -18,9 +18,6 @@
 package archiver
 
 import (
-	"path/filepath"
-	"strings"
-
 	"github.com/pashifika/compress"
 	"github.com/pashifika/util/files"
 )
@@ -35,6 +32,7 @@ func (f *FileSystem) SaveToDisk() error {
 		af.RenameExt(f.Cache.ImageExtension())
 		entries[i] = af
 	}
-	ext := strings.TrimLeft(filepath.Ext(f.savePath), ".")
-	return f.compressor.CreateArchiverFile(ext, out, entries)
+	//ext := strings.TrimLeft(filepath.Ext(f.savePath), ".")
+	// other formats is not supported
+	return f.compressor.CreateArchiverFile("zip", out, entries)
 }

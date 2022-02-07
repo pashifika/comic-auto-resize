@@ -30,8 +30,8 @@ func autoResize(width, height, ratio float64) (w, h uint) {
 	if ratio == 0.7 {
 		ratio = _defaultWidth / width
 	}
-	reW := math.Round(width * ratio)
-	reH := math.Round(height * ratio)
+	reW := width * ratio
+	reH := height * ratio
 
 	return uint(math.Round(reW)), uint(math.Round(reH))
 }
