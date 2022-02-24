@@ -121,18 +121,24 @@ func (p *Processing) Resize(path string, src image.Image) (image.Image, error) {
 	height := info.conf.Height
 	p._mu.RUnlock()
 	var reW, reH uint
+	doResize := true
 	if p.ratio == 70 && _defaultWidth >= width {
 		reW = uint(width)
 		reH = uint(height)
+		doResize = false
 	} else {
 		reW, reH = autoResize(float64(width), float64(height), float64(p.ratio)/100)
 	}
 	if reW <= 500 || reH <= 100 {
-		return nil, ErrRatioValueSmall
+		log.Warn("path: %s width=%d height=%d, %s", path, width, height, ErrRatioValueSmall.Error())
+		doResize = false
 	}
 	log.Debug("path: %s  resize to: width=%d height=%d", path, reW, reH)
 
-	return resize.Resize(reW, reH, src, p.resizeMode), nil
+	if doResize {
+		return resize.Resize(reW, reH, src, p.resizeMode), nil
+	}
+	return src, nil
 }
 
 func (p *Processing) Encoder(w io.Writer, src image.Image) error {
