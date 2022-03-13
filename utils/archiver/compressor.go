@@ -18,12 +18,18 @@
 package archiver
 
 import (
+	"path/filepath"
+
 	"github.com/pashifika/compress"
 	"github.com/pashifika/util/files"
 )
 
 func (f *FileSystem) SaveToDisk() error {
-	out, err := files.FileOpen(f.savePath, "w")
+	path := f.savePath
+	if filepath.Ext(path) != ".zip" {
+		path += ".zip"
+	}
+	out, err := files.FileOpen(path, "w")
 	if err != nil {
 		return err
 	}
