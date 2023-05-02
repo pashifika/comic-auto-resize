@@ -79,11 +79,16 @@ func (f *FileSystem) Open(ctx context.Context, root, pwd string, eg *errgroup.Gr
 	}
 	f.archivers = []*file{}
 	f.rootName = filepath.Base(root)
+	duplicated := map[string]struct{}{}
 	err = fs.WalkDir(fsys, ".", func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
 		if d.IsDir() {
+			if _, ok := duplicated[path]; ok {
+				return fs.SkipDir
+			}
+			duplicated[path] = struct{}{}
 			switch path {
 			case ".git":
 				return fs.SkipDir
