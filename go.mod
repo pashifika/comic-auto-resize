@@ -1,13 +1,13 @@
 module github.com/pashifika/comic-auto-resize
 
-go 1.17
+go 1.19
 
 require (
 	github.com/jessevdk/go-flags v1.5.0
 	github.com/pashifika/compress v0.1.4
 	github.com/pashifika/go-libjpeg v0.0.0-20220127144533-15e68936a637
 	github.com/pashifika/resize v0.0.0-20220113112049-f2d23e2995be
-	github.com/pashifika/util v0.2.3
+	github.com/pashifika/util v0.2.6-0.20230419152024-9692bd461a5d
 	golang.org/x/image v0.0.0-20211028202545-6944b10bf410
 	golang.org/x/text v0.3.7
 )

@@ -11,7 +11,7 @@ This tool will do the above work for you, from the open file all processing is d
 
 | Format | Decoder | Encoder | Test  | Info                                                     |
 |--------|---------|---------|-------|----------------------------------------------------------|
-| jpeg   | true    | true    | local | ues [mozjpeg v4.0.3](https://github.com/mozilla/mozjpeg) |
+| jpeg   | true    | true    | local | ues [mozjpeg v4.1.1](https://github.com/mozilla/mozjpeg) |
 | png    | true    | false   | local | go std lib                                               |
 | bmp    | true    | false   | local | go std lib                                               |
 | webp   | true    | false   | local | go std lib(incomplete? bug with mozjpeg encoder)         |
