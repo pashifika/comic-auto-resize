@@ -99,7 +99,8 @@ pull request into `main` from a fork.
 
 Both branches are protected and require the `ci` status check. `main` accepts merge
 commits only and requires every review thread resolved; `dev/2.0.x` is looser and accepts
-any merge method. `master` is frozen and rejects every write, including fast-forwards.
+any merge method. `master` cannot be deleted or force-pushed; it is a reference branch
+and new work does not belong on it.
 
 Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit
 subjects.
