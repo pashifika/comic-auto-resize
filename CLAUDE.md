@@ -22,8 +22,9 @@ zip reader to keep it.
 
 ## Repository layout and branches
 
-`master` holds the shipped Go implementation, v1.1.2, and is frozen — every write to it is
-rejected, and it remains the repository default branch until the rewrite reaches parity.
+`master` holds the shipped Go implementation, v1.1.2. It is a reference rather than a
+development line: it cannot be deleted or force-pushed, and it remains the repository
+default branch until the rewrite reaches parity. Do not open work against it.
 `main` holds the Rust rewrite. `dev/2.0.x` is the integration line feeding `main`.
 
 The behavioural reference the rewrite is measured against is the `master` branch itself.
