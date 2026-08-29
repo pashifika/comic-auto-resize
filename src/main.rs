@@ -19,7 +19,3 @@ fn main() {
         env!("CARGO_PKG_VERSION"),
     );
 }
-
-fn _probe_the_gate() {
-    let unused = 1;
-}
