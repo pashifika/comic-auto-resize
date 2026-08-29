@@ -1,0 +1,27 @@
+# Build output.
+/target
+
+# rustfmt backups, left behind when `--backup` is used.
+**/*.rs.bk
+
+# Byte-code from the Python CI policy scripts.
+__pycache__/
+*.py[cod]
+
+# macOS Finder metadata. Committing it once is enough to annoy every other host.
+.DS_Store
+
+# Machine-local planning and design inputs are managed outside the product repository.
+# Listed explicitly rather than relying on the machine-global excludes file, so a
+# contributor who does not have that file cannot commit them here by accident.
+/rasen/
+/.rasen/
+
+# A convenience checkout of the frozen `master` branch, used as the behavioural
+# reference during the rewrite. Machine-local; the branch itself is the real reference.
+/examples/
+
+# The machine-global excludes file ignores `AGENTS.md` so that agent scratch files stay
+# out of unrelated repositories. Here it is a tracked symbolic link to `CLAUDE.md` and
+# is part of the repository, so that rule is cancelled.
+!/AGENTS.md

@@ -1,0 +1,370 @@
+name: CI
+
+# Every job runs on every pull request and integration-branch push rather than behind a
+# path filter: `ci` is a required status, and a skipped required status blocks a pull
+# request instead of passing it.
+on:
+  pull_request:
+    branches:
+      - main
+      - "dev/**"
+  push:
+    branches:
+      - main
+      - "dev/**"
+  workflow_dispatch:
+
+# Least privilege: nothing in this workflow writes to the repository.
+permissions:
+  contents: read
+
+# One in-flight run per pull request, or per ref outside one. A newer push supersedes and
+# cancels the run it replaces.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Repository-level policy. Runs once, on the cheapest runner, and is never repeated by
+  # the native jobs.
+  hygiene:
+    name: hygiene
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_DENY_VERSION: 0.20.2
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Verify every action reference is SHA-pinned with a version comment
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          mapfile -t files < <(
+            find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) | sort
+          )
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "hygiene: no workflow files under .github/workflows; this check would verify nothing"
+            exit 1
+          fi
+
+          echo "hygiene: scanning ${#files[@]} workflow file(s)"
+          printf '  %s\n' "${files[@]}"
+
+          awk '
+          BEGIN {
+            checked = 0
+            violations = 0
+            sq = sprintf("%c", 39)
+          }
+          {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+
+            # A commented-out example is documentation, not a live reference.
+            if (line ~ /^#/) next
+
+            sub(/^-[[:space:]]+/, "", line)
+            if (line !~ /^uses:[[:space:]]*/) next
+            sub(/^uses:[[:space:]]*/, "", line)
+
+            # Separate the trailing version comment from the reference itself.
+            comment = ""
+            hash = index(line, "#")
+            if (hash > 0) {
+              comment = substr(line, hash + 1)
+              line = substr(line, 1, hash - 1)
+            }
+            sub(/[[:space:]]+$/, "", line)
+            sub(/^[[:space:]]+/, "", comment)
+            sub(/[[:space:]]+$/, "", comment)
+
+            ref = line
+            if (length(ref) > 1) {
+              first = substr(ref, 1, 1)
+              last = substr(ref, length(ref), 1)
+              if ((first == "\"" && last == "\"") || (first == sq && last == sq))
+                ref = substr(ref, 2, length(ref) - 2)
+            }
+            if (ref == "") next
+
+            checked++
+
+            # Action references carry exactly one "@"; scan from the right so a
+            # reusable-workflow path never confuses the split.
+            at = 0
+            for (i = length(ref); i > 0; i--)
+              if (substr(ref, i, 1) == "@") { at = i; break }
+
+            if (at == 0) {
+              printf "  FAIL %s:%d %s -- not pinned to a commit SHA\n", FILENAME, FNR, ref
+              violations++
+              next
+            }
+
+            sha = substr(ref, at + 1)
+            if (sha !~ /^[0-9a-f]{40}$/) {
+              printf "  FAIL %s:%d %s -- not pinned to a full 40-character commit SHA\n", FILENAME, FNR, ref
+              violations++
+              next
+            }
+
+            if (comment == "") {
+              printf "  FAIL %s:%d %s -- SHA pin carries no trailing version comment\n", FILENAME, FNR, ref
+              violations++
+              next
+            }
+
+            printf "  ok   %s:%d %s (%s)\n", FILENAME, FNR, ref, comment
+          }
+          END {
+            if (checked == 0) {
+              print "hygiene: no uses: references found; this check would verify nothing"
+              exit 1
+            }
+            if (violations > 0) {
+              printf "hygiene: %d of %d reference(s) rejected; every uses: must read owner/repo@<40-hex-sha> # <version>\n", violations, checked
+              exit 1
+            }
+            printf "hygiene: %d reference(s) checked, all SHA-pinned with a version comment\n", checked
+          }
+          ' "${files[@]}"
+
+      # The branch-flow rules judge every pull request, so they are verified before they
+      # are trusted. This check has no status context of its own -- the `ci` gate is the
+      # only required one -- which is exactly why its own bugs must be caught here.
+      - name: Test the branch-policy rules
+        timeout-minutes: 5
+        run: python3 -B .github/scripts/test_branch_policy.py
+
+      - name: Validate the pull-request branch flow
+        if: github.event_name == 'pull_request'
+        timeout-minutes: 5
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_AUTHOR_LOGIN: ${{ github.event.pull_request.user.login }}
+        run: >-
+          python3 -B .github/scripts/branch_policy.py
+          "$BASE_REF" "$HEAD_REF" "$BASE_REPOSITORY" "$HEAD_REPOSITORY"
+          "$PR_AUTHOR_LOGIN"
+
+      - name: Report non-applicable branch policy
+        if: github.event_name != 'pull_request'
+        timeout-minutes: 5
+        run: echo "Branch policy is not applicable to ${GITHUB_EVENT_NAME} events."
+
+      - name: Install the pinned Rust toolchain
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          # Read back from the file rather than duplicating the number here: a bump to
+          # `rust-toolchain.toml` must be the only edit a bump needs.
+          channel="$(tr -d '\r' < rust-toolchain.toml | sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p')"
+          if [ -z "${channel}" ]; then
+            echo "::error::could not read the pinned channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "pinned channel: ${channel}"
+
+          rustup toolchain install "${channel}" \
+            --profile minimal \
+            --component clippy,rustfmt \
+            --no-self-update
+          rustup default "${channel}"
+
+          # Printed, not assumed: every result below belongs to these versions.
+          rustc --version
+          cargo --version
+          cargo fmt --version
+
+      - name: Check formatting
+        timeout-minutes: 5
+        run: cargo fmt --all --check
+
+      - name: Restore cargo-deny
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        timeout-minutes: 5
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ runner.os }}-${{ env.CARGO_DENY_VERSION }}
+
+      - name: Check dependency policy
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          if ! command -v cargo-deny >/dev/null 2>&1; then
+            cargo install --locked cargo-deny --version "${CARGO_DENY_VERSION}"
+          fi
+          cargo deny --version
+          cargo deny --locked check
+
+  windows:
+    name: windows
+    runs-on: windows-2025
+    timeout-minutes: 30
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          channel="$(tr -d '\r' < rust-toolchain.toml | sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p')"
+          if [ -z "${channel}" ]; then
+            echo "::error::could not read the pinned channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "pinned channel: ${channel}"
+
+          rustup toolchain install "${channel}" \
+            --profile minimal \
+            --component clippy,rustfmt \
+            --no-self-update
+          rustup default "${channel}"
+
+      # A cross-compiled result must never be reported as native verification.
+      - name: Confirm the native release target
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          rustc -vV
+          cargo --version
+          host="$(rustc -vV | tr -d '\r' | sed -n 's/^host: //p')"
+          if [ "${host}" != "x86_64-pc-windows-msvc" ]; then
+            echo "::error::expected native host x86_64-pc-windows-msvc but found ${host}"
+            exit 1
+          fi
+
+      - name: Lint
+        shell: bash
+        timeout-minutes: 15
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test
+        shell: bash
+        timeout-minutes: 15
+        run: cargo test --locked --all-features
+
+      - name: Build the release binary
+        shell: bash
+        timeout-minutes: 15
+        run: cargo build --locked --release
+
+  macos:
+    name: macos
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          channel="$(tr -d '\r' < rust-toolchain.toml | sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p')"
+          if [ -z "${channel}" ]; then
+            echo "::error::could not read the pinned channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "pinned channel: ${channel}"
+
+          rustup toolchain install "${channel}" \
+            --profile minimal \
+            --component clippy,rustfmt \
+            --no-self-update
+          rustup default "${channel}"
+
+      - name: Confirm the native release target
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          rustc -vV
+          cargo --version
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "${host}" != "aarch64-apple-darwin" ]; then
+            echo "::error::expected native host aarch64-apple-darwin but found ${host}"
+            exit 1
+          fi
+
+      - name: Lint
+        timeout-minutes: 15
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      - name: Test
+        timeout-minutes: 15
+        run: cargo test --locked --all-features
+
+      - name: Build the release binary
+        timeout-minutes: 15
+        run: cargo build --locked --release
+
+  # The single required status context. Every ruleset names this job and no other, so a
+  # change that adds a job extends the `needs` list below and touches no repository
+  # setting.
+  ci:
+    name: ci
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs: [hygiene, windows, macos]
+    # `always()` so the gate still reports when a predecessor failed; without it the gate
+    # would be skipped, and a skipped required check blocks rather than fails.
+    if: always()
+    steps:
+      - name: Require every CI predecessor to succeed
+        env:
+          HYGIENE_RESULT: ${{ needs.hygiene.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
+          MACOS_RESULT: ${{ needs.macos.result }}
+        run: |
+          set -euo pipefail
+
+          # Checked explicitly rather than with `success()`: a *skipped* predecessor --
+          # from a mistaken condition, an empty matrix, or a cancelled dependency -- is
+          # not a passing predecessor, and the terse form accepts it silently.
+          failed=""
+          for pair in \
+            "hygiene=${HYGIENE_RESULT}" \
+            "windows=${WINDOWS_RESULT}" \
+            "macos=${MACOS_RESULT}"; do
+            name="${pair%%=*}"
+            result="${pair#*=}"
+            if [ "${result}" != "success" ]; then
+              echo "::error::required job ${name} reported '${result}'"
+              failed=1
+            fi
+          done
+
+          if [ -n "${failed}" ]; then
+            echo "::error::Required job results: hygiene=${HYGIENE_RESULT} windows=${WINDOWS_RESULT} macos=${MACOS_RESULT}"
+            exit 1
+          fi
+
+          echo "ci: hygiene, windows, and macos all succeeded."

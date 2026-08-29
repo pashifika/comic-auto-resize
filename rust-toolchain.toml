@@ -1,0 +1,7 @@
+[toolchain]
+# Pinned, not a floating channel: a toolchain that changes underneath a previously green
+# build makes a red one unexplainable. CI reads this value back from this file rather
+# than hard-coding it, so a bump here is the only edit a bump needs.
+channel = "1.97.1"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
