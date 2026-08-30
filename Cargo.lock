@@ -231,7 +231,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 [[package]]
 name = "mozjpeg"
 version = "0.10.13"
-source = "git+https://github.com/pashifika/mozjpeg-rust.git?rev=4c4c651e01d35fe7e52cf56a8c64b469821984a0#4c4c651e01d35fe7e52cf56a8c64b469821984a0"
+source = "git+https://github.com/pashifika/mozjpeg-rust.git?rev=58f4e0ef91f2a0c477140734ef8b3fe5403befc3#58f4e0ef91f2a0c477140734ef8b3fe5403befc3"
 dependencies = [
  "arrayvec",
  "bytemuck",
