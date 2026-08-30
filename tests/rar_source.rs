@@ -199,11 +199,13 @@ fn error_text(path: &Path) -> String {
 /// panic in the reader thread costs the run its message.
 #[test]
 fn an_input_path_containing_a_nul_is_refused_rather_than_panicking() {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
-
-    // Not reachable from the command line, but the library API is public.
-    let path = PathBuf::from(OsString::from_vec(b"pages\0.rar".to_vec()));
+    // A Rust `str` may hold a NUL, and `PathBuf::from(&str)` keeps it on every target — which
+    // matters, because `std::os::unix::ffi::OsStringExt` does not exist on `x86_64-pc-windows-
+    // msvc` and this project ships there too.
+    //
+    // Not reachable from the command line, but the library API is public and `unrar` panics
+    // rather than erroring on this input.
+    let path = PathBuf::from("pages\u{0}.rar");
     let error = Source::rar(&path).expect_err("a NUL-bearing path must be refused");
     assert!(
         matches!(error, SourceError::UnsafePath),
