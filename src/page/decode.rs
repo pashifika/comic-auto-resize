@@ -75,6 +75,34 @@ pub fn decode(name: &str, buffer: &[u8], settings: DecodeSettings) -> Result<Pag
         .map_err(|error| PageError::new(name, error.into()))
 }
 
+/// The geometry `buffer`'s header declares, without decoding it.
+///
+/// The resize policy needs the source geometry before the decode is configured: the target
+/// height follows from the source's aspect ratio, and whether the page is resized at all
+/// depends on both axes. Reading the header twice costs marker parsing, which is
+/// microseconds against a decode, and it keeps the policy above the codec instead of
+/// inside it.
+///
+/// # Errors
+///
+/// [`PageErrorKind::NotJpeg`] when `buffer` does not begin with the start-of-image marker,
+/// and [`PageErrorKind::Decode`] when libjpeg rejects the header.
+pub fn header(name: &str, buffer: &[u8]) -> Result<(u32, u32), PageError> {
+    require_soi(name, buffer)?;
+
+    panic::catch_unwind(|| {
+        let decompress = Decompress::new_mem(buffer)?;
+        Ok((
+            dimension(decompress.width()),
+            dimension(decompress.height()),
+        ))
+    })
+    .map_err(|payload| {
+        PageError::new(name, PageErrorKind::Decode(unwind_reason(payload.as_ref())))
+    })?
+    .map_err(|kind| PageError::new(name, kind))
+}
+
 /// One decoded page: the buffer, its own dimensions, and the ones the header declared.
 ///
 /// The two pairs differ whenever `scale` was applied, and they are kept apart because the
