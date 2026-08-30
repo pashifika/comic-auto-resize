@@ -104,14 +104,18 @@ feat|fix|perf|refactor|docs|test|build|ci|chore|revert/<slug>
         ▼
    dev/2.0.x
         │
-        ▼
+        ▼  once, at parity with master
       main
 ```
 
 Cut a short-lived topic branch from `dev/2.0.x`, using one of the prefixes above with a
-non-empty slug. Topic branches merge into `dev/2.0.x`; `dev/2.0.x` merges into `main`. A
-topic branch targeting `main` directly is rejected by the branch-flow check, and so is a
-pull request into `main` from a fork.
+non-empty slug. Topic branches merge into `dev/2.0.x`. A topic branch targeting `main`
+directly is rejected by the branch-flow check, and so is a pull request into `main` from a
+fork.
+
+`dev/2.0.x` merges into `main` once, at parity with `master`. `main` requires its head to
+be up to date with itself, so each promotion leaves `dev/2.0.x` one merge commit behind;
+fast-forward `dev/2.0.x` onto `main` afterwards.
 
 Both branches are protected and require the `ci` status check. `main` accepts merge
 commits only and requires every review thread resolved; `dev/2.0.x` is looser and accepts
