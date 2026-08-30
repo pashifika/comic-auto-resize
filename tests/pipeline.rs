@@ -473,3 +473,201 @@ fn the_output_holds_only_image_entries() {
         .collect();
     assert_eq!(names, ["page0.jpg", "page1.jpg", "page2.jpg", "page3.jpg"]);
 }
+
+/// Every long option `--help` lists, without its `--`.
+fn help_options() -> Vec<String> {
+    let output = Command::new(BINARY)
+        .arg("--help")
+        .output()
+        .expect("runs the binary");
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut found: Vec<String> = text
+        .split_whitespace()
+        .filter_map(|word| word.strip_prefix("--"))
+        .map(|word| word.trim_end_matches([',', '.', '>']).to_owned())
+        .filter(|word| !word.is_empty())
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// A valid input, so a refusal is attributable to the flag rather than to the archive.
+fn valid_input(directory: &TempDir) -> std::path::PathBuf {
+    let path = directory.join("in.zip");
+    write_pages(&path, 1, 320, 440);
+    path
+}
+
+/// The flags the Go implementation had and this build does not exist with.
+///
+/// A flag may exist and be unimplemented, or not exist; it must not exist and silently do
+/// the wrong thing. This asserts the second half — that they are genuinely absent, not
+/// accepted and ignored.
+#[test]
+fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
+    let directory = TempDir::new("unknown-flags");
+    let input = valid_input(&directory);
+
+    for flag in [
+        "--pwd",
+        "--charset",
+        "--delete-org",
+        "--jobs",
+        "-r",
+        "--ratio",
+        "--split",
+        "-o",
+        "--out",
+        "--small-skip",
+        "--optimizer",
+        "--progressive",
+    ] {
+        let output = Command::new(BINARY)
+            .arg(flag)
+            .arg(&input)
+            .output()
+            .expect("runs the binary");
+        assert!(
+            !output.status.success(),
+            "{flag} was accepted; it must not exist"
+        );
+        let message = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        assert!(
+            message.contains("unexpected") || message.contains("unknown"),
+            "{flag} did not fail as an unknown argument: {message}"
+        );
+        assert!(
+            !default_output(&input).exists(),
+            "{flag} produced an output archive"
+        );
+    }
+}
+
+/// `--help` lists exactly what exists, in both directions.
+#[test]
+fn help_lists_every_implemented_option_and_nothing_else() {
+    // The four the change implements, plus what clap adds for free.
+    let mut expected = vec![
+        "auto-width".to_owned(),
+        "dct".to_owned(),
+        "help".to_owned(),
+        "quality".to_owned(),
+        "resize-mode".to_owned(),
+        "version".to_owned(),
+    ];
+    expected.sort();
+
+    assert_eq!(help_options(), expected);
+}
+
+/// `MIN_EDGE` and the resource budget are internal constants, not options.
+///
+/// A limit a user can raise is a limit that will be raised to force a bad page through, so
+/// their absence from the surface is the requirement.
+#[test]
+fn no_option_sets_the_minimum_edge_or_a_budget() {
+    let listed = help_options().join(" ");
+    for forbidden in ["min-edge", "minimum", "budget", "max-pixels", "max-bytes"] {
+        assert!(
+            !listed.contains(forbidden),
+            "`{forbidden}` appears on the command line: {listed}"
+        );
+    }
+}
+
+/// An out-of-range value is refused by the parser, before the input is opened.
+#[test]
+fn an_out_of_range_option_value_is_refused_before_any_work() {
+    let directory = TempDir::new("bad-values");
+    let input = valid_input(&directory);
+
+    for args in [
+        vec!["--quality", "0"],
+        vec!["--quality", "101"],
+        vec!["--auto-width", "0"],
+        vec!["--auto-width", "65536"],
+        vec!["--resize-mode", "nearest"],
+        vec!["--dct", "fast"],
+    ] {
+        let output = Command::new(BINARY)
+            .args(&args)
+            .arg(&input)
+            .output()
+            .expect("runs the binary");
+        assert!(
+            !output.status.success(),
+            "{args:?} was accepted; the value is out of range"
+        );
+        // The input was valid, so nothing may have been produced from it.
+        assert!(
+            !default_output(&input).exists(),
+            "{args:?} produced an output archive"
+        );
+    }
+
+    // And the accepted values really are accepted, so the test above is not passing because
+    // every value is refused.
+    for args in [
+        vec!["--quality", "1"],
+        vec!["--quality", "100"],
+        vec!["--auto-width", "65535"],
+        vec!["--resize-mode", "nearest-neighbor"],
+        vec!["--dct", "islow"],
+    ] {
+        let scratch = TempDir::new("good-values");
+        let good = valid_input(&scratch);
+        let status = Command::new(BINARY)
+            .args(&args)
+            .arg(&good)
+            .status()
+            .expect("runs the binary");
+        assert!(status.success(), "{args:?} was refused but is in range");
+    }
+}
+
+/// Each accepted flag changes the output in a way attributable to it.
+///
+/// A flag that parses and then does nothing is the failure this guards against.
+#[test]
+fn every_accepted_flag_changes_the_output() {
+    fn run_with(args: &[&str], label: &str) -> Vec<u8> {
+        let directory = TempDir::new(label);
+        let input = directory.join("in.zip");
+        write_pages(&input, 1, 1520, 2150);
+        let status = Command::new(BINARY)
+            .args(args)
+            .arg(&input)
+            .status()
+            .expect("runs the binary");
+        assert!(status.success(), "{args:?} failed");
+        read_archive(&default_output(&input))
+            .into_iter()
+            .next()
+            .expect("one page")
+            .1
+    }
+
+    let baseline = run_with(&[], "flag-baseline");
+
+    // A different target width changes the dimensions.
+    let narrower = run_with(&["--auto-width", "1000"], "flag-width");
+    assert_eq!(jpeg_size(&baseline), Some((1280, 1811)));
+    assert_eq!(jpeg_size(&narrower), Some((1000, 1414)));
+
+    // The other three change the bytes at the same dimensions.
+    for (args, label) in [
+        (["-q", "50"], "flag-quality"),
+        (["--dct", "islow"], "flag-dct"),
+        (["--resize-mode", "nearest-neighbor"], "flag-filter"),
+    ] {
+        let changed = run_with(&args, label);
+        assert_eq!(
+            jpeg_size(&changed),
+            Some((1280, 1811)),
+            "{args:?} changed the geometry"
+        );
+        assert_ne!(changed, baseline, "{args:?} did not change the output");
+    }
+}
