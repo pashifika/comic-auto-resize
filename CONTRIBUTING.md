@@ -53,6 +53,32 @@ Either add the key to `ssh-agent` or run Cargo with `CARGO_NET_GIT_FETCH_WITH_CL
 cargo install --locked cargo-deny --version 0.20.2
 ```
 
+### rar fixtures, if you are touching the rar reader
+
+Not needed to build, and not needed for the verification sequence below: the rar tests that
+depend on these fixtures skip when they are absent, and CI never builds them.
+
+They are a separate step because rar is the one format this repository cannot write for
+itself. UnRAR's licence forbids using its source "to develop RAR (WinRAR) compatible archiver
+and to re-create RAR compression algorithm, which is proprietary", so no open implementation
+exists or lawfully can, and RARLAB's `rar` is the only program that writes a RAR archive.
+
+```sh
+tests/fixtures/make-rar-fixtures.sh
+```
+
+It fetches `rar` into `tools/` when it is not already there or on `PATH`, writes four fixtures
+to `tools/rar-fixtures/`, and checks each one with `bsdtar` and `7zz` — readers that are
+neither the writer nor the reader under test. `tools/` is gitignored: the archiver is
+proprietary and the fixtures are derived from it, so neither is committed.
+
+What the fixtures are for is the part worth knowing. Both real rar samples are non-solid and
+entirely stored, so they exercise header walking and the stored reader and nothing else. The
+solid, compressed fixture is the only evidence that the shared dictionary, the decompressor,
+and UnRAR's unpacker threads work at all.
+
+Set `CAR_RAR_FIXTURES` to write them somewhere other than `tools/rar-fixtures/`.
+
 ## Building
 
 ```sh

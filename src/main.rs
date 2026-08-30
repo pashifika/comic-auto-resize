@@ -6,10 +6,8 @@
 //! `--small-skip`, `--optimizer`, `--progressive`) are absent rather than accepted and
 //! ignored. Absence is the honest form of "not yet".
 
-use std::fs::File;
-use std::io::Read;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
 
@@ -97,76 +95,31 @@ fn run(cli: &Cli) -> Result<u32, CliError> {
         },
     };
 
-    let file = open_zip(&cli.input)?;
-    // The entry table is read here, so a malformed archive fails before the output is
-    // created. No `BufReader`: `by_index` seeks to every entry and `BufReader::seek` throws
-    // its buffer away, so a wrapper would be discarded once a page. The table's own reads
-    // are small and unbuffered — measured at 2 ms for 1000 entries.
-    let source = Source::zip(file).map_err(|source| CliError::Archive {
+    // The input is established as a readable file before anything is opened, so a missing or
+    // wrong input names itself before the output file is created. Which reader runs is
+    // decided by the file's leading bytes, never by its extension: `.cbz` and `.cbr` are
+    // conventions that the tools writing them get mixed up.
+    //
+    // For zip the entry table is read here too, so a malformed archive fails before the
+    // output is created. No `BufReader`: `by_index` seeks to every entry and `BufReader::seek`
+    // throws its buffer away, so a wrapper would be discarded once a page. The table's own
+    // reads are small and unbuffered — measured at 2 ms for 1000 entries.
+    let metadata = std::fs::metadata(&cli.input).map_err(|source| CliError::Input {
+        path: cli.input.clone(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(CliError::NotAFile {
+            path: cli.input.clone(),
+        });
+    }
+    let source = Source::open(&cli.input).map_err(|source| CliError::Archive {
         path: cli.input.clone(),
         source,
     })?;
     let output = default_output(&cli.input);
     let report = pipeline::run(source, &output, &settings)?;
     Ok(report.pages)
-}
-
-/// Opens `path` after establishing that it is a readable file holding a zip archive.
-///
-/// Checked here rather than left to the reader, so a missing or wrong input names itself
-/// before any entry is read and before the output file is created.
-fn open_zip(path: &Path) -> Result<File, CliError> {
-    let metadata = std::fs::metadata(path).map_err(|source| CliError::Input {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if !metadata.is_file() {
-        return Err(CliError::NotAFile {
-            path: path.to_path_buf(),
-        });
-    }
-
-    let mut file = File::open(path).map_err(|source| CliError::Input {
-        path: path.to_path_buf(),
-        source,
-    })?;
-
-    // A local file header, or the end-of-central-directory record an archive with no
-    // entries begins with.
-    let mut signature = [0; 4];
-    let read = read_prefix(&mut file, &mut signature).map_err(|source| CliError::Input {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let is_zip = read == signature.len()
-        && (signature == [b'P', b'K', 3, 4] || signature == [b'P', b'K', 5, 6]);
-    if !is_zip {
-        return Err(CliError::NotZip {
-            path: path.to_path_buf(),
-        });
-    }
-
-    // Rewound so the reader sees the whole archive.
-    std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).map_err(|source| {
-        CliError::Input {
-            path: path.to_path_buf(),
-            source,
-        }
-    })?;
-    Ok(file)
-}
-
-fn read_prefix(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
-    let mut filled = 0;
-    while filled < buffer.len() {
-        match reader.read(&mut buffer[filled..]) {
-            Ok(0) => break,
-            Ok(read) => filled += read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(filled)
 }
 
 /// How many pages are processed at once.
@@ -189,8 +142,8 @@ enum CliError {
     },
     #[error("{}: not a file", path.display())]
     NotAFile { path: PathBuf },
-    #[error("{}: not a zip archive", path.display())]
-    NotZip { path: PathBuf },
+    /// `NotZip` is gone with `open_zip`: which formats the build reads is the reader's
+    /// knowledge, so the refusal is `SourceError::NotAnArchive` and names them.
     /// Named with the path, because the entry table is read when the input is opened and a
     /// malformed one is a property of the file rather than of an entry.
     #[error("{}: {source}", path.display())]

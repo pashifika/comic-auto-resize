@@ -2,14 +2,38 @@
 //!
 //! An enum rather than trait objects: the set of archive formats is closed and known at
 //! compile time, so a `match` costs nothing and every variant's reading discipline stays
-//! visible. zip is the only variant here; rar, 7z, and a plain directory arrive later.
+//! visible. zip and rar are here; 7z and a plain directory arrive later.
+//!
+//! The enum carries no type parameter, and that is the decision Change 1 deferred. Only the
+//! zip variant has a reader at all — `unrar` is handed a path, and so will the directory
+//! variant be — and the only reader this tool ever opens is a [`File`], because the input is
+//! a path on the command line. So [`ZipSource`] stays generic, which is honest, and the enum
+//! names the one type production uses. A generic here would have meant every later variant
+//! ignoring it.
+//!
+//! [`Entries`] is what the pipeline consumes. It exists so `pipeline::run` is not welded to
+//! this enum: one test drives the pipeline over a [`ZipSource`] wrapping an instrumented
+//! reader, to prove the credit window bounds the reader rather than the reader's own
+//! restraint, and a concrete `ZipSource<File>` cannot be instrumented. Dispatch stays static.
+//! Deliberately not `Iterator`, whose adapters would make `source.collect()` — the unbounded
+//! buffering this pipeline exists to prevent — a one-liner that compiles.
 
 mod probe;
+mod rar;
+mod signature;
 mod zip;
 
 pub use probe::{CANDIDATES, Candidate, Format, MAGIC_MAX, declared_format, output_name, probe};
+pub use rar::RarSource;
+pub use signature::{
+    ARCHIVE_CANDIDATES, ARCHIVE_MAGIC_MAX, ArchiveCandidate, ArchiveFormat, detect,
+    readable_formats,
+};
+pub use zip::ZipSource;
 
+use std::fs::File;
 use std::io::{Read, Seek};
+use std::path::Path;
 
 use thiserror::Error;
 
@@ -35,36 +59,200 @@ pub struct Entry {
     pub bytes: Vec<u8>,
 }
 
-/// An archive being read once, in the order its entries are recorded in.
-pub enum Source<R> {
-    Zip(zip::ZipSource<R>),
+/// Hand-written rather than derived: `bytes` is a whole page, and a derive would put it in
+/// every assertion failure and every log line. The length is what a reader of one wants.
+impl std::fmt::Debug for Entry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Entry")
+            .field("index", &self.index)
+            .field("name", &self.name)
+            .field("format", &self.format)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
-/// The bound is the zip variant's, not the enum's: the `enum` declaration carries none, so
-/// `Source<R>` can be named without one. It is not yet the whole story for rar and 7z —
-/// `next_entry` lives on this block too, and `pipeline::run` repeats the bound because it
-/// drives `next_entry`, so a variant over a `Read`-only reader needs more than moving a bound.
-/// That is the Change that adds one to decide.
-impl<R: Read + Seek> Source<R> {
-    /// Opens `reader` as a zip, reading its entry table.
+/// What the pipeline needs from a source, and nothing more.
+///
+/// One method, because that is all `pipeline::run` calls. See the module doc for why this is
+/// a trait rather than the enum, and why it is not `Iterator`.
+pub trait Entries {
+    /// The next page, or `None` at the end of the archive.
+    ///
+    /// Nothing is retained after it is returned, which is what lets an archive larger than
+    /// memory be processed.
+    fn next_entry(&mut self) -> Option<Result<Entry, SourceError>>;
+}
+
+/// An archive being read once, in the order its entries are recorded in.
+pub enum Source {
+    Zip(ZipSource<File>),
+    Rar(RarSource),
+}
+
+/// Names the format and nothing else. A reader's internals are a cursor into an archive and
+/// have no useful rendering; the variant is the part a diagnostic wants.
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zip(_) => f.write_str("Source::Zip"),
+            Self::Rar(_) => f.write_str("Source::Rar"),
+        }
+    }
+}
+
+impl Source {
+    /// Opens the archive at `path`, choosing the reader from its leading bytes.
+    ///
+    /// The extension is not consulted; see [`signature`] for why. The whole decision lives
+    /// here rather than in the binary so that "a rar named `.cbz` reads as rar" is a property
+    /// a test can assert without running a process.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceError::NotAnArchive`] when the leading bytes match no format this build reads,
+    /// [`SourceError::Entry`] when `path` cannot be opened or read, and whatever the chosen
+    /// reader returns.
+    pub fn open(path: &Path) -> Result<Self, SourceError> {
+        let mut file = File::open(path).map_err(|source| SourceError::Input { source })?;
+
+        let mut header = [0; ARCHIVE_MAGIC_MAX];
+        let read = fill(&mut file, &mut header).map_err(|source| SourceError::Input { source })?;
+
+        match detect(&header[..read]) {
+            Some(ArchiveFormat::Zip) => {
+                // Rewound so the reader sees the whole archive.
+                file.seek(std::io::SeekFrom::Start(0))
+                    .map_err(|source| SourceError::Input { source })?;
+                Self::zip(file)
+            }
+            // The handle is dropped: `unrar` is given the path, not a stream.
+            Some(ArchiveFormat::Rar) => Self::rar(path),
+            None => Err(SourceError::NotAnArchive {
+                formats: readable_formats(),
+            }),
+        }
+    }
+
+    /// Opens `file` as a zip, reading its entry table.
     ///
     /// # Errors
     ///
     /// [`SourceError::Archive`] when the entry table cannot be read, which is established
     /// here rather than at the first entry.
-    pub fn zip(reader: R) -> Result<Self, SourceError> {
-        Ok(Self::Zip(zip::ZipSource::new(reader)?))
+    pub fn zip(file: File) -> Result<Self, SourceError> {
+        Ok(Self::Zip(ZipSource::new(file)?))
     }
 
-    /// The next page, or `None` at the end of the archive.
+    /// Opens the rar archive at `path`, reading its archive header only.
     ///
-    /// Nothing is retained after it is returned, which is what lets an archive larger than
-    /// memory be processed.
-    pub fn next_entry(&mut self) -> Option<Result<Entry, SourceError>> {
+    /// Unlike [`Source::zip`], this does not read the entry table: `unrar` walks headers as
+    /// it goes, so a malformed *entry* header surfaces at the first [`Entries::next_entry`]
+    /// rather than here. Not equalised, because equalising it would mean walking every header
+    /// at open and then again to read — two passes over a solid archive, which is the one
+    /// thing a solid archive makes expensive.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceError::UnsafePath`] when `path` contains an interior NUL, which `unrar` panics
+    /// on rather than reporting. [`SourceError::Rar`] when the archive header cannot be read.
+    pub fn rar(path: &Path) -> Result<Self, SourceError> {
+        Ok(Self::Rar(RarSource::open(path)?))
+    }
+}
+
+impl Entries for Source {
+    fn next_entry(&mut self) -> Option<Result<Entry, SourceError>> {
         match self {
             Self::Zip(source) => source.next_entry(),
+            Self::Rar(source) => source.next_entry(),
         }
     }
+}
+
+/// So a test can drive the pipeline over an instrumented reader; see the module doc.
+impl<R: Read + Seek> Entries for ZipSource<R> {
+    fn next_entry(&mut self) -> Option<Result<Entry, SourceError>> {
+        ZipSource::next_entry(self)
+    }
+}
+
+/// How much capacity an entry's recorded size may reserve.
+///
+/// A real page is tens of kilobytes to a few megabytes, so a megabyte is a useful hint and
+/// anything beyond it is the archive's claim rather than a measurement. Growth from there is
+/// geometric.
+pub(crate) const HINT_CEILING: u64 = 1 << 20;
+
+/// Whether a stored name is a directory rather than a file.
+///
+/// The archive says so by ending the name with a separator, and both are separators because
+/// a Windows-written archive may use either. The same rule `zip` applies internally, spelled
+/// out here because its helper is crate-private.
+///
+/// rar marks a directory with a header flag and is checked on that first; this remains the
+/// fallback there, because a directory entry without the flag is a malformed archive rather
+/// than a page.
+pub(crate) fn is_directory(name: &str) -> bool {
+    matches!(name.as_bytes().last(), Some(b'/' | b'\\'))
+}
+
+/// Why a stored name must not be carried into the output archive, or `None` if it may be.
+///
+/// Every check is on the name as the archive stored it, before the extension is rewritten,
+/// and both separators are treated as separators because a Windows-written archive may use
+/// either.
+///
+/// Shared by every format on purpose: the refusal is a property of the name that reaches the
+/// output, not of the container it came from.
+pub(crate) fn unsafe_name(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("the name is empty");
+    }
+    if name.contains('\0') {
+        return Some("the name contains a NUL byte");
+    }
+    if name.starts_with('/') || name.starts_with('\\') {
+        return Some("the name is absolute");
+    }
+    // A drive letter (`C:\…`) or a UNC prefix (`\\host\share`), which are absolute on
+    // Windows however the leading characters read on a unix host.
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return Some("the name carries a drive letter");
+    }
+    // A component that escapes, in every spelling that resolves to one. Windows strips
+    // trailing dots and spaces from a path component, so `.. ` names the parent directory
+    // there while an exact comparison against `..` lets it through — and the name is going
+    // into an archive somebody will extract on Windows. A component of nothing but dots and
+    // spaces is refused whenever it holds two or more dots, which costs `...` and `. .` as
+    // well: neither is a page directory, and refusing is the answer this function exists to
+    // give.
+    if name.split(['/', '\\']).any(|component| {
+        let dots = component.bytes().filter(|&byte| byte == b'.').count();
+        dots >= 2 && component.bytes().all(|byte| byte == b'.' || byte == b' ')
+    }) {
+        return Some("the name escapes its own directory");
+    }
+    None
+}
+
+/// Reads up to `buffer.len()` bytes, tolerating short reads.
+///
+/// Not `read_exact`: an input shorter than the longest signature, or an entry shorter than
+/// the longest magic, is not an I/O error — it is something that cannot be what was hoped
+/// for, and the caller decides that from what was read.
+pub(crate) fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buffer.len() {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(filled)
 }
 
 /// Why an archive could not be read.
@@ -106,4 +294,39 @@ pub enum SourceError {
     /// because rewriting it would produce an output whose entries do not match the input's.
     #[error("{name}: refusing the entry name because {reason}")]
     UnsafeName { name: String, reason: &'static str },
+    /// The rar archive's own structure, the counterpart to [`SourceError::Archive`]. A
+    /// separate variant only because `unrar`'s error type is not `zip`'s; the case is the
+    /// same one.
+    #[error("cannot read the archive: {0}")]
+    Rar(#[from] unrar_ng::error::UnrarError),
+    /// One volume of a multi-volume set was handed in. `unrar` would otherwise ask for the
+    /// next volume and, on being refused, fail with an error that does not say what happened.
+    /// Named here instead, because a half-followed volume set is a book missing pages and
+    /// the user needs to know which failure they have.
+    #[error(
+        "{name}: this entry continues into another volume, so the input is one part of a multi-volume set"
+    )]
+    Split { name: String },
+    /// The *input path*, not an entry name. `unrar` panics rather than erroring when the
+    /// path it is given contains an interior NUL (`pathed/all.rs`, `WideCString::from_os_str`
+    /// followed by `expect`), and a panic in the reader thread costs the run its message.
+    /// Checked before the path reaches the dependency, so it is the error it should have been.
+    ///
+    /// Carries no path, for the reason below.
+    #[error("refusing the input path because it contains a NUL byte")]
+    UnsafePath,
+    /// The input's leading bytes match no format this build reads. Names the formats,
+    /// because "not a zip archive" was never the whole answer and is now actively wrong.
+    #[error("not an archive this build reads ({formats})")]
+    NotAnArchive { formats: String },
+    /// The input path itself could not be opened or read, as distinct from an entry inside
+    /// it.
+    #[error("{source}")]
+    Input { source: std::io::Error },
 }
+
+// None of these variants names the input path, and that is deliberate rather than an
+// oversight: the caller passed the path in, and every one of them reaches a user through a
+// wrapper that prepends it — `CliError::Archive` is `{path}: {source}`. Carrying it here too
+// printed it twice. What each variant does name is the thing the caller could not have known,
+// which for an entry is the entry.

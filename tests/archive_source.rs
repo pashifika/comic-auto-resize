@@ -11,7 +11,7 @@ use std::io::{Cursor, Write};
 use comic_auto_resize::page::{Channels, PageImage};
 use comic_auto_resize::page::{EncodeSettings, encode};
 use comic_auto_resize::source::{
-    CANDIDATES, Format, MAGIC_MAX, MAX_ENTRY_BYTES, Source, SourceError, probe,
+    CANDIDATES, Format, MAGIC_MAX, MAX_ENTRY_BYTES, SourceError, ZipSource, probe,
 };
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -43,7 +43,9 @@ fn archive(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 
 /// Every page the source yields, in order.
 fn read_all(bytes: &[u8]) -> Result<Vec<(u32, String)>, SourceError> {
-    let mut source = Source::zip(Cursor::new(bytes))?;
+    // `ZipSource` rather than `Source`, because these tests are about the zip reader and the
+    // enum names `File` for the one reader the binary ever opens. Same code under test.
+    let mut source = ZipSource::new(Cursor::new(bytes))?;
     let mut yielded = Vec::new();
     while let Some(entry) = source.next_entry() {
         let entry = entry?;
@@ -57,7 +59,7 @@ fn read_all(bytes: &[u8]) -> Result<Vec<(u32, String)>, SourceError> {
 /// Separate from `read_all` rather than a widening of it, so the tests that predate the
 /// central-directory reader keep asserting exactly what they asserted before.
 fn read_all_sized(bytes: &[u8]) -> Result<Vec<(String, usize)>, SourceError> {
-    let mut source = Source::zip(Cursor::new(bytes))?;
+    let mut source = ZipSource::new(Cursor::new(bytes))?;
     let mut yielded = Vec::new();
     while let Some(entry) = source.next_entry() {
         let entry = entry?;

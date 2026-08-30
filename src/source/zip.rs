@@ -30,14 +30,7 @@ use std::io::{Read, Seek, SeekFrom};
 use zip::ZipArchive;
 
 use super::probe::{self, MAGIC_MAX};
-use super::{Entry, MAX_ENTRY_BYTES, SourceError};
-
-/// How much capacity an entry's recorded size may reserve.
-///
-/// A real page is tens of kilobytes to a few megabytes, so a megabyte is a useful hint and
-/// anything beyond it is the archive's claim rather than a measurement. `read_to_end` grows
-/// geometrically from there.
-const HINT_CEILING: u64 = 1 << 20;
+use super::{Entry, HINT_CEILING, MAX_ENTRY_BYTES, SourceError, fill, is_directory, unsafe_name};
 
 /// The signature of the 32-bit end-of-central-directory record.
 const END_OF_DIRECTORY: [u8; 4] = [b'P', b'K', 5, 6];
@@ -203,75 +196,12 @@ impl<R: Read + Seek> ZipSource<R> {
     }
 }
 
-/// Whether a stored name is a directory rather than a file.
-///
-/// The archive says so by ending the name with a separator, and both are separators because
-/// a Windows-written archive may use either. The same rule `zip` applies internally, spelled
-/// out here because its helper is crate-private.
-fn is_directory(name: &str) -> bool {
-    matches!(name.as_bytes().last(), Some(b'/' | b'\\'))
-}
-
-/// Why a stored name must not be carried into the output archive, or `None` if it may be.
-///
-/// Every check is on the name as the archive stored it, before the extension is rewritten,
-/// and both separators are treated as separators because a Windows-written archive may use
-/// either.
-fn unsafe_name(name: &str) -> Option<&'static str> {
-    if name.is_empty() {
-        return Some("the name is empty");
-    }
-    if name.contains('\0') {
-        return Some("the name contains a NUL byte");
-    }
-    if name.starts_with('/') || name.starts_with('\\') {
-        return Some("the name is absolute");
-    }
-    // A drive letter (`C:\…`) or a UNC prefix (`\\host\share`), which are absolute on
-    // Windows however the leading characters read on a unix host.
-    let bytes = name.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
-        return Some("the name carries a drive letter");
-    }
-    // A component that escapes, in every spelling that resolves to one. Windows strips
-    // trailing dots and spaces from a path component, so `.. ` names the parent directory
-    // there while an exact comparison against `..` lets it through — and the name is going
-    // into an archive somebody will extract on Windows. A component of nothing but dots and
-    // spaces is refused whenever it holds two or more dots, which costs `...` and `. .` as
-    // well: neither is a page directory, and refusing is the answer this function exists to
-    // give.
-    if name.split(['/', '\\']).any(|component| {
-        let dots = component.bytes().filter(|&byte| byte == b'.').count();
-        dots >= 2 && component.bytes().all(|byte| byte == b'.' || byte == b' ')
-    }) {
-        return Some("the name escapes its own directory");
-    }
-    None
-}
-
 /// What one pass over an entry produced.
 enum Yielded {
     Entry(Entry),
     /// Not a page. The entry is left where it is rather than read past.
     Skipped,
     Failed(SourceError),
-}
-
-/// Reads up to `buffer.len()` bytes, tolerating short reads.
-///
-/// Not `read_exact`: an entry shorter than the longest magic is not an I/O error, it is an
-/// entry that cannot be a page, and the caller decides that from what was read.
-fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
-    let mut filled = 0;
-    while filled < buffer.len() {
-        match reader.read(&mut buffer[filled..]) {
-            Ok(0) => break,
-            Ok(read) => filled += read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(filled)
 }
 
 /// How many entries the archive's end record says it holds, or `None` when that cannot be

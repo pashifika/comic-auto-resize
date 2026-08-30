@@ -5,7 +5,7 @@
 //! credits ─────────────────────────────────────────────────────────┐
 //!    │ capacity W                                                  │ one per entry written
 //!    ▼                                                             │
-//! reader (1 thread) ─► work ─► workers (J) ─► done ─► writer (1 thread)
+//! reader (1 thread*) ─► work ─► workers (J) ─► done ─► writer (1 thread)
 //!    entry bytes    capacity J   decode      capacity J   BTreeMap ─► ZipWriter
 //!                               resize
 //!                               encode
@@ -34,8 +34,19 @@
 //! entry behind it, so it is already in flight and no later entry can take its place; when
 //! it is written a credit is returned. `credits` never blocks the writer either: at most `W`
 //! tokens exist, and the entry just written holds one of them, so there is always room.
+//!
+//! # \* The reader is one thread of this pipeline's making, not one OS thread
+//!
+//! Reading rar goes through libunrar, which is built with `RAR_SMP`: `Unpack::SetThreads`
+//! does `MaxUserThreads = Min(Threads, 8)` with `Threads` from `GetNumberOfThreads()`
+//! (`unpack.cpp`, `options.cpp`). So a *compressed* member can unpack across up to eight
+//! further OS threads inside what this diagram calls one reader, on top of the `J` workers,
+//! and the crate exposes no knob to cap it. Recorded rather than fixed: it does not affect
+//! the memory bound argued above, which counts entries in flight and not threads, but a
+//! comment claiming a thread count has to be true. Neither real rar sample reaches it —
+//! both are entirely stored — so the peak-RSS measurement is taken on a compressed fixture
+//! as well.
 
-use std::io::{Read, Seek};
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -49,7 +60,7 @@ use crate::page::{
 };
 use crate::policy::{self, Plan};
 use crate::sink::{Page, PageKey, Sink};
-use crate::source::{Source, SourceError};
+use crate::source::{Entries, SourceError};
 
 /// How much work may be in flight, as a multiple of the worker count.
 ///
@@ -116,10 +127,11 @@ pub struct Report {
 /// If the credit channel rejects a token while it is still being filled, which cannot
 /// happen: it was just created with room for exactly that many and nothing can have
 /// disconnected yet.
-pub fn run<R>(source: Source<R>, output: &Path, settings: &Settings) -> Result<Report, RunError>
-where
-    R: Read + Seek + Send,
-{
+pub fn run<S: Entries + Send>(
+    source: S,
+    output: &Path,
+    settings: &Settings,
+) -> Result<Report, RunError> {
     let capacities = Capacities::for_jobs(settings.jobs);
 
     let (credit_tx, credit_rx) = bounded::<()>(capacities.credits);
@@ -229,8 +241,8 @@ struct Job {
 }
 
 /// Reads the archive once, taking a credit before each entry.
-fn read_entries<R: Read + Seek>(
-    mut source: Source<R>,
+fn read_entries<S: Entries>(
+    mut source: S,
     credits: &crossbeam_channel::Receiver<()>,
     work: &crossbeam_channel::Sender<Job>,
 ) -> Result<(), RunError> {

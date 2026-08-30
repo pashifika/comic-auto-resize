@@ -37,6 +37,15 @@ exceptions = [
     # Builds mozjpeg from vendored C. Its expression is `IJG AND Zlib AND BSD-3-Clause`;
     # only the `IJG` term needs granting, the other two are already allowed above.
     { name = "mozjpeg-sys", allow = ["IJG"] },
+    # No entry for the rar dependency, and the absence is the finding rather than an
+    # oversight. `unrar-ng` and `unrar-ng-sys` both declare `MIT OR Apache-2.0`, so this
+    # check passes them — while the tree they build is RARLAB's UnRAR under a non-OSI
+    # licence at `vendor/unrar/license.txt`. cargo-deny reads licence files only at a
+    # crate's root and only when the name begins with `LICENSE` or `COPYING`, and it does
+    # not recurse, so it never sees that file and the sys crate ships no root licence at
+    # all. Granting an exception here would be worse than useless: it would imply the
+    # check had found something. `NOTICE.md` carries the obligation instead, and a test
+    # asserts it survives.
 ]
 
 [licenses.private]
@@ -64,5 +73,13 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # Deleted together with `[patch.crates-io]` in `Cargo.toml` when both
 # https://github.com/ImageOptim/mozjpeg-rust/pull/54 and
 # https://github.com/ImageOptim/mozjpeg-rust/pull/55 land in a release.
-allow-git = ["https://github.com/pashifika/mozjpeg-rust.git"]
+#
+# The `unrar-ng` fork, carrying one commit: a `DataSink` seam that lets a read be aborted
+# part-way, which `src/source/rar.rs` needs to bound an entry as `src/source/zip.rs` does.
+# Deleted together with its `[patch.crates-io]` entry when that change stops being needed.
+# Rationale, drift, and the upstream decision are in `Cargo.toml`.
+allow-git = [
+    "https://github.com/pashifika/mozjpeg-rust.git",
+    "https://github.com/pashifika/unrar.rs.git",
+]
 unused-allowed-source = "allow"
