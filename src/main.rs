@@ -99,7 +99,9 @@ fn run(cli: &Cli) -> Result<u32, CliError> {
 
     let file = open_zip(&cli.input)?;
     // The entry table is read here, so a malformed archive fails before the output is
-    // created. No `BufReader`: `ZipArchive` buffers its own reads.
+    // created. No `BufReader`: `by_index` seeks to every entry and `BufReader::seek` throws
+    // its buffer away, so a wrapper would be discarded once a page. The table's own reads
+    // are small and unbuffered — measured at 2 ms for 1000 entries.
     let source = Source::zip(file).map_err(|source| CliError::Archive {
         path: cli.input.clone(),
         source,

@@ -555,6 +555,10 @@ fn an_unsafe_entry_name_is_refused() {
         "\\absolute.jpg",
         "C:\\windows\\escape.jpg",
         "pages\\..\\..\\escape.jpg",
+        // Windows strips a component's trailing spaces and dots, so these name the parent
+        // there while an exact comparison against `..` would let them through.
+        "pages/.. /escape.jpg",
+        "pages\\.. \\escape.jpg",
     ] {
         let input = archive_bytes(&[(stored.to_owned(), page_bytes(64, 96))]);
         let directory = TempDir::new("unsafe-name");

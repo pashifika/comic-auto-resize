@@ -27,8 +27,8 @@ fn page(width: u32, height: u32) -> Vec<u8> {
 
 /// Builds a zip in memory, storing entries in exactly the order given.
 ///
-/// Stored, and `large_file(false)`, so each local header carries real sizes — which is what
-/// a sequential reader needs.
+/// Stored, and `large_file(false)` so no Zip64 extra field appears and the fixture stays a
+/// plain 32-bit archive.
 fn archive(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default()
@@ -128,6 +128,14 @@ fn a_non_image_entry_is_passed_over() {
     let yielded = read_all(&bytes).expect("reads");
     let names: Vec<_> = yielded.iter().map(|(_, name)| name.as_str()).collect();
     assert_eq!(names, ["page01.jpg"], "only the page is a page");
+    // The skipped leading entry costs no index: the writer's key sequence has no gaps,
+    // whether the reader counted table positions or yielded entries.
+    let indices: Vec<_> = yielded.iter().map(|(index, _)| *index).collect();
+    assert_eq!(
+        indices,
+        [0],
+        "a skipped entry must not advance the yielded index"
+    );
 }
 
 #[test]
@@ -283,4 +291,50 @@ fn an_entry_the_table_lists_but_cannot_locate_is_named() {
         matches!(&error, SourceError::Entry { name, .. } if name == "page02.jpg"),
         "expected an entry failure naming the entry, got {error}"
     );
+}
+
+/// Two entries stored under one name are refused, not silently reduced to one.
+///
+/// `zip` keys its entry table on the stored name, so the second record replaces the first and
+/// `len()` counts one. Without the cross-check against what the archive records, the run would
+/// write a book one page short and report success.
+#[test]
+fn two_entries_stored_under_one_name_are_refused() {
+    let entries = [
+        ("pages/page01.jpg", page(8, 8)),
+        ("pages/page01.jpg", page(64, 96)),
+        ("pages/page02.jpg", page(8, 8)),
+    ];
+    let bytes = framed_archive(&entries, Framing::default());
+
+    let error = read_all(&bytes).expect_err("a repeated stored name must be refused");
+    assert!(
+        matches!(
+            &error,
+            SourceError::RepeatedName { recorded, kept } if *recorded == 3 && *kept == 2
+        ),
+        "expected a repeated-name refusal counting both sides, got {error}"
+    );
+}
+
+/// A component Windows normalisation turns into `..` escapes just as `..` does.
+#[test]
+fn a_name_whose_component_normalises_to_a_parent_is_refused() {
+    for stored in [
+        "pages/.. /escape.jpg",
+        "pages\\.. \\escape.jpg",
+        ".../escape.jpg",
+    ] {
+        let bytes = framed_archive(&[(stored, page(8, 8))], Framing::default());
+
+        let error = read_all(&bytes).expect_err("a traversing name must be refused");
+        assert!(
+            matches!(
+                &error,
+                SourceError::UnsafeName { reason, .. }
+                    if *reason == "the name escapes its own directory"
+            ),
+            "{stored}: expected a traversal refusal, got {error}"
+        );
+    }
 }

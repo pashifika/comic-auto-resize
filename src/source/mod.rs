@@ -40,9 +40,10 @@ pub enum Source<R> {
     Zip(zip::ZipSource<R>),
 }
 
-/// The bound is the zip variant's, not the enum's: rar and 7z are solid, cannot be addressed
-/// by index, and will want `Read` alone. Keeping it here rather than on `Source` is what
-/// leaves room for variants whose readers differ.
+/// The bound is the zip variant's, not the enum's: `Source<R>` can be named without it, which
+/// is what keeps it out of `pipeline::run`'s signature. It is not yet the whole story for rar
+/// and 7z — `next_entry` lives on this block too, so a variant over a `Read`-only reader needs
+/// more than moving a bound. That is the Change that adds one to decide.
 impl<R: Read + Seek> Source<R> {
     /// Opens `reader` as a zip, reading its entry table.
     ///
@@ -71,9 +72,19 @@ impl<R: Read + Seek> Source<R> {
 pub enum SourceError {
     /// The archive's own structure, rather than one entry's: the entry table is read when
     /// the source is opened, so a truncated or malformed one is reported before any entry.
-    /// An entry that cannot be read is [`SourceError::Entry`], which names it.
+    /// An entry that cannot be read is [`SourceError::Entry`], which names it. Also carries
+    /// the unreachable case in the reader where the entry table has no name for a position
+    /// the table itself supplied.
     #[error("cannot read the archive: {0}")]
     Archive(#[from] ::zip::result::ZipError),
+    /// The entry table kept fewer entries than the archive records. `zip` keys the table on
+    /// the stored name, so two entries stored under one name byte for byte collapse into one
+    /// record — and the page that lost would leave the book without a word. Refused rather
+    /// than shortened: a book missing a page is the failure a reader notices last.
+    #[error(
+        "the archive records {recorded} entries but only {kept} can be addressed: two entries share a stored name"
+    )]
+    RepeatedName { recorded: u64, kept: u64 },
     #[error("{name}: cannot read the entry: {source}")]
     Entry {
         name: String,

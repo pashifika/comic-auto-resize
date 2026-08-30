@@ -82,8 +82,8 @@ pub fn page_bytes(width: u32, height: u32) -> Vec<u8> {
 
 /// Writes a Stored zip holding `entries` in exactly the order given.
 ///
-/// `large_file(false)` so each local header carries real sizes, which is what a sequential
-/// reader needs.
+/// `large_file(false)` so no Zip64 extra field appears and the fixture stays a plain 32-bit
+/// archive, which is what the hand-written framings in `framed_archive` are written against.
 pub fn write_archive(path: &Path, entries: &[(String, Vec<u8>)]) {
     let file = File::create(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let mut writer = ZipWriter::new(file);
@@ -117,9 +117,10 @@ pub fn write_pages(path: &Path, count: u32, width: u32, height: u32) {
 
 /// How a hand-written zip departs from what `ZipWriter` produces.
 ///
-/// `ZipWriter` always seeks back to fill each local header in, so an archive written the way
-/// a writer streaming to a non-seekable output writes one cannot be produced with it. These
-/// fixtures are assembled field by field instead.
+/// `ZipWriter::new_stream` can write the data-descriptor form, but nothing can write an
+/// archive whose directory order and layout disagree, whose entries record a size they do not
+/// hold, whose directory is cut short, or whose record points at no local header. One
+/// generator for all five, assembled field by field, rather than two sources of fixture.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Framing {
     /// Each local header records zero sizes and sets general-purpose flag bit 3; the real
@@ -198,8 +199,10 @@ pub fn framed_archive(entries: &[(&str, Vec<u8>)], framing: Framing) -> Vec<u8> 
     }
 
     if let Some(orphan) = framing.orphaned_entry {
-        // One byte into the first local header, where the signature cannot match.
-        offsets[orphan] = 1;
+        // The last byte before the central directory: past every entry, so no entry's data
+        // overruns it, and the four bytes read there begin with the directory's own
+        // signature rather than a local header's.
+        offsets[orphan] = len32(&bytes).saturating_sub(1);
     }
 
     let directory_offset = len32(&bytes);

@@ -37,12 +37,12 @@ crossbeam-channel = "=0.5.16"
 # Both pinned exactly: a native build that changes underneath a previously green run is
 # the hardest kind of failure to attribute.
 fast_image_resize = "=6.1.0"
-# Not used directly. `zip` declares `flate2` with defaults off and only its
-# `deflate-flate2-zlib-*` variants pick a backend, so naming one needs a direct
-# dependency. `rust_backend` is `miniz_oxide`, pure safe Rust; `zlib-rs` is faster but a
-# large translated C body, and inflate here reads JPEG, which Deflate keeps in stored
-# blocks. Swap both lines to `deflate-flate2-zlib-rs` if the reader ever measures as the
-# bottleneck.
+# Named directly because `zip` declares `flate2` with defaults off and only its
+# `deflate-flate2-zlib-*` variants pick a backend, so choosing one needs a direct dependency.
+# `rust_backend` is `miniz_oxide`, pure safe Rust; `zlib-rs` is faster but a large translated C
+# body, and inflate here reads JPEG, which Deflate keeps in stored blocks. Swap both lines to
+# `deflate-flate2-zlib-rs` if the reader ever measures as the bottleneck. The test support
+# module also uses its `Crc`, which is the checksum `zip` verifies entries against.
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
 mozjpeg = "=0.10.13"
 # Not a new crate: `mozjpeg` already builds it. Direct only for libjpeg's `JWRN_*`

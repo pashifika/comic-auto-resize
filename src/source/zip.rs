@@ -19,8 +19,13 @@
 //! The entry table is also the authority on order. A malformed archive can lay its data out
 //! in one order and list it in another; the table's order is the one every other reader
 //! presents, including the viewer the output will be opened in.
+//!
+//! One thing the table does not survive intact. `ZipArchive` keys it on the stored name, so
+//! two entries stored under one name byte for byte collapse into a single record and the
+//! loser would leave the book without a word. The end record counts what the archive says it
+//! holds; a disagreement with what the table kept is refused rather than shortened.
 
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, SeekFrom};
 
 use zip::ZipArchive;
 
@@ -33,6 +38,9 @@ use super::{Entry, MAX_ENTRY_BYTES, SourceError};
 /// anything beyond it is the archive's claim rather than a measurement. `read_to_end` grows
 /// geometrically from there.
 const HINT_CEILING: u64 = 1 << 20;
+
+/// The signature of the 32-bit end-of-central-directory record.
+const END_OF_DIRECTORY: [u8; 4] = [b'P', b'K', 5, 6];
 
 /// An archive whose entry table has been read, walked once in that table's order.
 pub struct ZipSource<R> {
@@ -51,9 +59,19 @@ impl<R: Read + Seek> ZipSource<R> {
     ///
     /// [`SourceError::Archive`] when the entry table cannot be read. It is read here, before
     /// any entry, so a truncated or malformed one fails the run before a page is processed.
-    pub fn new(reader: R) -> Result<Self, SourceError> {
+    /// [`SourceError::RepeatedName`] when the table kept fewer entries than the archive
+    /// records, which is what two entries stored under one name look like from here.
+    pub fn new(mut reader: R) -> Result<Self, SourceError> {
+        let recorded = recorded_entry_count(&mut reader).map_err(::zip::result::ZipError::Io)?;
+        let archive = ZipArchive::new(reader)?;
+        if let Some(recorded) = recorded {
+            let kept = archive.len() as u64;
+            if recorded > kept {
+                return Err(SourceError::RepeatedName { recorded, kept });
+            }
+        }
         Ok(Self {
-            archive: ZipArchive::new(reader)?,
+            archive,
             next_position: 0,
             next_index: 0,
         })
@@ -215,7 +233,17 @@ fn unsafe_name(name: &str) -> Option<&'static str> {
     if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
         return Some("the name carries a drive letter");
     }
-    if name.split(['/', '\\']).any(|component| component == "..") {
+    // A component that escapes, in every spelling that resolves to one. Windows strips
+    // trailing dots and spaces from a path component, so `.. ` names the parent directory
+    // there while an exact comparison against `..` lets it through — and the name is going
+    // into an archive somebody will extract on Windows. A component of nothing but dots and
+    // spaces is refused whenever it holds two or more dots, which costs `...` and `. .` as
+    // well: neither is a page directory, and refusing is the answer this function exists to
+    // give.
+    if name.split(['/', '\\']).any(|component| {
+        let dots = component.bytes().filter(|&byte| byte == b'.').count();
+        dots >= 2 && component.bytes().all(|byte| byte == b'.' || byte == b' ')
+    }) {
         return Some("the name escapes its own directory");
     }
     None
@@ -244,4 +272,47 @@ fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
         }
     }
     Ok(filled)
+}
+
+/// How many entries the archive's end record says it holds, or `None` when that record does
+/// not express the count.
+///
+/// Not a second archive parser. The end-of-central-directory record is the one structure the
+/// format puts at a defined place — last in the file, followed only by its own comment, whose
+/// length the record states. A candidate is accepted only when that stated length matches the
+/// bytes that follow it, which is what separates this from scanning for a signature that can
+/// also occur inside entry data. Searched from the end, as `zip` searches, so a crafted
+/// archive is read the same way by both.
+///
+/// A count of `0xFFFF` means the real one is in the Zip64 end record. That chain is not
+/// followed: the count is reported as unknown rather than guessed, so an archive of 65,535
+/// entries or more is read without this cross-check. No book has 65,535 pages.
+fn recorded_entry_count(reader: &mut (impl Read + Seek)) -> std::io::Result<Option<u64>> {
+    /// Signature, four `u16` fields, two `u32`, then the comment length: 22 bytes.
+    const RECORD: usize = 22;
+    /// The comment length is a `u16`, so the record begins no earlier than this from the end.
+    const MAX_TRAILER: u64 = RECORD as u64 + u16::MAX as u64;
+
+    let length = reader.seek(SeekFrom::End(0))?;
+    let window = length.min(MAX_TRAILER);
+    if window < RECORD as u64 {
+        return Ok(None);
+    }
+    reader.seek(SeekFrom::Start(length - window))?;
+    let window = usize::try_from(window).expect("the window is at most 65,557 bytes");
+    let mut tail = vec![0; window];
+    reader.read_exact(&mut tail)?;
+
+    for start in (0..=window - RECORD).rev() {
+        if tail[start..start + END_OF_DIRECTORY.len()] != END_OF_DIRECTORY {
+            continue;
+        }
+        let comment = usize::from(u16::from_le_bytes([tail[start + 20], tail[start + 21]]));
+        if start + RECORD + comment != window {
+            continue;
+        }
+        let count = u16::from_le_bytes([tail[start + 10], tail[start + 11]]);
+        return Ok((count != u16::MAX).then(|| u64::from(count)));
+    }
+    Ok(None)
 }
