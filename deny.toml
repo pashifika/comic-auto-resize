@@ -26,9 +26,18 @@ allow = [
 ]
 confidence-threshold = 0.8
 unused-allowed-license = "allow"
-# mozjpeg (IJG) arrives with the image pipeline, not here. An exception added before its
-# dependency exists would be a rule nobody could evaluate.
-exceptions = []
+# `IJG` is not OSI-approved, so it stays out of the allow-list above and is granted per
+# crate instead: an exception names the crate it applies to, an allow-list entry would
+# silently cover every future IJG dependency.
+exceptions = [
+    # The mozjpeg binding. `IJG` permits use, modification, and redistribution of source
+    # and binaries provided the origin is not misrepresented; it is the licence libjpeg
+    # has carried since 1991 and is standard for JPEG tooling.
+    { name = "mozjpeg", allow = ["IJG"] },
+    # Builds mozjpeg from vendored C. Its expression is `IJG AND Zlib AND BSD-3-Clause`;
+    # only the `IJG` term needs granting, the other two are already allowed above.
+    { name = "mozjpeg-sys", allow = ["IJG"] },
+]
 
 [licenses.private]
 ignore = false
@@ -51,5 +60,8 @@ unknown-git = "deny"
 # branch that can move underneath a previously green build.
 required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# The `mozjpeg` fork carrying `Compress::set_dct_method`. Deleted together with
+# `[patch.crates-io]` in `Cargo.toml` when
+# https://github.com/ImageOptim/mozjpeg-rust/pull/54 lands in a release.
+allow-git = ["https://github.com/pashifika/mozjpeg-rust.git"]
 unused-allowed-source = "allow"
