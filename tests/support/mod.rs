@@ -146,6 +146,9 @@ pub struct Framing {
     /// Bytes appended after the end record. The format allows only the record's own comment
     /// there, but readers tolerate garbage, so a reader must too.
     pub trailing_bytes: usize,
+    /// The length of the archive comment the end record states and carries. The format allows
+    /// up to 65,535 bytes there, which pushes the record that far from the end of the file.
+    pub comment_bytes: usize,
 }
 
 /// Writes a Stored zip byte by byte, with `framing`'s departures from the ordinary form.
@@ -249,7 +252,9 @@ pub fn framed_archive(entries: &[(&str, Vec<u8>)], framing: Framing) -> Vec<u8> 
     push16(&mut bytes, framing.recorded_total.unwrap_or(count)); // entries in total
     push32(&mut bytes, directory_len);
     push32(&mut bytes, directory_offset);
-    push16(&mut bytes, 0); // archive comment
+    let comment = u16::try_from(framing.comment_bytes).expect("a comment is at most 65,535 bytes");
+    push16(&mut bytes, comment); // archive comment length
+    bytes.resize(bytes.len() + framing.comment_bytes, b'#');
     bytes.resize(bytes.len() + framing.trailing_bytes, 0);
     bytes
 }

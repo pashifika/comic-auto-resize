@@ -300,8 +300,8 @@ fn an_entry_the_table_lists_but_cannot_locate_is_named() {
 /// `len()` counts one. Without the cross-check against what the archive records, the run would
 /// write a book one page short and report success.
 ///
-/// The two framings after the plain case are the ways the cross-check was got wrong once, so
-/// they are the ways it can silently stop working:
+/// The framings after the plain case are the ways the cross-check was got wrong once, so they
+/// are the ways it can silently stop working:
 ///
 /// - The end record states the entry count twice, once for this disk and once in total. `zip`
 ///   counts records with the first; a reader taking the second compares two independent
@@ -309,6 +309,10 @@ fn an_entry_the_table_lists_but_cannot_locate_is_named() {
 /// - The record's comment is the last thing the format puts in the file, but readers tolerate
 ///   garbage after it — `zip` deliberately relaxed that check. A reader requiring the comment
 ///   to end exactly at the end of the file is disabled by one trailing byte.
+/// - The comment may be 65,535 bytes long, which puts the record that far from the end and the
+///   bytes *before* the record further still. A reader whose search window has no room for
+///   what precedes the record cannot establish the record's Zip64 status, and gives up on a
+///   perfectly conformant archive.
 #[test]
 fn two_entries_stored_under_one_name_are_refused() {
     let entries = [
@@ -328,6 +332,14 @@ fn two_entries_stored_under_one_name_are_refused() {
         },
         Framing {
             trailing_bytes: 1,
+            ..Framing::default()
+        },
+        Framing {
+            comment_bytes: usize::from(u16::MAX),
+            ..Framing::default()
+        },
+        Framing {
+            comment_bytes: usize::from(u16::MAX) - 20,
             ..Framing::default()
         },
     ] {

@@ -294,19 +294,22 @@ fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
 ///   excludes an archive with data prepended, whose recorded offsets are relative to the
 ///   archive rather than to the file.
 /// - The count is the entries *on this disk*, at offset 8, because that is the field `zip`
-///   reads records with. The total at offset 10 reaches `zip` only as one of three Zip64
-///   hints and is discarded when no locator follows, so counting with it would compare two
+///   bounds its record loop with. Offset 10 never bounds that loop: it reaches `zip` as one of
+///   three Zip64 hints in `may_be_zip64`, and as the empty-archive short-circuit in the zip32
+///   branch, and neither is a count of records read. Counting with it would compare two
 ///   independent numbers.
 /// - A Zip64 locator immediately before the record, or a count of `0xFFFF`, means the
 ///   authoritative count is in the Zip64 end record. That chain is not followed: no book has
 ///   65,535 pages, and a second footer parser is the thing this function exists not to be.
 ///
-/// The search covers the last 65,557 bytes, which is where the format allows the record to be:
-/// the comment before it is a `u16` length. `zip` searches the whole file, so an archive with
-/// more than 65,535 bytes appended after its end record is read by `zip` and not cross-checked
-/// here. That archive is not conformant, and the check exists to catch an archive that lost an
-/// entry by accident rather than one built to lose one — scanning a 300 MB file backwards for a
-/// signature would be its own guess about where to stop.
+/// The search covers the last 65,577 bytes: the record, the longest comment the format allows
+/// before it, and the locator that may precede it, because a record whose preceding bytes
+/// cannot be read is a record whose Zip64 status cannot be established. `zip` searches the
+/// whole file, so an archive with a comment and trailing garbage together running past 65,555
+/// bytes is read by `zip` and not cross-checked here. That archive is not conformant, and the
+/// check exists to catch an archive that lost an entry by accident rather than one built to
+/// lose one — scanning a 300 MB file backwards for a signature would be its own guess about
+/// where to stop.
 fn recorded_entry_count(reader: &mut (impl Read + Seek)) -> std::io::Result<Option<u64>> {
     /// Signature, four `u16` fields, two `u32`, then the comment length: 22 bytes.
     const RECORD: usize = 22;
@@ -315,8 +318,9 @@ fn recorded_entry_count(reader: &mut (impl Read + Seek)) -> std::io::Result<Opti
     const ZIP64_LOCATOR: [u8; 4] = [b'P', b'K', 6, 7];
     /// The locator's signature plus its fixed block.
     const LOCATOR: usize = 20;
-    /// The comment length is a `u16`, so the record begins no earlier than this from the end.
-    const MAX_TRAILER: u64 = RECORD as u64 + u16::MAX as u64;
+    /// The comment length is a `u16` and the locator that may precede the record is another
+    /// 20 bytes, so the window begins no earlier than this from the end.
+    const MAX_TRAILER: u64 = RECORD as u64 + u16::MAX as u64 + LOCATOR as u64;
 
     let length = reader.seek(SeekFrom::End(0))?;
     let window = length.min(MAX_TRAILER);
@@ -325,7 +329,7 @@ fn recorded_entry_count(reader: &mut (impl Read + Seek)) -> std::io::Result<Opti
     }
     let base = length - window;
     reader.seek(SeekFrom::Start(base))?;
-    let window = usize::try_from(window).expect("the window is at most 65,557 bytes");
+    let window = usize::try_from(window).expect("the window is at most 65,577 bytes");
     let mut tail = vec![0; window];
     reader.read_exact(&mut tail)?;
 
@@ -347,7 +351,9 @@ fn recorded_entry_count(reader: &mut (impl Read + Seek)) -> std::io::Result<Opti
         let zip64 = match start.checked_sub(LOCATOR) {
             Some(at) => tail[at..at + ZIP64_LOCATOR.len()] == ZIP64_LOCATOR,
             // The bytes before the record are outside the window, so the locator's absence
-            // cannot be established. Reachable only behind a comment of almost 64 KiB.
+            // cannot be established. The window has room for the locator ahead of the longest
+            // comment the format allows, so this is only reachable when a comment and trailing
+            // garbage together run past the window — which no conformant archive does.
             None if base > 0 => return Ok(None),
             None => false,
         };
