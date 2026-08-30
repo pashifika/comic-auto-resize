@@ -355,6 +355,30 @@ jobs:
             echo "mozjpeg-sys: WITH_SIMD confirmed in ${config}"
           done
 
+      # The 7z tests build their fixtures with a 7-Zip archiver and skip, loudly, when there
+      # is none. That is the right behaviour on a contributor's machine and the wrong one
+      # here: a suite that skipped every test is not a suite that passed. Both images ship an
+      # archiver, so this asserts rather than installs -- and turns "the image dropped it"
+      # into a named failure instead of a green run that verified nothing.
+      - name: Confirm a 7-Zip archiver is available
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          for program in 7zz 7z; do
+            if command -v "${program}" >/dev/null 2>&1; then
+              # No pipe: `pipefail` plus a `head` that closes early turns a working
+              # archiver into a failed step.
+              "${program}" i >/dev/null
+              echo "7z fixtures will be written by $(command -v "${program}")"
+              exit 0
+            fi
+          done
+
+          echo "::error::no 7-Zip archiver on PATH; every test in tests/sevenz_source.rs would skip"
+          exit 1
+
       - name: Lint
         shell: bash
         timeout-minutes: 15
@@ -468,6 +492,26 @@ jobs:
             fi
             echo "mozjpeg-sys: WITH_SIMD confirmed in ${config}"
           done
+
+      # Same assertion as the windows job, for the same reason: a skipped 7z suite must not
+      # be mistaken for a passing one.
+      - name: Confirm a 7-Zip archiver is available
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          for program in 7zz 7z; do
+            if command -v "${program}" >/dev/null 2>&1; then
+              # No pipe: `pipefail` plus a `head` that closes early turns a working
+              # archiver into a failed step.
+              "${program}" i >/dev/null
+              echo "7z fixtures will be written by $(command -v "${program}")"
+              exit 0
+            fi
+          done
+
+          echo "::error::no 7-Zip archiver on PATH; every test in tests/sevenz_source.rs would skip"
+          exit 1
 
       - name: Lint
         timeout-minutes: 15

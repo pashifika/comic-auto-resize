@@ -1,15 +1,16 @@
-//! Reading an archive as an ordered sequence of named pages.
+//! Reading an input as an ordered sequence of named pages.
 //!
-//! An enum rather than trait objects: the set of archive formats is closed and known at
-//! compile time, so a `match` costs nothing and every variant's reading discipline stays
-//! visible. zip and rar are here; 7z and a plain directory arrive later.
+//! An enum rather than trait objects: the set of inputs is closed and known at compile time,
+//! so a `match` costs nothing and every variant's reading discipline stays visible. All four
+//! are here — zip, rar, 7z, and a plain directory, which is the one that is not an archive at
+//! all and so the one that has to choose its own order.
 //!
 //! The enum carries no type parameter, and that is the decision Change 1 deferred. Only the
-//! zip variant has a reader at all — `unrar` is handed a path, and so will the directory
-//! variant be — and the only reader this tool ever opens is a [`File`], because the input is
-//! a path on the command line. So [`ZipSource`] stays generic, which is honest, and the enum
-//! names the one type production uses. A generic here would have meant every later variant
-//! ignoring it.
+//! zip variant has a reader at all — `unrar` is handed a path, the directory variant a
+//! directory, and 7z owns its own [`File`] on a decoder thread — and the only reader this
+//! tool ever opens is a [`File`], because the input is a path on the command line. So
+//! [`ZipSource`] stays generic, which is honest, and the enum names the one type production
+//! uses. A generic here would have meant every later variant ignoring it.
 //!
 //! [`Entries`] is what the pipeline consumes. It exists so `pipeline::run` is not welded to
 //! this enum: one test drives the pipeline over a [`ZipSource`] wrapping an instrumented
@@ -17,14 +18,26 @@
 //! restraint, and a concrete `ZipSource<File>` cannot be instrumented. Dispatch stays static.
 //! Deliberately not `Iterator`, whose adapters would make `source.collect()` — the unbounded
 //! buffering this pipeline exists to prevent — a one-liner that compiles.
+//!
+//! [`Entries`] stays pull-shaped even though 7z's decoder pushes. Flipping the trait would
+//! not avoid the extra entry a push-shaped source holds — in a push shape every source reads
+//! before it offers, so all four would pay it rather than one — and it would rewrite a trait
+//! introduced one Change ago along with all its implementors. If a second push-only source
+//! ever arrives, that trade changes and the trait should flip.
 
+mod directory;
 mod probe;
 mod rar;
+mod sevenz;
 mod signature;
 mod zip;
 
-pub use probe::{CANDIDATES, Candidate, Format, MAGIC_MAX, declared_format, output_name, probe};
+pub use directory::DirectorySource;
+pub use probe::{
+    CANDIDATES, Candidate, Format, MAGIC_MAX, Names, Naming, declared_format, output_name, probe,
+};
 pub use rar::RarSource;
+pub use sevenz::SevenZSource;
 pub use signature::{
     ARCHIVE_CANDIDATES, ARCHIVE_MAGIC_MAX, ArchiveCandidate, ArchiveFormat, detect,
     readable_formats,
@@ -84,10 +97,13 @@ pub trait Entries {
     fn next_entry(&mut self) -> Option<Result<Entry, SourceError>>;
 }
 
-/// An archive being read once, in the order its entries are recorded in.
+/// An input being read once, in the order its entries are recorded in — or, for a directory,
+/// in the order the reader chose.
 pub enum Source {
     Zip(ZipSource<File>),
     Rar(RarSource),
+    SevenZ(SevenZSource),
+    Directory(DirectorySource),
 }
 
 /// Names the format and nothing else. A reader's internals are a cursor into an archive and
@@ -97,23 +113,42 @@ impl std::fmt::Debug for Source {
         match self {
             Self::Zip(_) => f.write_str("Source::Zip"),
             Self::Rar(_) => f.write_str("Source::Rar"),
+            Self::SevenZ(_) => f.write_str("Source::SevenZ"),
+            Self::Directory(_) => f.write_str("Source::Directory"),
         }
     }
 }
 
 impl Source {
-    /// Opens the archive at `path`, choosing the reader from its leading bytes.
+    /// Opens the input at `path`, deciding its *kind* before its format.
     ///
-    /// The extension is not consulted; see [`signature`] for why. The whole decision lives
-    /// here rather than in the binary so that "a rar named `.cbz` reads as rar" is a property
-    /// a test can assert without running a process.
+    /// A directory is an input in its own right and has no leading bytes to probe, so the
+    /// question "is this a directory" is asked first and the signature probe is reached only
+    /// for a file. For a file the extension is not consulted; see [`signature`] for why. The
+    /// whole decision lives here rather than in the binary so that "a rar named `.cbz` reads
+    /// as rar" is a property a test can assert without running a process.
+    ///
+    /// `naming` decides whether an entry reaches the output under the name the input stored
+    /// or under one carrying its own position, and it is threaded from here because the
+    /// positional rule needs an entry total that only each reader can supply.
     ///
     /// # Errors
     ///
-    /// [`SourceError::NotAnArchive`] when the leading bytes match no format this build reads,
+    /// [`SourceError::NotAnArchive`] when a file's leading bytes match no format this build
+    /// reads, [`SourceError::NotReadable`] when the path is neither a file nor a directory,
     /// [`SourceError::Input`] when `path` cannot be opened or read, and whatever the chosen
     /// reader returns.
-    pub fn open(path: &Path) -> Result<Self, SourceError> {
+    pub fn open(path: &Path, naming: Naming) -> Result<Self, SourceError> {
+        let metadata = std::fs::metadata(path).map_err(|source| SourceError::Input { source })?;
+        if metadata.is_dir() {
+            return Self::directory(path, naming);
+        }
+        if !metadata.is_file() {
+            // A device, a socket, a fifo. Refused before it is opened, because opening a
+            // fifo blocks until a writer appears and there is nothing to read from the rest.
+            return Err(SourceError::NotReadable);
+        }
+
         let mut file = File::open(path).map_err(|source| SourceError::Input { source })?;
 
         let mut header = [0; ARCHIVE_MAGIC_MAX];
@@ -124,14 +159,19 @@ impl Source {
                 // Rewound so the reader sees the whole archive.
                 file.seek(std::io::SeekFrom::Start(0))
                     .map_err(|source| SourceError::Input { source })?;
-                Self::zip(file)
+                Self::zip(file, naming)
             }
             Some(ArchiveFormat::Rar) => {
                 // `unrar` is given the path, not a stream, so the probe handle has no further
                 // use. Dropped explicitly: left to the end of this scope it would still be
                 // open while `unrar` opened the same file a second time.
                 drop(file);
-                Self::rar(path)
+                Self::rar(path, naming)
+            }
+            Some(ArchiveFormat::SevenZ) => {
+                file.seek(std::io::SeekFrom::Start(0))
+                    .map_err(|source| SourceError::Input { source })?;
+                Self::sevenz(file, naming)
             }
             None => Err(SourceError::NotAnArchive {
                 formats: readable_formats(),
@@ -145,8 +185,8 @@ impl Source {
     ///
     /// [`SourceError::Archive`] when the entry table cannot be read, which is established
     /// here rather than at the first entry.
-    pub fn zip(file: File) -> Result<Self, SourceError> {
-        Ok(Self::Zip(ZipSource::new(file)?))
+    pub fn zip(file: File, naming: Naming) -> Result<Self, SourceError> {
+        Ok(Self::Zip(ZipSource::new(file, naming)?))
     }
 
     /// Opens the rar archive at `path`, reading its archive header only.
@@ -161,8 +201,27 @@ impl Source {
     ///
     /// [`SourceError::UnsafePath`] when `path` contains an interior NUL, which `unrar` panics
     /// on rather than reporting. [`SourceError::Rar`] when the archive header cannot be read.
-    pub fn rar(path: &Path) -> Result<Self, SourceError> {
-        Ok(Self::Rar(RarSource::open(path)?))
+    pub fn rar(path: &Path, naming: Naming) -> Result<Self, SourceError> {
+        Ok(Self::Rar(RarSource::open(path, naming)?))
+    }
+
+    /// Opens `file` as a 7z, reading its header and starting the decoder thread.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceError::SevenZ`] when the header cannot be read.
+    pub fn sevenz(file: File, naming: Naming) -> Result<Self, SourceError> {
+        Ok(Self::SevenZ(SevenZSource::new(file, naming)?))
+    }
+
+    /// Lists the directory at `path`, choosing the order its pages will be read in.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceError::Input`] when the tree cannot be listed, and the name refusals the walk
+    /// makes — see [`DirectorySource::open`].
+    pub fn directory(path: &Path, naming: Naming) -> Result<Self, SourceError> {
+        Ok(Self::Directory(DirectorySource::open(path, naming)?))
     }
 }
 
@@ -171,6 +230,8 @@ impl Entries for Source {
         match self {
             Self::Zip(source) => source.next_entry(),
             Self::Rar(source) => source.next_entry(),
+            Self::SevenZ(source) => source.next_entry(),
+            Self::Directory(source) => source.next_entry(),
         }
     }
 }
@@ -247,7 +308,10 @@ pub(crate) fn unsafe_name(name: &str) -> Option<&'static str> {
 /// Not `read_exact`: an input shorter than the longest signature, or an entry shorter than
 /// the longest magic, is not an I/O error — it is something that cannot be what was hoped
 /// for, and the caller decides that from what was read.
-pub(crate) fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
+///
+/// Generic rather than `impl Read` so an unsized reader passes: 7z hands its callback a
+/// `&mut dyn Read`, and the head is read off it exactly as it is off a zip entry.
+pub(crate) fn fill<R: Read + ?Sized>(reader: &mut R, buffer: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0;
     while filled < buffer.len() {
         match reader.read(&mut buffer[filled..]) {
@@ -321,6 +385,29 @@ pub enum SourceError {
         "{name}: this entry continues into another volume, so the input is one part of a multi-volume set"
     )]
     Split { name: String },
+    /// The 7z archive's own structure, the counterpart to [`SourceError::Archive`]. A
+    /// separate variant only because `sevenz-rust2`'s error type is neither `zip`'s nor
+    /// `unrar`'s; the case is the same one. It also carries an archive whose headers are
+    /// encrypted, and one written with a codec this build does not carry — `PPMd` and
+    /// `BZip2` are licence-blocked rather than merely absent, so both arrive here.
+    #[error("cannot read the archive: {0}")]
+    SevenZ(#[from] sevenz_rust2::Error),
+    /// The 7z decoder runs on a thread of the reader's making, and the pipeline's own
+    /// `catch_unwind` sits on the outer reader thread where it would not see a panic here.
+    /// Reported rather than lost, because a run that dies without a message is the worst
+    /// kind to be handed.
+    #[error("the 7z decoder stopped unexpectedly")]
+    SevenZPanicked,
+    /// A symbolic link inside a directory input. Not followed — its target may sit outside
+    /// the input entirely — and refused rather than passed over, because the walk cannot
+    /// tell a link to a page from a link to a chapter of them without resolving it, and a
+    /// page that vanishes in silence is the failure this project refuses above all others.
+    #[error("{name}: refusing the entry because it is a symbolic link, which is not followed")]
+    SymbolicLink { name: String },
+    /// The input is neither a file nor a directory: a device, a socket, a fifo. Refused
+    /// before it is opened, because opening a fifo blocks until a writer appears.
+    #[error("not a file or a directory")]
+    NotReadable,
     /// The *input path*, not an entry name. `unrar` panics rather than erroring when the
     /// path it is given contains an interior NUL (`pathed/all.rs`, `WideCString::from_os_str`
     /// followed by `expect`), and a panic in the reader thread costs the run its message.

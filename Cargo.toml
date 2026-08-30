@@ -3,10 +3,12 @@ name = "comic-auto-resize"
 version = "2.0.0-dev"
 edition = "2024"
 # The crate's own floor, separate from the channel pinned in `rust-toolchain.toml`.
-# Raised from 1.87 to 1.88 because `zip` 8.6.0 declares 1.88; `fast_image_resize` 6.1.0
-# declares 1.87 and was the previous reason. Lowering it again means dropping `zip`, so
-# the dependency that demands it is named rather than left to be bisected for.
-rust-version = "1.88"
+# Raised from 1.88 to 1.93 because `sevenz-rust2` 0.22.2 declares 1.93; `zip` 8.6.0 declares
+# 1.88 and was the previous reason. Pinning `sevenz-rust2` 0.20.2 to keep 1.85 instead would
+# give up the path-traversal fix, the malformed-archive hardening, the coder-stream-count
+# overflow fix and the Delta/BCJ2 folder fix. Lowering the floor again means dropping a
+# dependency, so the one that demands it is named rather than left to be bisected for.
+rust-version = "1.93"
 description = "Auto-resize the pages of a comic archive and repack them as zip"
 license = "Apache-2.0"
 repository = "https://github.com/pashifika/comic-auto-resize"
@@ -50,6 +52,19 @@ mozjpeg = "=0.10.13"
 # hard-coded integers from a C enum. Features are left off here so the native build stays
 # entirely `mozjpeg`'s to configure.
 mozjpeg-sys = { version = "=2.2.3", default-features = false }
+# 7z reading, pure Rust — no build script and no C, unlike rar. Defaults are refused for a
+# licence reason rather than a size one, which is the difference `deny.toml` cares about:
+# `bzip2` reaches `libbz2-rs-sys` declaring `bzip2-1.0.6` and `ppmd` reaches `ppmd-rust`
+# declaring `CC0-1.0 OR MIT-0`, and neither `bzip2-1.0.6` nor `MIT-0` is in the allow-list, so
+# `cargo deny` refuses the build outright. `aes256` (encrypted archives this build does not
+# read), `compress` (writing, and the output is zip) and `util` (whole-archive extraction to
+# disk, which this pipeline never does) are off because they are capability the binary cannot
+# use. What remains covers Copy, LZMA, LZMA2, BCJ, BCJ2 and Delta — 7-Zip writes LZMA2 by
+# default and Copy for "store", so an ordinary comic archive is read.
+#
+# No `[patch.crates-io]` entry: the entry reader is handed `&mut dyn Read`, so
+# `MAX_ENTRY_BYTES` applies to the read itself with no fork, which is what rar needed one for.
+sevenz-rust2 = { version = "=0.22.2", default-features = false }
 # Already in the tree through `fast_image_resize`, so it adds no dependency and no new
 # licence: typed page errors the pipeline can branch on, without hand-written `Display`.
 thiserror = "=2.0.20"

@@ -29,7 +29,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use zip::ZipArchive;
 
-use super::probe::{self, MAGIC_MAX};
+use super::probe::{self, MAGIC_MAX, Names, Naming};
 use super::{Entry, HINT_CEILING, MAX_ENTRY_BYTES, SourceError, fill, is_directory, unsafe_name};
 
 /// The signature of the 32-bit end-of-central-directory record.
@@ -43,6 +43,7 @@ pub struct ZipSource<R> {
     /// Position in the sequence of *yielded* entries, so the writer's key has no gaps where
     /// the archive held something that was not a page.
     next_index: u32,
+    names: Names,
 }
 
 impl<R: Read + Seek> ZipSource<R> {
@@ -54,7 +55,7 @@ impl<R: Read + Seek> ZipSource<R> {
     /// any entry, so a truncated or malformed one fails the run before a page is processed.
     /// [`SourceError::RepeatedName`] when the table kept fewer entries than the archive
     /// records, which is what two entries stored under one name look like from here.
-    pub fn new(mut reader: R) -> Result<Self, SourceError> {
+    pub fn new(mut reader: R, naming: Naming) -> Result<Self, SourceError> {
         let recorded = recorded_entry_count(&mut reader).map_err(::zip::result::ZipError::Io)?;
         let archive = ZipArchive::new(reader)?;
         if let Some(recorded) = recorded {
@@ -63,10 +64,16 @@ impl<R: Read + Seek> ZipSource<R> {
                 return Err(SourceError::RepeatedName { recorded, kept });
             }
         }
+        let names = match naming {
+            Naming::Stored => Names::stored(),
+            // The entry table is read by now, so the entry total costs nothing here.
+            Naming::ByPosition => Names::by_position(archive.len()),
+        };
         Ok(Self {
             archive,
             next_position: 0,
             next_index: 0,
+            names,
         })
     }
 
@@ -189,7 +196,7 @@ impl<R: Read + Seek> ZipSource<R> {
 
         Yielded::Entry(Entry {
             index,
-            name: probe::output_name(&name, declared),
+            name: self.names.of(&name, declared),
             format: declared,
             bytes,
         })

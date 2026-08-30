@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use comic_auto_resize::page::{DecodeSettings, EncodeSettings, Filter, PageErrorKind};
 use comic_auto_resize::pipeline::{self, Capacities, RunError, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
-use comic_auto_resize::sink::default_output;
-use comic_auto_resize::source::{SourceError, ZipSource};
+use comic_auto_resize::sink::InputKind;
+use comic_auto_resize::source::{Naming, SourceError, ZipSource};
 
 use support::{
     Framing, TempDir, corrupt_scan, framed_archive, jpeg_size, page_bytes, read_archive,
@@ -27,6 +27,16 @@ use support::{
 
 /// The binary under test, built by Cargo for this integration test at the same profile.
 const BINARY: &str = env!("CARGO_BIN_EXE_comic-auto-resize");
+
+/// The output path for a file input, which every test here uses.
+///
+/// `sink::default_output` now takes the input's kind, because a directory has no extension to
+/// remove; a file input can never be the unnamed case, so the `Result` is unwrapped here
+/// rather than at every callsite.
+fn default_output(input: &std::path::Path) -> std::path::PathBuf {
+    comic_auto_resize::sink::default_output(input, InputKind::File)
+        .expect("a file input always has a name")
+}
 
 fn settings(jobs: usize) -> Settings {
     Settings {
@@ -64,7 +74,7 @@ impl<R: Seek> Seek for Counting<R> {
 
 /// Runs the pipeline over an in-memory archive, writing to `output`.
 fn run(input: &[u8], output: &Path, jobs: usize) -> Result<u32, RunError> {
-    let source = ZipSource::new(std::io::Cursor::new(input.to_vec()))?;
+    let source = ZipSource::new(std::io::Cursor::new(input.to_vec()), Naming::Stored)?;
     pipeline::run(source, output, &settings(jobs)).map(|report| report.pages)
 }
 
@@ -214,10 +224,13 @@ fn an_index_addressable_reader_does_not_read_past_the_window() {
     let read = Arc::new(AtomicU64::new(0));
     // `ZipSource` directly, which is the reason `pipeline::run` takes `Entries` rather than
     // `Source`: the enum names `File`, and a `File` cannot be instrumented.
-    let source = ZipSource::new(Counting {
-        inner: std::io::Cursor::new(input.clone()),
-        read: Arc::clone(&read),
-    })
+    let source = ZipSource::new(
+        Counting {
+            inner: std::io::Cursor::new(input.clone()),
+            read: Arc::clone(&read),
+        },
+        Naming::Stored,
+    )
     .expect("the entry table reads");
 
     let directory = TempDir::new("window");
@@ -457,9 +470,14 @@ fn the_binary_refuses_an_archive_whose_entry_table_is_truncated() {
 ///   cargo test --locked --release --test pipeline -- --ignored --nocapture
 /// ```
 ///
-/// Acceptance criterion 5 is a *ratio* between the two, so the measurement itself does not
-/// have to be portable — but the sampling method has to be recorded beside the number, which
-/// is why it is done deliberately rather than folded into the suite.
+/// Acceptance criterion 5 is a *ratio* between the two zips, so the measurement itself does
+/// not have to be portable — but the sampling method has to be recorded beside the number,
+/// which is why it is done deliberately rather than folded into the suite.
+///
+/// The 7z and directory fixtures answer a different question. 7z's decoder allocates working
+/// memory at the size the *archive* declares, so the same pages have to be measured through
+/// it and through an input with no such term, and the large-dictionary archive is what makes
+/// that term visible rather than inferred.
 #[test]
 #[ignore = "generates large fixtures for the manual peak-memory measurement"]
 fn write_memory_fixtures() {
@@ -475,6 +493,38 @@ fn write_memory_fixtures() {
         write_pages(&path, pages, 1520, 2150);
         let size = fs::metadata(&path).expect("metadata").len();
         println!("{}: {pages} pages, {size} bytes", path.display());
+    }
+
+    // The same 1000 pages as a directory tree, which is also the staging area the 7z
+    // fixtures are written from — so all three inputs hold byte-identical pages and the
+    // only variable is the container.
+    let tree = directory.join("pages-1000");
+    let files: Vec<(String, Vec<u8>)> = (0..1000)
+        .map(|page| (format!("page{page:04}.jpg"), page_bytes(1520, 2150)))
+        .collect();
+    let borrowed: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+    support::write_tree(&tree, &borrowed);
+    println!("{}: 1000 pages as a directory", tree.display());
+
+    if support::seven_zip().is_none() {
+        return;
+    }
+    for (name, flags) in [
+        ("pages-1000.7z", Vec::new()),
+        // Large enough that 7-Zip does not clamp the dictionary down to the input size.
+        ("pages-1000-dict.7z", vec!["-m0=LZMA2:d128m"]),
+    ] {
+        let path = directory.join(name);
+        let _ = fs::remove_file(&path);
+        support::write_seven_zip(&path, &tree, &borrowed, &flags);
+        let size = fs::metadata(&path).expect("metadata").len();
+        println!(
+            "{}: 1000 pages, {size} bytes, flags {flags:?}",
+            path.display()
+        );
     }
 }
 
@@ -685,10 +735,11 @@ fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
 /// `--help` lists exactly what exists, in both directions.
 #[test]
 fn help_lists_every_implemented_option_and_nothing_else() {
-    // The four the change implements, plus what clap adds for free.
+    // The five the tool implements, plus what clap adds for free.
     let mut expected = vec![
         "auto-width".to_owned(),
         "dct".to_owned(),
+        "fix-idx".to_owned(),
         "help".to_owned(),
         "quality".to_owned(),
         "resize-mode".to_owned(),

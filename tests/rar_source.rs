@@ -10,7 +10,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use comic_auto_resize::source::{
-    ArchiveFormat, Entries, Entry, MAX_ENTRY_BYTES, Source, SourceError, detect,
+    ArchiveFormat, Entries, Entry, MAX_ENTRY_BYTES, Naming, Source, SourceError, detect,
 };
 
 use support::{TempDir, write_pages};
@@ -45,7 +45,7 @@ fn with_fixture(name: &str, body: impl FnOnce(&Path)) {
 
 /// Every page the source yields, in order.
 fn read_all(path: &Path) -> Result<Vec<Entry>, SourceError> {
-    let mut source = Source::open(path)?;
+    let mut source = Source::open(path, Naming::Stored)?;
     let mut yielded = Vec::new();
     while let Some(entry) = comic_auto_resize::source::Entries::next_entry(&mut source) {
         yielded.push(entry?);
@@ -76,6 +76,25 @@ fn a_rar_yields_every_page_in_stored_order_with_a_gapless_index() {
                 (2, "page03.jpg".to_owned()),
                 (3, "page01.jpg".to_owned()),
             ]
+        );
+    });
+}
+
+/// rar is the one format with no entry table, so `--fix-idx`'s width comes from a second
+/// open in List mode. That pre-pass is what this asserts: the width is two because the
+/// archive holds four entries, and the positions are read order rather than the numbers the
+/// names carried.
+#[test]
+fn renumbering_takes_its_width_from_a_header_only_second_open() {
+    with_fixture("stored-order.rar", |path| {
+        let mut source = Source::open(path, Naming::ByPosition).expect("opens");
+        let mut names = Vec::new();
+        while let Some(entry) = source.next_entry() {
+            names.push(entry.expect("reads").name);
+        }
+        assert_eq!(
+            names,
+            ["page_1.jpg", "page_2.jpg", "page_3.jpg", "page_4.jpg"]
         );
     });
 }
@@ -206,7 +225,7 @@ fn an_input_path_containing_a_nul_is_refused_rather_than_panicking() {
     // Not reachable from the command line, but the library API is public and `unrar` panics
     // rather than erroring on this input.
     let path = PathBuf::from("pages\u{0}.rar");
-    let error = Source::rar(&path).expect_err("a NUL-bearing path must be refused");
+    let error = Source::rar(&path, Naming::Stored).expect_err("a NUL-bearing path must be refused");
     assert!(
         matches!(error, SourceError::UnsafePath),
         "expected UnsafePath, got {error}"
@@ -227,7 +246,7 @@ fn a_rar_named_cbz_is_read_as_rar() {
         let entries = read_all(&disguised).expect("reads as rar despite the name");
         assert_eq!(entries.len(), 4);
         assert!(matches!(
-            Source::open(&disguised).expect("opens"),
+            Source::open(&disguised, Naming::Stored).expect("opens"),
             Source::Rar(_)
         ));
     });
@@ -240,7 +259,7 @@ fn a_zip_named_cbr_is_read_as_zip() {
     write_pages(&disguised, 2, 320, 480);
 
     assert!(matches!(
-        Source::open(&disguised).expect("opens"),
+        Source::open(&disguised, Naming::Stored).expect("opens"),
         Source::Zip(_)
     ));
     let entries = read_all(&disguised).expect("reads as zip despite the name");
@@ -253,7 +272,7 @@ fn a_file_matching_no_signature_is_refused_naming_the_formats() {
     let path = directory.join("book.cbz");
     std::fs::write(&path, b"this is not an archive at all").expect("writes the decoy");
 
-    let error = Source::open(&path).expect_err("an unknown format must be refused");
+    let error = Source::open(&path, Naming::Stored).expect_err("an unknown format must be refused");
     match error {
         SourceError::NotAnArchive { ref formats } => {
             assert!(formats.contains("zip"), "must name zip: {formats}");
@@ -407,7 +426,7 @@ fn a_page_with_a_very_long_name_is_not_dropped() {
 #[test]
 fn an_error_ends_the_source_rather_than_resuming_at_a_used_index() {
     with_fixture("oversize-then-page.rar", |path| {
-        let mut source = Source::open(path).expect("opens");
+        let mut source = Source::open(path, Naming::Stored).expect("opens");
         let first = Entries::next_entry(&mut source).expect("an entry");
         assert!(
             matches!(first, Err(SourceError::TooLarge { .. })),
@@ -425,7 +444,7 @@ fn an_error_ends_the_source_rather_than_resuming_at_a_used_index() {
 #[test]
 fn a_mismatch_also_ends_the_source() {
     with_fixture("mismatch-entry.rar", |path| {
-        let mut source = Source::open(path).expect("opens");
+        let mut source = Source::open(path, Naming::Stored).expect("opens");
         let mut seen = 0;
         let mut errored = false;
         while let Some(entry) = Entries::next_entry(&mut source) {

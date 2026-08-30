@@ -35,6 +35,38 @@
 //! it is written a credit is returned. `credits` never blocks the writer either: at most `W`
 //! tokens exist, and the entry just written holds one of them, so there is always room.
 //!
+//! ## `W + 1` for a source whose decoder pushes
+//!
+//! `sevenz-rust2` offers entries rather than being asked for them, so `SevenZSource` decodes
+//! an entry and *then* offers it across a rendezvous channel. The credit is taken by
+//! `read_entries` when that offer is accepted, so while the decoder is blocked offering, it
+//! holds one entry the credit system has not counted. The window for such a source is
+//! `W + 1`.
+//!
+//! One entry, a constant, for one source. It does not grow with the page count, which is
+//! what the bound actually claims — but the arithmetic above is precise and would otherwise
+//! be wrong. Flipping [`Entries`](crate::source::Entries) to a push shape would not remove
+//! the extra entry: in a push shape every source reads before it offers, so all four would
+//! pay it instead of one.
+//!
+//! # Working memory a decoder sizes from the input
+//!
+//! Peak memory is independent of page count, and that is what this section's claim is. It is
+//! not independent of what the *input declares*, and 7z is where that shows: `lzma-rust2`
+//! allocates its LZMA2 dictionary at the size the archive was written with, and the term is
+//! that size. Measured end to end on 1000 identical pages, against the same pages as a zip:
+//! **+33.6 MB** for an archive declaring a 32 MiB dictionary and **+103.9 MB** for one
+//! declaring 96 MiB.
+//!
+//! The allocation is fallible, so a hostile declaration is an error rather than an abort, but
+//! a merely large one is simply that many megabytes; the crate's own `MAX_MEM_LIMIT_KB` is
+//! `usize::MAX / 1024`, so its guard can never fire and there is no public knob to lower it.
+//!
+//! An additive term, recorded here rather than folded into the page-size term it is not part
+//! of. It is also per *reader*, not per worker — `SevenZSource::new` sets the decoder's
+//! thread count to one, because the default is the host's parallelism and each worker holds
+//! its own dictionary: 35.6 MB against 682.3 MB on the same archive.
+//!
 //! # \* The reader is one thread of this pipeline's making, not one OS thread
 //!
 //! Reading rar goes through libunrar, which is built with `RAR_SMP`: `Unpack::SetThreads`
@@ -46,6 +78,10 @@
 //! comment claiming a thread count has to be true. Neither real rar sample reaches it —
 //! both are entirely stored — so the peak-RSS measurement is taken on a compressed fixture
 //! as well.
+//!
+//! Reading 7z adds one more, and this one *is* capped: `SevenZSource` runs the crate's
+//! push-shaped walk on a thread of its own, and pins the LZMA2 reader to a single thread, so
+//! the count is exactly one and it is this module's choice rather than the host's.
 
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
@@ -320,10 +356,13 @@ pub enum RunError {
     /// would discard the payload and skip the cleanup path.
     #[error("{stage} stopped unexpectedly")]
     StagePanicked { stage: &'static str },
-    /// The archive held no page this build can process, so there was nothing to write. An
+    /// The input held no page this build can process, so there was nothing to write. An
     /// empty output would report success and then make the next run fail with "already
     /// exists".
-    #[error("no pages to process: the archive yielded no image entry this build can read")]
+    ///
+    /// Says *input* rather than *archive* because a directory reaches it too, and a
+    /// directory holding no page must not be told it is an unrecognised format.
+    #[error("no pages to process: the input yielded no image entry this build can read")]
     Empty,
     /// Two stored names became one output name when their extensions were rewritten.
     #[error(
@@ -334,6 +373,11 @@ pub enum RunError {
     /// after every worker finished.
     #[error("page {expected} never arrived, but page {stranded} did")]
     Incomplete { expected: u32, stranded: u32 },
+    /// A directory input with no name of its own — `.`, `..`, or the filesystem root — so
+    /// there is nothing to derive an output name from. Reached only after the path has been
+    /// resolved, so `.` is the directory the user is standing in rather than this case.
+    #[error("{}: cannot name an output for a directory with no name of its own", path.display())]
+    UnnamedInput { path: PathBuf },
 }
 
 #[cfg(test)]

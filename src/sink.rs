@@ -218,45 +218,124 @@ impl Drop for Sink {
     }
 }
 
-/// The default output path for `input`: its stem plus `_resize.zip`, in its own directory.
+/// What the input is, which decides how its output is named.
+///
+/// A file has an extension to remove and a directory does not, so the two cannot share one
+/// derivation without stripping something a directory never had — `[Author] Title v1.5`
+/// would lose its `.5`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputKind {
+    File,
+    Directory,
+}
+
+/// The default output path for `input`: its name plus `_resize.zip`, in its own directory.
 ///
 /// The `_resize` suffix is load-bearing rather than cosmetic. Without it a `.zip` input
 /// resolves to its own path, so the refusal to overwrite would fire on every run — and a
 /// future `--delete-org` would destroy the input. With it the two can never coincide,
 /// because the resolved name always ends in `_resize.zip` and always gains that suffix from
 /// whatever stem it started with.
-#[must_use]
-pub fn default_output(input: &Path) -> PathBuf {
-    let stem = input.file_stem().unwrap_or_default();
-    let mut name = stem.to_os_string();
+///
+/// For a directory the suffix is load-bearing a second time. `vol1` and `vol1.zip` do not
+/// collide, so nothing else would stop the output being written *inside* the input, where the
+/// next run would read it as a page.
+///
+/// # Errors
+///
+/// [`RunError::UnnamedInput`] when a directory input has no name to derive one from, which
+/// `.`, `..` and `/` are. Resolved against the filesystem first, so `.` names the directory
+/// the user is standing in rather than nothing.
+pub fn default_output(input: &Path, kind: InputKind) -> Result<PathBuf, RunError> {
+    let mut name = match kind {
+        // Nothing to remove, because a directory has no extension.
+        InputKind::Directory => directory_name(input)?,
+        InputKind::File => input.file_stem().unwrap_or_default().to_os_string(),
+    };
     name.push("_resize.zip");
-    input.with_file_name(name)
+
+    match kind {
+        // Beside the directory rather than in it: `with_file_name` replaces the last
+        // component, which for `/books/vol1` is `vol1` and gives `/books/vol1_resize.zip`.
+        InputKind::Directory => Ok(resolved(input)?.with_file_name(name)),
+        InputKind::File => Ok(input.with_file_name(name)),
+    }
+}
+
+/// The directory's own name, resolving the path when it has none of its own.
+fn directory_name(input: &Path) -> Result<std::ffi::OsString, RunError> {
+    if let Some(name) = input.file_name() {
+        return Ok(name.to_os_string());
+    }
+    resolved(input)?
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .ok_or_else(|| RunError::UnnamedInput {
+            path: input.to_path_buf(),
+        })
+}
+
+/// `input` with `.`, `..` and any link resolved away, so it has a last component to work
+/// from. Only reached for a directory: a file path is used exactly as it was given.
+fn resolved(input: &Path) -> Result<PathBuf, RunError> {
+    if input.file_name().is_some() {
+        return Ok(input.to_path_buf());
+    }
+    fs::canonicalize(input).map_err(|source| RunError::Io {
+        path: input.to_path_buf(),
+        source,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::default_output;
-    use std::path::Path;
+    use super::{InputKind, default_output};
+    use std::path::{Path, PathBuf};
+
+    fn file(input: &str) -> PathBuf {
+        default_output(Path::new(input), InputKind::File).expect("a file always has a name")
+    }
+
+    fn directory(input: &str) -> PathBuf {
+        default_output(Path::new(input), InputKind::Directory).expect("a named directory")
+    }
 
     #[test]
     fn the_default_output_is_the_stem_plus_resize_zip() {
-        assert_eq!(
-            default_output(Path::new("/books/foo.zip")),
-            Path::new("/books/foo_resize.zip")
-        );
-        assert_eq!(
-            default_output(Path::new("/books/foo.rar")),
-            Path::new("/books/foo_resize.zip")
-        );
+        assert_eq!(file("/books/foo.zip"), Path::new("/books/foo_resize.zip"));
+        assert_eq!(file("/books/foo.rar"), Path::new("/books/foo_resize.zip"));
         // No extension at all.
-        assert_eq!(
-            default_output(Path::new("/books/foo")),
-            Path::new("/books/foo_resize.zip")
-        );
+        assert_eq!(file("/books/foo"), Path::new("/books/foo_resize.zip"));
         // Relative, staying in the input's directory.
+        assert_eq!(file("foo.zip"), Path::new("foo_resize.zip"));
+    }
+
+    /// A directory has no extension to remove, so a dot in its name is part of the name.
+    #[test]
+    fn a_directory_keeps_every_part_of_its_own_name() {
         assert_eq!(
-            default_output(Path::new("foo.zip")),
-            Path::new("foo_resize.zip")
+            directory("/books/vol1"),
+            Path::new("/books/vol1_resize.zip")
+        );
+        assert_eq!(
+            directory("/books/[Author] Title v1.5"),
+            Path::new("/books/[Author] Title v1.5_resize.zip")
+        );
+        // A trailing separator names the same directory.
+        assert_eq!(
+            directory("/books/vol1/"),
+            Path::new("/books/vol1_resize.zip")
+        );
+    }
+
+    /// The output must not land inside the input, where a second run would read it as a page.
+    #[test]
+    fn a_directorys_output_is_written_beside_it() {
+        let output = directory("/books/vol1");
+        assert!(
+            !output.starts_with("/books/vol1"),
+            "{} is inside its own input",
+            output.display()
         );
     }
 
@@ -269,12 +348,15 @@ mod tests {
             "foo.cbz",
             "/books/foo.tar.gz",
         ] {
-            let input = Path::new(input);
             assert_ne!(
-                default_output(input),
-                input,
-                "{} resolved to itself",
-                input.display()
+                file(input),
+                Path::new(input),
+                "{input} resolved to itself as a file"
+            );
+            assert_ne!(
+                directory(input),
+                Path::new(input),
+                "{input} resolved to itself as a directory"
             );
         }
     }
