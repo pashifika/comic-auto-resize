@@ -51,7 +51,7 @@
 //!
 //! # What this module bounds, and what it cannot
 //!
-//! Two allocations in a 7z read are sized by numbers the archive chooses, and only one of
+//! Three allocations in a 7z read are sized by numbers the archive chooses, and only one of
 //! them is reachable from here.
 //!
 //! The LZMA2 dictionary is: the size is in the header the crate has already parsed when
@@ -59,14 +59,18 @@
 //! block is decoded. The crate's own guard cannot help — `MAX_MEM_LIMIT_KB` is
 //! `usize::MAX / 1024` — and it exposes no knob, so the ceiling lives here.
 //!
-//! The header's own parse is not. An encoded header is decompressed into a `Vec` bounded by
-//! the archive's declared unpack size, and the entry table is then an infallible
-//! `vec![ArchiveEntry::default(); num_files]` — both inside `Archive::read`, before any code
-//! here runs, with no maximum-entry or maximum-header knob to set. A padded, highly
+//! The header's own parse is not, and it is two allocations rather than one. An encoded
+//! header is decompressed into a `Vec` bounded by the archive's declared unpack size, and the
+//! entry table is then an infallible `vec![ArchiveEntry::default(); num_files]`. The encoded
+//! header is *itself* decoded through a coder chain, and `read_encoded_header`
+//! (`reader.rs:466`) hands that chain the same `MAX_MEM_LIMIT_KB` that cannot fire — so a
+//! header folder declaring a 4 GiB dictionary allocates it too. All three happen inside
+//! `Archive::read`, before any code here runs, with no knob to set. A padded, highly
 //! compressible header is therefore small on disk and large in memory. Recorded rather than
 //! forked around: `AGENTS.md` records what maintaining a fork of a reader cost the Go
 //! implementation, and the fix belongs upstream. The residual is a hostile archive making
-//! this process allocate at parse time; an ordinary one is unaffected.
+//! this process allocate at parse time; an ordinary one is unaffected, and the ceiling above
+//! still bounds every block the walk decodes.
 
 use std::io::{self, Read};
 use std::thread::JoinHandle;
@@ -115,28 +119,36 @@ fn oversized_dictionary(archive: &sevenz_rust2::Archive) -> Option<u64> {
         .blocks
         .iter()
         .flat_map(|block| &block.coders)
-        .filter_map(|coder| {
-            let properties = coder.properties();
-            match coder.encoder_method_id() {
-                // One byte: `(2 | (bits & 1)) << (bits / 2 + 11)`, saturating at 4 GiB.
-                sevenz_rust2::EncoderMethod::ID_LZMA2 => {
-                    let bits = u32::from(*properties.first()?);
-                    match bits {
-                        41.. => None,
-                        40 => Some(u64::from(u32::MAX)),
-                        _ => Some(u64::from((2 | (bits & 1)) << (bits / 2 + 11))),
-                    }
-                }
-                // Five bytes: one property byte, then the size as a little-endian `u32`.
-                sevenz_rust2::EncoderMethod::ID_LZMA => {
-                    let field: [u8; 4] = properties.get(1..5)?.try_into().ok()?;
-                    Some(u64::from(u32::from_le_bytes(field)))
-                }
-                _ => None,
-            }
-        })
+        .filter_map(|coder| dictionary_bytes(coder.encoder_method_id(), coder.properties()))
         .max()
         .filter(|&declared| declared > MAX_DICTIONARY_BYTES)
+}
+
+/// The dictionary one coder declares, or `None` for a method whose properties do not name one.
+///
+/// Split out from [`oversized_dictionary`] because this is the part that reads bytes an
+/// attacker chose, and a test can drive it with those bytes directly. Every arm is total: a
+/// short, absent or unrecognised property field gives `None` and is left to the crate, which
+/// is the only party that can say what it means.
+fn dictionary_bytes(method: &[u8], properties: &[u8]) -> Option<u64> {
+    match method {
+        // One byte: `(2 | (bits & 1)) << (bits / 2 + 11)`, with 40 meaning the 4 GiB maximum
+        // and anything above it rejected by the crate before it is used.
+        sevenz_rust2::EncoderMethod::ID_LZMA2 => {
+            let bits = u32::from(*properties.first()?);
+            match bits {
+                41.. => None,
+                40 => Some(u64::from(u32::MAX)),
+                _ => Some(u64::from((2 | (bits & 1)) << (bits / 2 + 11))),
+            }
+        }
+        // Five bytes: one property byte, then the size as a little-endian `u32`.
+        sevenz_rust2::EncoderMethod::ID_LZMA => {
+            let field: [u8; 4] = properties.get(1..5)?.try_into().ok()?;
+            Some(u64::from(u32::from_le_bytes(field)))
+        }
+        _ => None,
+    }
 }
 
 impl SevenZSource {
@@ -247,9 +259,10 @@ fn decode(
         let mut drain = Drain::new(stream);
         let name = entry.name.clone();
 
-        // Every terminal path goes through this: it abandons the rest of the entry, because a
-        // path that ends the run has no next entry to keep the block coherent for, and then
-        // ends the whole walk rather than this block.
+        // The one exception below goes its own way: `finish` moves the drain, so a skip whose
+        // drain fails cannot reach this. Every other terminal path does, and each one
+        // abandons the rest of the entry — a path that ends the run has no next entry to keep
+        // the block coherent for — and then ends the whole walk rather than this block.
         macro_rules! stop {
             ($result:expr) => {{
                 drain.abandon();
@@ -270,10 +283,16 @@ fn decode(
         //   6. the rest of the entry   — bounded on the way in
         //   7. the stored name         — refused only once it is a page worth naming
         //
-        // A skip is the one path that continues, so it is the one path that must drain — and
-        // a drain that fails is reported rather than swallowed. `.is_ok()` would turn a
-        // corrupt block into a clean end of archive: fewer pages, exit code zero.
-        if entry.is_directory() || is_directory(&name) || probe::declared_format(&name).is_none() {
+        // The first three share one exit because a skip is the one path that continues, so it
+        // is the one path that must drain — and a drain that fails is reported rather than
+        // swallowed. `.is_ok()` would turn a corrupt block into a clean end of archive: fewer
+        // pages, exit code zero.
+        let claimed = if entry.is_directory() || is_directory(&name) {
+            None
+        } else {
+            probe::declared_format(&name)
+        };
+        let Some(declared) = claimed else {
             return match drain.finish() {
                 Ok(()) => Ok(true),
                 Err(source) => {
@@ -282,8 +301,7 @@ fn decode(
                     Err(stop())
                 }
             };
-        }
-        let declared = probe::declared_format(&name).expect("the filter above accepted it");
+        };
 
         // The header records the size away from the entry's data, so an entry claiming more
         // than the limit is refused before any of it is decoded — which is what `abandon`
@@ -339,6 +357,12 @@ fn decode(
             // The receiver is gone — the pipeline stopped, usually because an earlier page
             // failed — so there is nobody left to read the rest of the archive for. Nothing
             // to offer: the pipeline already has its own error.
+            //
+            // `read_entry` has consumed this entry to its end on every path that reaches
+            // here, so the abandon costs nothing today. It is here because that is an
+            // invariant two functions apart with nothing else recording it, and relying on
+            // one of those is what the guard exists to stop.
+            drain.abandon();
             stopped = true;
             Err(stop())
         }
@@ -448,7 +472,7 @@ impl Drop for Drain<'_> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Drain, MAX_DICTIONARY_BYTES};
+    use super::{Drain, MAX_DICTIONARY_BYTES, dictionary_bytes};
     use std::io::{self, Read};
 
     /// A reader that reports how much of it was consumed, and can be made to fail.
@@ -526,26 +550,59 @@ mod tests {
         );
     }
 
-    /// The LZMA2 property byte the ceiling is compared against, decoded the way the crate
-    /// decodes it: `(2 | (bits & 1)) << (bits / 2 + 11)`, so an even byte is a power of two.
-    /// 30 is 128 MiB — the largest a plausible archive declares — and 40 is the 4 GiB maximum
-    /// the format allows, which is the allocation the ceiling exists to refuse.
+    /// The decode itself, against the bytes an archive would carry, and checked against
+    /// `sevenz-rust2`'s own `get_lzma2_dic_size` and `get_lzma_dic_size` rather than against a
+    /// restatement of them. The property byte 30 is 128 MiB — the largest a plausible archive
+    /// declares — 32 is exactly the ceiling, and 40 is the 4 GiB maximum the format allows,
+    /// which is the allocation the ceiling exists to refuse.
+    #[test]
+    fn a_declared_dictionary_is_decoded_from_the_bytes_the_coder_carries() {
+        let lzma2 = sevenz_rust2::EncoderMethod::ID_LZMA2;
+        let lzma = sevenz_rust2::EncoderMethod::ID_LZMA;
+
+        assert_eq!(dictionary_bytes(lzma2, &[30]), Some(128 << 20));
+        assert_eq!(dictionary_bytes(lzma2, &[32]), Some(256 << 20));
+        assert_eq!(dictionary_bytes(lzma2, &[40]), Some(u64::from(u32::MAX)));
+        // Above 40 the crate refuses the byte itself, so there is nothing here to bound.
+        assert_eq!(dictionary_bytes(lzma2, &[41]), None);
+        assert_eq!(dictionary_bytes(lzma2, &[]), None);
+
+        // One property byte, then the size little-endian. Unlike LZMA2 there is no capped
+        // encoding here — the field is the size — so the 4 GiB maximum is a plain `u32::MAX`.
+        assert_eq!(
+            dictionary_bytes(lzma, &[0x5D, 0x00, 0x00, 0x00, 0x10]),
+            Some(256 << 20)
+        );
+        assert_eq!(
+            dictionary_bytes(lzma, &[0x5D, 0xFF, 0xFF, 0xFF, 0xFF]),
+            Some(u64::from(u32::MAX))
+        );
+        assert_eq!(dictionary_bytes(lzma, &[0x5D, 0x00, 0x00]), None);
+
+        // A filter names no dictionary, whatever its properties hold.
+        assert_eq!(
+            dictionary_bytes(sevenz_rust2::EncoderMethod::ID_DELTA, &[4]),
+            None
+        );
+        assert_eq!(dictionary_bytes(&[0x03, 0x03, 0x01, 0x03], &[]), None);
+    }
+
+    /// The ceiling, against the same decode: what a real archive declares passes and what the
+    /// format's maximum declares does not.
     #[test]
     fn the_dictionary_ceiling_admits_the_plausible_and_refuses_the_possible() {
-        let dictionary = |bits: u32| -> u64 {
-            if bits == 40 {
-                u64::from(u32::MAX)
-            } else {
-                u64::from((2 | (bits & 1)) << (bits / 2 + 11))
-            }
-        };
-        assert_eq!(dictionary(30), 128 << 20);
-        assert_eq!(dictionary(32), 256 << 20);
-        assert_eq!(dictionary(40), u64::from(u32::MAX));
+        let lzma2 = sevenz_rust2::EncoderMethod::ID_LZMA2;
+        let declared = |bits: u8| dictionary_bytes(lzma2, &[bits]).expect("a dictionary");
 
-        assert!(dictionary(30) <= MAX_DICTIONARY_BYTES);
-        assert!(dictionary(32) <= MAX_DICTIONARY_BYTES);
-        assert!(dictionary(34) > MAX_DICTIONARY_BYTES);
-        assert!(dictionary(40) > MAX_DICTIONARY_BYTES);
+        assert!(declared(30) <= MAX_DICTIONARY_BYTES, "128 MiB must pass");
+        assert!(
+            declared(32) <= MAX_DICTIONARY_BYTES,
+            "256 MiB is the ceiling"
+        );
+        assert!(
+            declared(34) > MAX_DICTIONARY_BYTES,
+            "512 MiB must be refused"
+        );
+        assert!(declared(40) > MAX_DICTIONARY_BYTES, "4 GiB must be refused");
     }
 }

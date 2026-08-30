@@ -295,7 +295,11 @@ fn a_symbolic_link_that_does_not_escape_is_refused_too() {
 
 /// A fifo named like a page would block `File::open` until a writer appeared. `Source::open`
 /// already refuses one as an *input*; a child of a directory input reaches the same open and
-/// needs the same refusal, before it is opened rather than while it hangs.
+/// needs the same refusal.
+///
+/// Asserted at `Source::open` rather than only through a read, because the two checks produce
+/// the same message: the walk's refusal is the one that matters, since it happens before the
+/// output file is created, and only opening the source separates them.
 #[cfg(unix)]
 #[test]
 fn something_that_is_not_a_regular_file_is_refused_before_it_is_opened() {
@@ -310,7 +314,9 @@ fn something_that_is_not_a_regular_file_is_refused_before_it_is_opened() {
         .expect("runs mkfifo");
     assert!(status.success(), "the fixture needs a fifo");
 
-    let message = error_text(&root);
+    let error = Source::open(&root, Naming::Stored)
+        .expect_err("the listing must refuse it, before the output exists");
+    let message = error.to_string();
     assert!(message.contains("page2.jpg"), "{message}");
     assert!(message.contains("not a regular file"), "{message}");
 }

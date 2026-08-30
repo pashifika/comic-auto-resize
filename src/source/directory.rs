@@ -95,10 +95,13 @@ impl DirectorySource {
     ///
     /// # Errors
     ///
-    /// [`SourceError::Input`] when a directory in the tree cannot be read, and
-    /// [`SourceError::UnsafeName`] when a name the walk built cannot be carried into the
-    /// output archive. Both are established here, before the output file exists, because the
-    /// listing happens before anything is read.
+    /// [`SourceError::Input`] when the input directory itself cannot be read and
+    /// [`SourceError::Entry`] when one below it cannot, naming which;
+    /// [`SourceError::SymbolicLink`] for a link, which is never followed;
+    /// [`SourceError::NotAPage`] for something a candidate extension claims that is not a
+    /// regular file; and [`SourceError::UnsafeName`] for a name the walk built that cannot be
+    /// carried into the output archive. All are established here, before the output file
+    /// exists, because the listing happens before anything is read.
     pub fn open(root: &Path, naming: Naming) -> Result<Self, SourceError> {
         let mut pages = Vec::new();
         walk(root, "", &mut pages)?;
@@ -134,11 +137,20 @@ impl DirectorySource {
 
         // Re-checked here, not only in the walk. The listing runs at open and this runs a
         // page later, so a tree the tool does not own can change in between: a page can
-        // become a symbolic link to something outside the input, and `File::open` follows
-        // one. `symlink_metadata` does not, so the swap has to land between this call and the
-        // open below rather than anywhere in the run — narrowed to a syscall, not closed.
-        // Closing it needs `O_NOFOLLOW`, which needs a platform crate on both targets; the
-        // residual is recorded in `archive-source` rather than left to be discovered.
+        // become a symbolic link to something outside the input, and `File::open` follows one.
+        //
+        // This narrows that window and does not close it, and the two halves are worth
+        // separating. For the *last* component `symlink_metadata` does not follow, so a swap
+        // has to land between this call and the open below rather than anywhere in the run.
+        // For an *ancestor* it resolves as any other path call does, so replacing a listed
+        // `ch1/` with a link to somewhere else defeats the check outright.
+        //
+        // Closing either needs an open that does not follow — `openat2` with
+        // `RESOLVE_NO_SYMLINKS` on unix, reparse-point protection on Windows — which needs a
+        // platform crate on both release targets. Recorded in `archive-source` and in the
+        // Change's evidence rather than left to be discovered, because the threat is a tree
+        // being mutated under the tool while it runs, and the alternative to the check is no
+        // check at all.
         let kind = std::fs::symlink_metadata(path)
             .map_err(|source| SourceError::Entry {
                 name: name.clone(),
@@ -231,27 +243,26 @@ impl DirectorySource {
 /// `prefix` is the entry-name prefix for this level, already ending in `/` when it is not
 /// empty, so a name is built by concatenation rather than by path arithmetic.
 fn walk(directory: &Path, prefix: &str, pages: &mut Vec<Page>) -> Result<(), SourceError> {
-    // Every failure below names the entry it happened at rather than the input root. `main`
-    // prefixes the input path, so a bare `Input` error would print `~/books/vol1: Permission
-    // denied` for an unreadable `~/books/vol1/ch3/private` and name a directory that reads
-    // fine. `walk` holds the prefix, so the name is already in hand.
-    let here = || {
-        if prefix.is_empty() {
-            ".".to_owned()
+    // A failure below the root names the entry it happened at rather than the input root:
+    // `main` prefixes the input path, so a bare `Input` error would print
+    // `~/books/vol1: Permission denied` for an unreadable `~/books/vol1/ch3/private` and name
+    // a directory that reads fine. At the root there is no name to add — the prefix has
+    // already said it — so that one case stays as it was.
+    let named = |source: std::io::Error, at: String| {
+        if at.is_empty() {
+            SourceError::Input { source }
         } else {
-            prefix.trim_end_matches('/').to_owned()
+            SourceError::Entry { name: at, source }
         }
     };
+    let here = || prefix.trim_end_matches('/').to_owned();
+
     let mut children = Vec::new();
-    let listing = directory.read_dir().map_err(|source| SourceError::Entry {
-        name: here(),
-        source,
-    })?;
+    let listing = directory
+        .read_dir()
+        .map_err(|source| named(source, here()))?;
     for child in listing {
-        let child = child.map_err(|source| SourceError::Entry {
-            name: here(),
-            source,
-        })?;
+        let child = child.map_err(|source| named(source, here()))?;
         let raw = child.file_name();
         // Generalises Go's `.git` case: a dot-name is machinery rather than a page, and
         // descending into one would put `.DS_Store` and `.git` objects in the listing. Read
@@ -271,10 +282,9 @@ fn walk(directory: &Path, prefix: &str, pages: &mut Vec<Page>) -> Result<(), Sou
         };
         // `file_type` on a `DirEntry` does not follow a link, which is the whole point: a
         // link's target may sit outside the input entirely.
-        let kind = child.file_type().map_err(|source| SourceError::Entry {
-            name: format!("{prefix}{name}"),
-            source,
-        })?;
+        let kind = child
+            .file_type()
+            .map_err(|source| named(source, format!("{prefix}{name}")))?;
         children.push((name, child.path(), kind));
     }
 

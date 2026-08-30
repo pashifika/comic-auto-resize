@@ -235,29 +235,45 @@ fn a_drive_letter_in_a_nested_component_is_refused() {
 
 /// `--fix-idx` against 7z, the one format whose entry total is read off a field rather than a
 /// method: `reader.archive().files.len()`.
+///
+/// Eight pages in two directories, which 7-Zip stores as ten entries — the eight files plus
+/// `ch1` and `ch2`. The total therefore needs two digits while the page count needs one, so
+/// the assertion separates the entry table from a count of pages; with fewer entries both
+/// give one digit and the test would pass either way.
 #[test]
 fn renumbering_takes_its_width_from_the_7z_entry_table() {
-    let files = [
-        ("cover.jpg", page(30)),
-        ("ch1/page7.jpg", page(31)),
-        ("ch1/page8.jpg", page(32)),
-        ("ch2/page9.jpg", page(33)),
-    ];
-    with_archive("sevenz-renumber", &files, &[], |archive| {
+    let mut files: Vec<(String, Vec<u8>)> = (1..=4)
+        .map(|page| (format!("ch1/page{page}.jpg"), page_bytes(30 + page, 24)))
+        .collect();
+    files.extend((1..=4).map(|page| (format!("ch2/page{page}.jpg"), page_bytes(40 + page, 24))));
+    let borrowed: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.clone()))
+        .collect();
+
+    with_archive("sevenz-renumber", &borrowed, &[], |archive| {
+        assert_eq!(
+            seven_zip_listing(archive).len(),
+            10,
+            "the fixture must hold ten entries for the width to be observable"
+        );
+
         let mut source = Source::open(archive, Naming::ByPosition).expect("opens");
         let mut names = Vec::new();
         while let Some(entry) = source.next_entry() {
             names.push(entry.expect("reads").name);
         }
-        // Five entries — four files and the `ch1`/`ch2` directory entries 7-Zip stores —
-        // so one digit, positions in read order, and `ch2` restarting at one.
         assert_eq!(
             names,
             [
-                "ch1/page_1.jpg",
-                "ch1/page_2.jpg",
-                "ch2/page_1.jpg",
-                "cover.jpg",
+                "ch1/page_01.jpg",
+                "ch1/page_02.jpg",
+                "ch1/page_03.jpg",
+                "ch1/page_04.jpg",
+                "ch2/page_01.jpg",
+                "ch2/page_02.jpg",
+                "ch2/page_03.jpg",
+                "ch2/page_04.jpg",
             ]
         );
     });

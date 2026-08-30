@@ -218,8 +218,9 @@ impl Source {
     ///
     /// # Errors
     ///
-    /// [`SourceError::Input`] when the tree cannot be listed, and the name refusals the walk
-    /// makes — see [`DirectorySource::open`].
+    /// [`SourceError::Input`] when the directory itself cannot be listed,
+    /// [`SourceError::Entry`] when one below it cannot, and the refusals the walk makes —
+    /// see [`DirectorySource::open`].
     pub fn directory(path: &Path, naming: Naming) -> Result<Self, SourceError> {
         Ok(Self::Directory(DirectorySource::open(path, naming)?))
     }
