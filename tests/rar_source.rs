@@ -10,10 +10,10 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use comic_auto_resize::source::{
-    ArchiveFormat, Entries, Entry, MAX_ENTRY_BYTES, Naming, Source, SourceError, detect,
+    ArchiveFormat, Entries, Entry, MAX_ENTRY_BYTES, ReadOptions, Source, SourceError, detect,
 };
 
-use support::{TempDir, write_pages};
+use support::{TempDir, by_position, write_pages};
 
 /// The fixture directory, or `None` with a message naming how to build it.
 fn fixtures() -> Option<PathBuf> {
@@ -45,7 +45,7 @@ fn with_fixture(name: &str, body: impl FnOnce(&Path)) {
 
 /// Every page the source yields, in order.
 fn read_all(path: &Path) -> Result<Vec<Entry>, SourceError> {
-    let mut source = Source::open(path, Naming::Stored)?;
+    let mut source = Source::open(path, &ReadOptions::default())?;
     let mut yielded = Vec::new();
     while let Some(entry) = comic_auto_resize::source::Entries::next_entry(&mut source) {
         yielded.push(entry?);
@@ -87,7 +87,7 @@ fn a_rar_yields_every_page_in_stored_order_with_a_gapless_index() {
 #[test]
 fn renumbering_takes_its_width_from_a_header_only_second_open() {
     with_fixture("stored-order.rar", |path| {
-        let mut source = Source::open(path, Naming::ByPosition).expect("opens");
+        let mut source = Source::open(path, &by_position()).expect("opens");
         let mut names = Vec::new();
         while let Some(entry) = source.next_entry() {
             names.push(entry.expect("reads").name);
@@ -225,7 +225,8 @@ fn an_input_path_containing_a_nul_is_refused_rather_than_panicking() {
     // Not reachable from the command line, but the library API is public and `unrar` panics
     // rather than erroring on this input.
     let path = PathBuf::from("pages\u{0}.rar");
-    let error = Source::rar(&path, Naming::Stored).expect_err("a NUL-bearing path must be refused");
+    let error = Source::rar(&path, &ReadOptions::default())
+        .expect_err("a NUL-bearing path must be refused");
     assert!(
         matches!(error, SourceError::UnsafePath),
         "expected UnsafePath, got {error}"
@@ -246,7 +247,7 @@ fn a_rar_named_cbz_is_read_as_rar() {
         let entries = read_all(&disguised).expect("reads as rar despite the name");
         assert_eq!(entries.len(), 4);
         assert!(matches!(
-            Source::open(&disguised, Naming::Stored).expect("opens"),
+            Source::open(&disguised, &ReadOptions::default()).expect("opens"),
             Source::Rar(_)
         ));
     });
@@ -259,7 +260,7 @@ fn a_zip_named_cbr_is_read_as_zip() {
     write_pages(&disguised, 2, 320, 480);
 
     assert!(matches!(
-        Source::open(&disguised, Naming::Stored).expect("opens"),
+        Source::open(&disguised, &ReadOptions::default()).expect("opens"),
         Source::Zip(_)
     ));
     let entries = read_all(&disguised).expect("reads as zip despite the name");
@@ -272,7 +273,8 @@ fn a_file_matching_no_signature_is_refused_naming_the_formats() {
     let path = directory.join("book.cbz");
     std::fs::write(&path, b"this is not an archive at all").expect("writes the decoy");
 
-    let error = Source::open(&path, Naming::Stored).expect_err("an unknown format must be refused");
+    let error = Source::open(&path, &ReadOptions::default())
+        .expect_err("an unknown format must be refused");
     match error {
         SourceError::NotAnArchive { ref formats } => {
             assert!(formats.contains("zip"), "must name zip: {formats}");
@@ -426,7 +428,7 @@ fn a_page_with_a_very_long_name_is_not_dropped() {
 #[test]
 fn an_error_ends_the_source_rather_than_resuming_at_a_used_index() {
     with_fixture("oversize-then-page.rar", |path| {
-        let mut source = Source::open(path, Naming::Stored).expect("opens");
+        let mut source = Source::open(path, &ReadOptions::default()).expect("opens");
         let first = Entries::next_entry(&mut source).expect("an entry");
         assert!(
             matches!(first, Err(SourceError::TooLarge { .. })),
@@ -444,7 +446,7 @@ fn an_error_ends_the_source_rather_than_resuming_at_a_used_index() {
 #[test]
 fn a_mismatch_also_ends_the_source() {
     with_fixture("mismatch-entry.rar", |path| {
-        let mut source = Source::open(path, Naming::Stored).expect("opens");
+        let mut source = Source::open(path, &ReadOptions::default()).expect("opens");
         let mut seen = 0;
         let mut errored = false;
         while let Some(entry) = Entries::next_entry(&mut source) {
@@ -480,19 +482,54 @@ fn a_traversing_name_on_a_non_page_reports_the_content_mismatch() {
     });
 }
 
-/// An entry that cannot be read inside an archive that reads fine. Blaming the archive would
-/// be wrong, and the reader knew which entry it was.
+/// An encrypted entry with no password is refused by name, before its data is read.
+///
+/// The refusal is the reader's own rather than `unrar`'s: the header flag says the entry is
+/// enciphered, so handing it to a decoder with no key would only turn a known refusal into a
+/// "bad password" for a password nobody supplied.
 #[test]
-fn an_unreadable_entry_is_named_rather_than_blamed_on_the_archive() {
+fn an_encrypted_entry_with_no_password_is_refused_by_name() {
     with_fixture("encrypted-data.rar", |path| {
         let error = read_all(path).expect_err("an encrypted entry cannot be read");
         match error {
-            SourceError::RarEntry { ref name, .. } => assert_eq!(name, "page00.jpg"),
-            other => panic!("expected RarEntry naming the entry, got {other}"),
+            SourceError::Encrypted { ref name } => assert_eq!(name, "page00.jpg"),
+            other => panic!("expected a named encryption refusal, got {other}"),
         }
         assert!(
             !error.to_string().starts_with("cannot read the archive"),
             "the archive reads; only this entry does not: {error}"
+        );
+    });
+}
+
+/// And with the right password it is decrypted and read like any other page. `unrar`'s binding
+/// takes one, so this costs no dependency and no feature.
+#[test]
+fn an_encrypted_entry_with_the_right_password_is_read() {
+    with_fixture("encrypted-data.rar", |path| {
+        let options = ReadOptions {
+            password: Some("Secret1".to_owned()),
+            ..Default::default()
+        };
+        let mut source = Source::open(path, &options).expect("opens");
+        let entry = Entries::next_entry(&mut source)
+            .expect("a page")
+            .expect("decrypts and reads");
+        assert_eq!(entry.name, "page00.jpg");
+        assert!(entry.bytes.starts_with(&[0xFF, 0xD8]), "a JPEG page");
+
+        // A wrong one fails as the archive's own error rather than as a page: `unrar` checks
+        // the password itself.
+        let wrong = ReadOptions {
+            password: Some("Secret2".to_owned()),
+            ..Default::default()
+        };
+        let mut source = Source::open(path, &wrong).expect("opens");
+        assert!(
+            Entries::next_entry(&mut source)
+                .expect("an outcome")
+                .is_err(),
+            "a wrong password must not yield a page"
         );
     });
 }

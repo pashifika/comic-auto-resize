@@ -18,7 +18,7 @@ use comic_auto_resize::page::{DecodeSettings, EncodeSettings, Filter, PageErrorK
 use comic_auto_resize::pipeline::{self, Capacities, RunError, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
 use comic_auto_resize::sink::InputKind;
-use comic_auto_resize::source::{Naming, SourceError, ZipSource};
+use comic_auto_resize::source::{ReadOptions, SourceError, ZipSource};
 
 use support::{
     Framing, TempDir, corrupt_scan, framed_archive, jpeg_size, page_bytes, read_archive,
@@ -74,7 +74,10 @@ impl<R: Seek> Seek for Counting<R> {
 
 /// Runs the pipeline over an in-memory archive, writing to `output`.
 fn run(input: &[u8], output: &Path, jobs: usize) -> Result<u32, RunError> {
-    let source = ZipSource::new(std::io::Cursor::new(input.to_vec()), Naming::Stored)?;
+    let source = ZipSource::new(
+        std::io::Cursor::new(input.to_vec()),
+        &ReadOptions::default(),
+    )?;
     pipeline::run(source, output, &settings(jobs)).map(|report| report.pages)
 }
 
@@ -229,7 +232,7 @@ fn an_index_addressable_reader_does_not_read_past_the_window() {
             inner: std::io::Cursor::new(input.clone()),
             read: Arc::clone(&read),
         },
-        Naming::Stored,
+        &ReadOptions::default(),
     )
     .expect("the entry table reads");
 
@@ -692,14 +695,15 @@ fn valid_input(directory: &TempDir) -> std::path::PathBuf {
 /// A flag may exist and be unimplemented, or not exist; it must not exist and silently do
 /// the wrong thing. This asserts the second half — that they are genuinely absent, not
 /// accepted and ignored.
+///
+/// `--charset` and `--pwd` were here until they were implemented, and moved into the list
+/// below in the same Change — the movement `--fix-idx` made before them.
 #[test]
 fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
     let directory = TempDir::new("unknown-flags");
     let input = valid_input(&directory);
 
     for flag in [
-        "--pwd",
-        "--charset",
         "--delete-org",
         "--jobs",
         "-r",
@@ -735,12 +739,14 @@ fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
 /// `--help` lists exactly what exists, in both directions.
 #[test]
 fn help_lists_every_implemented_option_and_nothing_else() {
-    // The five the tool implements, plus what clap adds for free.
+    // The seven the tool implements, plus what clap adds for free.
     let mut expected = vec![
         "auto-width".to_owned(),
+        "charset".to_owned(),
         "dct".to_owned(),
         "fix-idx".to_owned(),
         "help".to_owned(),
+        "pwd".to_owned(),
         "quality".to_owned(),
         "resize-mode".to_owned(),
         "version".to_owned(),
@@ -815,9 +821,12 @@ fn an_out_of_range_option_value_is_refused_before_any_work() {
     }
 }
 
-/// Each accepted flag changes the output in a way attributable to it.
+/// Each accepted flag that changes a page's *bytes* changes them in a way attributable to it.
 ///
-/// A flag that parses and then does nothing is the failure this guards against.
+/// A flag that parses and then does nothing is the failure this guards against. The three
+/// that change entry *names* rather than page bytes are asserted where their rules live:
+/// `--fix-idx` in `tests/entry_naming.rs`, `--charset` and `--pwd` in
+/// `tests/entry_charset.rs`.
 #[test]
 fn every_accepted_flag_changes_the_output() {
     fn run_with(args: &[&str], label: &str) -> Vec<u8> {

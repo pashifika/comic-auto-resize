@@ -45,7 +45,9 @@ use unrar_ng::{
 };
 
 use super::probe::{self, MAGIC_MAX, Names, Naming};
-use super::{Entry, HINT_CEILING, MAX_ENTRY_BYTES, SourceError, is_directory, unsafe_name};
+use super::{
+    Entry, HINT_CEILING, MAX_ENTRY_BYTES, ReadOptions, SourceError, is_directory, unsafe_name,
+};
 
 /// An archive being walked once, header by header.
 pub struct RarSource {
@@ -69,6 +71,10 @@ pub struct RarSource {
     /// the archive held something that was not a page.
     next_index: u32,
     names: Names,
+    /// Whether a password was supplied, which is all this reader needs: `unrar` was given it
+    /// at open, so an encrypted entry either reads or reports its own failure. Without one, an
+    /// encrypted entry is refused by name rather than handed to a decoder that will guess.
+    has_password: bool,
 }
 
 impl RarSource {
@@ -84,7 +90,7 @@ impl RarSource {
     ///
     /// [`SourceError::UnsafePath`] when `path` holds an interior NUL, and
     /// [`SourceError::Rar`] when the archive header cannot be read.
-    pub fn open(path: &Path, naming: Naming) -> Result<Self, SourceError> {
+    pub fn open(path: &Path, options: &ReadOptions) -> Result<Self, SourceError> {
         // Before the path reaches `unrar`, which panics rather than erroring on an interior
         // NUL: `open_for_processing` is documented `# Panics`, via
         // `WideCString::from_os_str(path).expect("Unexpected nul in path")`. A command-line
@@ -94,15 +100,23 @@ impl RarSource {
             return Err(SourceError::UnsafePath);
         }
 
-        let names = match naming {
+        let names = match options.naming {
             Naming::Stored => Names::stored(),
             Naming::ByPosition => Names::by_position(count_entries(path)?),
         };
 
+        // `options.charset` is not consulted, and this is the module the reason belongs in:
+        // the stored bytes are gone before Rust sees a name. See the module doc.
+        let archive = match &options.password {
+            Some(password) => unrar_ng::Archive::with_password(path, password),
+            None => unrar_ng::Archive::new(path),
+        };
+
         Ok(Self {
-            archive: Some(unrar_ng::Archive::new(path).open_for_processing()?),
+            archive: Some(archive.open_for_processing()?),
             next_index: 0,
             names,
+            has_password: options.password.is_some(),
         })
     }
 
@@ -128,9 +142,10 @@ impl RarSource {
             //   2. the split flag          — a property of the *archive*, not of this entry
             //   3. the trailing separator  — a directory that failed to set its flag
             //   4. the extension filter    — not a page, and cheap to decide from the name
-            //   5. the recorded size       — refusable before any data is read
-            //   6. the bytes               — bounded on the way in, then probed
-            //   7. the stored name         — refused only once it is a page worth naming
+            //   5. the encryption flag     — refusable before any data is read
+            //   6. the recorded size       — likewise
+            //   7. the bytes               — bounded on the way in, then probed
+            //   8. the stored name         — refused only once it is a page worth naming
             //
             // 1 before 4 is the point of the flag: `SourceError::Mismatch` ("named as JPEG but
             // its leading bytes are not") would be the wrong diagnosis for a directory. 2 that
@@ -176,6 +191,14 @@ impl RarSource {
                     Err(error) => return Some(Err(error.into())),
                 }
             };
+
+            // After the filter, so a non-page entry in an encrypted archive is passed over
+            // rather than refused, and before the read, so ciphertext never reaches a page
+            // buffer. `unrar` would otherwise report "bad password" for an entry nothing was
+            // supplied for.
+            if header.entry().is_encrypted() && !self.has_password {
+                return Some(Err(SourceError::Encrypted { name }));
+            }
 
             // The header records the size away from the data, so an entry claiming more than
             // the limit costs nothing to refuse and is not read at all.

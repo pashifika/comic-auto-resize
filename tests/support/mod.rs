@@ -280,6 +280,199 @@ pub fn framed_archive(entries: &[(&str, Vec<u8>)], framing: Framing) -> Vec<u8> 
     bytes
 }
 
+/// How an entry of an [`encoded_archive`] is encrypted, as its *headers* declare it.
+///
+/// The data is not actually enciphered, and it does not need to be: every path these fixtures
+/// exercise refuses the entry before reading a byte of it. A fixture whose data must really
+/// decrypt is written by `ZipWriter` with `with_deprecated_encryption` instead, because
+/// producing a `ZipCrypto` keystream by hand would be reimplementing the cipher to test the
+/// reader that uses it.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub enum Encryption {
+    #[default]
+    None,
+    /// General-purpose bit 0, which is all a `ZipCrypto` entry declares.
+    ZipCrypto,
+    /// Bit 0, compression method 99, and an AE-x extra field naming `AES-256`. All three,
+    /// because `zip` refuses "AES encryption without AES extra data field" when the method
+    /// says 99 and the field is absent — and because `AexEncryption::parse` then rewrites the
+    /// compression method to the *underlying* one, which is what makes an AES entry
+    /// indistinguishable from a `ZipCrypto` one by the open error alone.
+    Aes256,
+}
+
+/// One entry of a zip named by the bytes the archive stores, rather than by a `&str`.
+///
+/// `ZipWriter` cannot write these at all: it takes a name as `&str`, encodes it as UTF-8, and
+/// sets general-purpose bit 11 for anything non-ASCII — which is the exact opposite of the
+/// archive under test, whose names are in a legacy codepage with that bit clear.
+pub struct Encoded<'a> {
+    /// The name exactly as it will appear in both headers.
+    pub name: &'a [u8],
+    pub data: Vec<u8>,
+    /// General-purpose bit 11: the archive declaring this name to be UTF-8.
+    pub utf8: bool,
+    /// An Info-ZIP Unicode Path extra field (`0x7075`) carrying a name of its own.
+    ///
+    /// Its `NameCRC32` is computed over `name`, so the field reads as current even when its
+    /// characters disagree with what `name` decodes to — which is the case worth testing,
+    /// since a stale CRC makes `zip` refuse the whole archive.
+    pub unicode_path: Option<&'a str>,
+    pub encryption: Encryption,
+}
+
+impl<'a> Encoded<'a> {
+    /// A plain stored entry, bit 11 clear: the legacy form a Japanese archiver writes.
+    pub fn new(name: &'a [u8], data: Vec<u8>) -> Self {
+        Self {
+            name,
+            data,
+            utf8: false,
+            unicode_path: None,
+            encryption: Encryption::None,
+        }
+    }
+
+    /// The same entry with the archive declaring its name to be UTF-8.
+    pub fn utf8(mut self) -> Self {
+        self.utf8 = true;
+        self
+    }
+
+    pub fn unicode_path(mut self, name: &'a str) -> Self {
+        self.unicode_path = Some(name);
+        self
+    }
+
+    pub fn encrypted(mut self, encryption: Encryption) -> Self {
+        self.encryption = encryption;
+        self
+    }
+
+    fn flag(&self) -> u16 {
+        /// General-purpose bit 0: the data is enciphered.
+        const ENCRYPTED: u16 = 1;
+        /// General-purpose bit 11: the name and comment are UTF-8.
+        const UTF8_NAME: u16 = 1 << 11;
+
+        let mut flag = 0;
+        if self.utf8 {
+            flag |= UTF8_NAME;
+        }
+        if self.encryption != Encryption::None {
+            flag |= ENCRYPTED;
+        }
+        flag
+    }
+
+    fn method(&self) -> u16 {
+        if self.encryption == Encryption::Aes256 {
+            99
+        } else {
+            0
+        }
+    }
+
+    /// The central record's extra field, which is the one `zip` parses for an entry.
+    fn extra(&self) -> Vec<u8> {
+        let mut extra = Vec::new();
+        if let Some(unicode) = self.unicode_path {
+            push16(&mut extra, 0x7075);
+            push16(&mut extra, len16_of(5 + unicode.len()));
+            extra.push(1); // version
+            push32(&mut extra, crc32(self.name));
+            extra.extend_from_slice(unicode.as_bytes());
+        }
+        if self.encryption == Encryption::Aes256 {
+            push16(&mut extra, 0x9901);
+            push16(&mut extra, 7);
+            push16(&mut extra, 2); // AE-2
+            extra.extend_from_slice(b"AE"); // vendor id
+            extra.push(3); // AES-256
+            push16(&mut extra, 0); // the underlying method, which parsing restores
+        }
+        extra
+    }
+}
+
+/// Writes a zip byte by byte whose entry names are the bytes given.
+///
+/// Stored, no data descriptors, no Zip64: the departures from the ordinary form that
+/// [`framed_archive`] exists for are orthogonal to this one, and combining them would make one
+/// generator that answers neither question clearly.
+///
+/// The extra fields go in the central record only, which is where `zip` reads an entry's:
+/// `central_header_to_zip_file_inner` parses that record's field and never the local one. The
+/// local header therefore declares no extra field, which keeps it self-consistent for
+/// `find_data_start`.
+pub fn encoded_archive(entries: &[Encoded<'_>]) -> Vec<u8> {
+    const LOCAL_HEADER: u32 = 0x0403_4b50;
+    const CENTRAL_HEADER: u32 = 0x0201_4b50;
+    const END_OF_DIRECTORY: u32 = 0x0605_4b50;
+    /// Version 2.0, the floor for Stored.
+    const VERSION: u16 = 20;
+
+    let mut bytes = Vec::new();
+    let mut offsets = Vec::with_capacity(entries.len());
+    for entry in entries {
+        offsets.push(len32(&bytes));
+        push32(&mut bytes, LOCAL_HEADER);
+        push16(&mut bytes, VERSION);
+        push16(&mut bytes, entry.flag());
+        push16(&mut bytes, entry.method());
+        push32(&mut bytes, 0); // modification time and date
+        push32(&mut bytes, crc32(&entry.data));
+        push32(&mut bytes, len32(&entry.data));
+        push32(&mut bytes, len32(&entry.data));
+        push16(&mut bytes, len16_of(entry.name.len()));
+        push16(&mut bytes, 0); // extra field
+        bytes.extend_from_slice(entry.name);
+        bytes.extend_from_slice(&entry.data);
+    }
+
+    let directory_offset = len32(&bytes);
+    let mut directory = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let extra = entry.extra();
+        push32(&mut directory, CENTRAL_HEADER);
+        push16(&mut directory, VERSION); // version made by
+        push16(&mut directory, VERSION); // version needed
+        push16(&mut directory, entry.flag());
+        push16(&mut directory, entry.method());
+        push32(&mut directory, 0); // modification time and date
+        push32(&mut directory, crc32(&entry.data));
+        push32(&mut directory, len32(&entry.data));
+        push32(&mut directory, len32(&entry.data));
+        push16(&mut directory, len16_of(entry.name.len()));
+        push16(&mut directory, len16_of(extra.len()));
+        push16(&mut directory, 0); // comment
+        push16(&mut directory, 0); // starting disk
+        push16(&mut directory, 0); // internal attributes
+        push32(&mut directory, 0); // external attributes
+        push32(&mut directory, offsets[index]);
+        directory.extend_from_slice(entry.name);
+        directory.extend_from_slice(&extra);
+    }
+
+    let directory_len = len32(&directory);
+    bytes.extend_from_slice(&directory);
+
+    let count = u16::try_from(entries.len()).expect("the fixture holds few entries");
+    push32(&mut bytes, END_OF_DIRECTORY);
+    push16(&mut bytes, 0); // this disk
+    push16(&mut bytes, 0); // the disk the directory starts on
+    push16(&mut bytes, count); // entries on this disk
+    push16(&mut bytes, count); // entries in total
+    push32(&mut bytes, directory_len);
+    push32(&mut bytes, directory_offset);
+    push16(&mut bytes, 0); // archive comment length
+    bytes
+}
+
+fn len16_of(length: usize) -> u16 {
+    u16::try_from(length).expect("a fixture name and extra field are short")
+}
+
 fn push16(bytes: &mut Vec<u8>, value: u16) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
@@ -505,12 +698,21 @@ pub fn corrupt_scan(jpeg: &[u8], offset: usize) -> Vec<u8> {
     damaged
 }
 
+/// The options `--fix-idx` produces, which is the only naming a test ever asks for beside the
+/// default.
+pub fn by_position() -> comic_auto_resize::source::ReadOptions {
+    comic_auto_resize::source::ReadOptions {
+        naming: comic_auto_resize::source::Naming::ByPosition,
+        ..Default::default()
+    }
+}
+
 /// Every entry of a zip, in stored order, as `(name, bytes)`.
 pub fn read_archive(path: &Path) -> Vec<(String, Vec<u8>)> {
     let bytes = fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let mut source = comic_auto_resize::source::ZipSource::new(
         std::io::Cursor::new(bytes),
-        comic_auto_resize::source::Naming::Stored,
+        &comic_auto_resize::source::ReadOptions::default(),
     )
     .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let mut entries = Vec::new();
@@ -519,4 +721,32 @@ pub fn read_archive(path: &Path) -> Vec<(String, Vec<u8>)> {
         entries.push((entry.name, entry.bytes));
     }
     entries
+}
+
+/// Writes a zip whose entries are really ZipCrypto-enciphered, under `password`.
+///
+/// `zip`'s own writer, because the cipher has to be the one the reader will run in reverse.
+/// `mod zipcrypto` is unconditional in `zip` 8.6.0 — there is no feature to enable and none in
+/// the manifest — so this costs the fixture nothing and proves the same of the reader.
+pub fn write_encrypted_archive(path: &Path, entries: &[(&str, Vec<u8>)], password: &str) {
+    use zip::unstable::write::FileOptionsExt;
+
+    let file = File::create(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let mut writer = ZipWriter::new(file);
+    for (name, bytes) in entries {
+        let options = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .large_file(false)
+            .with_deprecated_encryption(password.as_bytes())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        writer
+            .start_file(*name, options)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        writer
+            .write_all(bytes)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+    }
+    writer
+        .finish()
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
 }
