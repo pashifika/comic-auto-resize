@@ -37,7 +37,7 @@ pub use probe::{
     CANDIDATES, Candidate, Format, MAGIC_MAX, Names, Naming, declared_format, output_name, probe,
 };
 pub use rar::RarSource;
-pub use sevenz::SevenZSource;
+pub use sevenz::{MAX_DICTIONARY_BYTES, SevenZSource};
 pub use signature::{
     ARCHIVE_CANDIDATES, ARCHIVE_MAGIC_MAX, ArchiveCandidate, ArchiveFormat, detect,
     readable_formats,
