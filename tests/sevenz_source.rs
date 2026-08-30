@@ -154,6 +154,12 @@ fn an_entry_whose_extension_and_content_disagree_is_an_error_not_a_skip() {
     });
 }
 
+/// `-spf` is the only way to make 7-Zip store a name it would otherwise strip.
+///
+/// The stored separator is the host's, not the format's: the same command writes
+/// `../page1.jpg` on unix and `..\page1.jpg` on Windows. That is exactly why `unsafe_name`
+/// treats both as separators, so the fixture is checked for either and the refusal is
+/// asserted exactly.
 #[test]
 fn a_traversing_stored_name_is_refused_rather_than_sanitised() {
     if seven_zip().is_none() {
@@ -175,7 +181,16 @@ fn a_traversing_stored_name_is_refused_rather_than_sanitised() {
         .status()
         .expect("runs the archiver");
     assert!(status.success());
-    assert_eq!(seven_zip_listing(&archive), ["../page1.jpg"]);
+
+    let listing = seven_zip_listing(&archive);
+    assert_eq!(
+        listing
+            .iter()
+            .map(|name| name.replace('\\', "/"))
+            .collect::<Vec<_>>(),
+        ["../page1.jpg"],
+        "the fixture does not store the traversing name this test depends on"
+    );
 
     assert!(
         error_text(&archive).contains("escapes its own directory"),
