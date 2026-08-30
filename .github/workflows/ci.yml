@@ -257,6 +257,56 @@ jobs:
             exit 1
           fi
 
+      # `mozjpeg-sys` assembles its x86 SIMD kernels with nasm, and `repo-bootstrap`
+      # established that this image does not ship it. Installed before the first cargo
+      # invocation, because the fallback is a silent one.
+      - name: Provision nasm
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          choco install nasm --yes --no-progress
+
+          # Chocolatey's package does not put nasm on PATH, so the directory is exported
+          # for the later steps rather than assumed to already be there.
+          nasm_dir='/c/Program Files/NASM'
+          printf '%s\n' 'C:\Program Files\NASM' >> "${GITHUB_PATH}"
+          export PATH="${nasm_dir}:${PATH}"
+
+          if ! command -v nasm >/dev/null 2>&1; then
+            echo "::error::nasm is absent after installation; mozjpeg-sys would drop SIMD"
+            exit 1
+          fi
+          nasm -v
+
+      - name: Build mozjpeg and confirm SIMD survived
+        shell: bash
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          cargo build --locked -p mozjpeg-sys
+
+          # mozjpeg-sys falls back to `jsimd_none.c` and emits only a `cargo:warning`
+          # when its assembler is missing, which is easy to miss in an otherwise green
+          # run. `WITH_SIMD` reaches the generated `jconfig.h` on the SIMD path alone, so
+          # the outcome is asserted rather than the tool that produces it.
+          configs=(target/debug/build/mozjpeg-sys-*/out/include/jconfig.h)
+          if [ "${#configs[@]}" -eq 0 ]; then
+            echo "::error::mozjpeg-sys produced no jconfig.h; its build script did not run"
+            exit 1
+          fi
+
+          for config in "${configs[@]}"; do
+            if ! grep -q 'define WITH_SIMD 1' "${config}"; then
+              echo "::error::${config} has no WITH_SIMD; mozjpeg-sys compiled without SIMD"
+              exit 1
+            fi
+            echo "mozjpeg-sys: WITH_SIMD confirmed in ${config}"
+          done
+
       - name: Lint
         shell: bash
         timeout-minutes: 15
@@ -313,6 +363,40 @@ jobs:
             echo "::error::expected native host aarch64-apple-darwin but found ${host}"
             exit 1
           fi
+
+      # `mozjpeg-sys` only shells out to nasm for x86 targets; on aarch64 it assembles
+      # `vendor/simd/arm/aarch64/jsimd_neon.S` with the C compiler's GNU-style
+      # assembler, which this image ships. Reported rather than assumed, because the
+      # next step's SIMD assertion depends on it.
+      - name: Report the assembler toolchain
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cc --version
+
+      - name: Build mozjpeg and confirm SIMD survived
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          cargo build --locked -p mozjpeg-sys
+
+          # Same assertion as the windows job, for the same reason: the fallback to
+          # `jsimd_none.c` costs performance and announces itself only as a warning.
+          configs=(target/debug/build/mozjpeg-sys-*/out/include/jconfig.h)
+          if [ "${#configs[@]}" -eq 0 ]; then
+            echo "::error::mozjpeg-sys produced no jconfig.h; its build script did not run"
+            exit 1
+          fi
+
+          for config in "${configs[@]}"; do
+            if ! grep -q 'define WITH_SIMD 1' "${config}"; then
+              echo "::error::${config} has no WITH_SIMD; mozjpeg-sys compiled without SIMD"
+              exit 1
+            fi
+            echo "mozjpeg-sys: WITH_SIMD confirmed in ${config}"
+          done
 
       - name: Lint
         timeout-minutes: 15

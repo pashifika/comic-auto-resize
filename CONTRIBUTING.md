@@ -24,12 +24,28 @@ request as the manifest change that caused it.
 
 ## Prerequisites
 
-Only `rustup`. The skeleton depends on `clap` and nothing native.
+`rustup`, a C compiler, and `nasm` on x86.
 
-This will change: the image pipeline links mozjpeg, which `mozjpeg-sys` builds from
-source and which needs a C compiler and `nasm` for its SIMD paths. That prerequisite
-arrives with the change that adds the dependency, and this section is updated then rather
-than in advance.
+The image pipeline links mozjpeg, and `mozjpeg-sys` builds it from source on every clean
+build. That needs a C compiler on every target, and `nasm` on x86 for the SIMD kernels —
+on aarch64 the kernels are assembled by the C compiler itself, so `nasm` is not used
+there. Without the assembler it needs, `mozjpeg-sys` compiles a scalar fallback and says
+so only in a `cargo:warning`, so CI asserts that `WITH_SIMD` survived rather than trusting
+the build to be loud about it.
+
+```sh
+# macOS
+brew install nasm      # only needed on an Intel Mac
+
+# Windows
+choco install nasm     # then add C:\Program Files\NASM to PATH
+```
+
+The `mozjpeg` crate is patched to a Git revision until its upstream pull request lands;
+see the comment beside `[patch.crates-io]` in `Cargo.toml`. If your global Git
+configuration rewrites `https://github.com/` to SSH — `url.<ssh>.insteadOf` — Cargo's
+bundled fetcher will try ssh-agent and fail with `no authentication methods succeeded`.
+Either add the key to `ssh-agent` or run Cargo with `CARGO_NET_GIT_FETCH_WITH_CLI=true`.
 
 `cargo-deny` is needed for the dependency-policy step below:
 
