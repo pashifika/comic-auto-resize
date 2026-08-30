@@ -14,7 +14,7 @@ use std::path::Path;
 
 use comic_auto_resize::pipeline::{self, RunError};
 use comic_auto_resize::source::{
-    Entries, Entry, MAX_ENTRY_BYTES, Naming, Source, SourceError, ZipSource,
+    Entries, Entry, MAX_DICTIONARY_BYTES, MAX_ENTRY_BYTES, Naming, Source, SourceError, ZipSource,
 };
 
 use support::{TempDir, page_bytes, seven_zip, seven_zip_listing, write_seven_zip};
@@ -277,6 +277,55 @@ fn renumbering_takes_its_width_from_the_7z_entry_table() {
             ]
         );
     });
+}
+
+/// An archive declaring more decoder working memory than this build will allocate is refused
+/// from its header, before a block is decoded.
+///
+/// The format allows 4 GiB and the dependency's own guard cannot fire, so this ceiling is the
+/// only thing between a crafted archive and that allocation — which makes an untested refusal
+/// branch exactly the wrong thing to ship. `7zz` clamps a requested dictionary to the input
+/// size rounded up, so the fixture needs a large *input* rather than a large archive: 300 MiB
+/// of zeros asked for at `d512m` gives `LZMA2:384m` and packs to about 46 KB, in under two
+/// seconds. The staging file goes with the scratch directory.
+#[test]
+fn an_archive_declaring_more_working_memory_than_the_limit_is_refused() {
+    let Some(program) = seven_zip() else {
+        return;
+    };
+    let directory = TempDir::new("sevenz-dictionary");
+    let staging = directory.join("staging");
+    std::fs::create_dir_all(&staging).expect("creates the staging directory");
+
+    // Written in chunks rather than as one buffer: the point is a large input, not a large
+    // allocation in the test.
+    let mut page = std::fs::File::create(staging.join("page1.jpg")).expect("creates");
+    std::io::Write::write_all(&mut page, &[0xFF, 0xD8]).expect("writes the marker");
+    let chunk = vec![0; 1 << 20];
+    for _ in 0..300 {
+        std::io::Write::write_all(&mut page, &chunk).expect("writes a chunk");
+    }
+    drop(page);
+
+    let archive = directory.join("big-dictionary.7z");
+    let status = std::process::Command::new(program)
+        .args(["a", "-t7z", "-bso0", "-bsp0", "-m0=LZMA2:d512m"])
+        .arg(&archive)
+        .arg("page1.jpg")
+        .current_dir(&staging)
+        .status()
+        .expect("runs the archiver");
+    assert!(status.success());
+    std::fs::remove_file(staging.join("page1.jpg")).expect("removes the staging file");
+
+    let error = Source::open(&archive, Naming::Stored)
+        .expect_err("an over-large dictionary must be refused at open");
+    let message = error.to_string();
+    assert!(message.contains("decoder dictionary"), "{message}");
+    assert!(
+        message.contains(&MAX_DICTIONARY_BYTES.to_string()),
+        "the refusal must name the limit: {message}"
+    );
 }
 
 /// Every item the source produces, errors included, so a reader that keeps going after it has

@@ -321,6 +321,37 @@ fn something_that_is_not_a_regular_file_is_refused_before_it_is_opened() {
     assert!(message.contains("not a regular file"), "{message}");
 }
 
+/// Nothing is unpacked to disk. The directory reader only ever opens a file for reading, so
+/// the guard is that a run creates nothing beside the input — the same assertion the zip, rar
+/// and 7z readers each carry, made here so the contract holds for the input that is not an
+/// archive.
+#[test]
+fn reading_a_directory_writes_nothing_to_disk() {
+    let files = [("page1.jpg", page(30)), ("ch1/page2.jpg", page(31))];
+    with_tree("dir-no-temp", &files, |scratch, root| {
+        let before = tree_listing(scratch.path());
+        assert_eq!(names(root).len(), 2);
+        assert_eq!(before, tree_listing(scratch.path()));
+    });
+}
+
+/// Every path under `directory`, sorted, so a stray temporary anywhere in the tree shows.
+fn tree_listing(directory: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).expect("lists") {
+            let entry = entry.expect("an entry");
+            found.push(entry.path().to_string_lossy().into_owned());
+            if entry.file_type().expect("a type").is_dir() {
+                pending.push(entry.path());
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
 /// The listing runs at open and each page is read later, so a tree the tool does not own can
 /// change in between. The file type is re-checked immediately before the open, which narrows
 /// the window to a syscall rather than the length of the run — a page swapped for a link
