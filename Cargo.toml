@@ -3,9 +3,10 @@ name = "comic-auto-resize"
 version = "2.0.0-dev"
 edition = "2024"
 # The crate's own floor, separate from the channel pinned in `rust-toolchain.toml`.
-# Edition 2024 and clap 4.6 both require 1.85; nothing here needs more yet. Later
-# changes raise it when a dependency actually demands it, not pre-emptively.
-rust-version = "1.85"
+# Raised from 1.85 to 1.87 because `fast_image_resize` 6.1.0 declares 1.87; nothing here
+# needs more yet. Later changes raise it when a dependency actually demands it, not
+# pre-emptively.
+rust-version = "1.87"
 description = "Auto-resize the pages of a comic archive and repack them as zip"
 license = "Apache-2.0"
 repository = "https://github.com/pashifika/comic-auto-resize"
@@ -26,3 +27,21 @@ pedantic = "deny"
 
 [dependencies]
 clap = { version = "=4.6.6", features = ["derive"] }
+# Both pinned exactly: a native build that changes underneath a previously green run is
+# the hardest kind of failure to attribute.
+fast_image_resize = "=6.1.0"
+mozjpeg = "=0.10.13"
+# Already in the tree through `fast_image_resize`, so it adds no dependency and no new
+# licence: typed page errors the pipeline can branch on, without hand-written `Display`.
+thiserror = "=2.0.20"
+
+# Temporary. `mozjpeg` 0.10.13 exposes `Decompress::dct_method` but no encoder-side
+# counterpart, and `Compress` keeps `cinfo` private, so `--dct` cannot reach the
+# compressor through the released crate. The fork is the v0.10.13 tag plus one commit
+# adding `Compress::set_dct_method`, and nothing else.
+#
+# Exit condition: https://github.com/ImageOptim/mozjpeg-rust/pull/54 landing in a
+# release. When it does, this section and the matching `allow-git` entry in `deny.toml`
+# are deleted together and the requirement above is raised to that release.
+[patch.crates-io]
+mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "4c4c651e01d35fe7e52cf56a8c64b469821984a0" }
