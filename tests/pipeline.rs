@@ -15,7 +15,7 @@ use comic_auto_resize::page::{DecodeSettings, EncodeSettings, Filter, PageErrorK
 use comic_auto_resize::pipeline::{self, RunError, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
 use comic_auto_resize::sink::default_output;
-use comic_auto_resize::source::Source;
+use comic_auto_resize::source::{Source, SourceError};
 
 use support::{
     TempDir, corrupt_scan, jpeg_size, page_bytes, read_archive, write_archive, write_pages,
@@ -343,4 +343,133 @@ fn write_memory_fixtures() {
         let size = fs::metadata(&path).expect("metadata").len();
         println!("{}: {pages} pages, {size} bytes", path.display());
     }
+}
+
+/// An existing partial is refused rather than opened.
+///
+/// The partial's name is derived from the output's, so it is predictable. Without exclusive
+/// creation, anyone able to write the output directory could pre-place it as a link and have
+/// this process truncate and overwrite the link's target, then rename the link into place.
+#[test]
+fn an_existing_partial_file_is_refused_without_being_written() {
+    let input = archive_bytes(&[("page.jpg".to_owned(), page_bytes(320, 440))]);
+
+    let directory = TempDir::new("partial");
+    let output = directory.join("out.zip");
+    let partial = directory.join("out.zip.part");
+    fs::write(&partial, b"planted").expect("plants the partial");
+
+    let error = run(&input, &output, 2).expect_err("an existing partial is refused");
+    assert!(
+        matches!(&error, RunError::PartialExists { .. }),
+        "expected a partial refusal, got {error}"
+    );
+    assert_eq!(
+        fs::read(&partial).expect("reads the plant"),
+        b"planted",
+        "the planted file was written to"
+    );
+    assert!(!output.exists());
+}
+
+/// An archive with no pages produces no archive, rather than an empty one.
+///
+/// An empty output would report success and then make the next run fail with
+/// "already exists".
+#[test]
+fn an_archive_with_no_pages_writes_nothing() {
+    let input = archive_bytes(&[
+        (
+            "ComicInfo.xml".to_owned(),
+            b"<?xml version=\"1.0\"?>".to_vec(),
+        ),
+        ("notes.txt".to_owned(), b"nothing to see".to_vec()),
+    ]);
+
+    let directory = TempDir::new("empty");
+    let output = directory.join("out.zip");
+    let error = run(&input, &output, 2).expect_err("no pages is not a successful run");
+
+    assert!(
+        matches!(&error, RunError::Empty),
+        "expected an empty-run refusal, got {error}"
+    );
+    assert!(!output.exists(), "an empty archive was installed");
+    // Not even the partial.
+    let leftovers: Vec<_> = fs::read_dir(directory.path())
+        .expect("reads the directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+}
+
+/// Two stored names that collide once renamed are reported as a collision.
+#[test]
+fn two_entries_that_rename_onto_one_name_are_named() {
+    // `p.jpeg` and `p.jpg` both become `p.jpg`.
+    let input = archive_bytes(&[
+        ("p.jpeg".to_owned(), page_bytes(320, 440)),
+        ("p.jpg".to_owned(), page_bytes(320, 440)),
+    ]);
+
+    let directory = TempDir::new("collision");
+    let output = directory.join("out.zip");
+    let error = run(&input, &output, 1).expect_err("one output name cannot hold two entries");
+
+    assert!(
+        matches!(&error, RunError::NameCollision { name } if name == "p.jpg"),
+        "expected a collision naming the output name, got {error}"
+    );
+    assert!(!output.exists());
+}
+
+/// A traversing or absolute entry name is refused rather than carried into the output.
+#[test]
+fn an_unsafe_entry_name_is_refused() {
+    for stored in [
+        "../escape.jpg",
+        "pages/../../escape.jpg",
+        "/absolute.jpg",
+        "\\absolute.jpg",
+        "C:\\windows\\escape.jpg",
+        "pages\\..\\..\\escape.jpg",
+    ] {
+        let input = archive_bytes(&[(stored.to_owned(), page_bytes(64, 96))]);
+        let directory = TempDir::new("unsafe-name");
+        let output = directory.join("out.zip");
+
+        let error = run(&input, &output, 1).expect_err("an unsafe stored name must be refused");
+        assert!(
+            matches!(&error, RunError::Source(SourceError::UnsafeName { .. })),
+            "{stored}: expected an unsafe-name refusal, got {error}"
+        );
+        assert!(!output.exists(), "{stored}: an output was written");
+    }
+}
+
+/// The output archive really holds only the pages, read back with the `zip` crate rather
+/// than through this crate's own reader — which skips non-image entries and so could not
+/// observe one being written.
+#[test]
+fn the_output_holds_only_image_entries() {
+    let mut entries: Vec<_> = (0..4)
+        .map(|index| (format!("page{index}.jpg"), page_bytes(320, 440)))
+        .collect();
+    entries.push((
+        "ComicInfo.xml".to_owned(),
+        b"<?xml version=\"1.0\"?>".to_vec(),
+    ));
+    let input = archive_bytes(&entries);
+
+    let directory = TempDir::new("only-images");
+    let output = directory.join("out.zip");
+    assert_eq!(run(&input, &output, 2).expect("runs"), 4);
+
+    let file = fs::File::open(&output).expect("opens the output");
+    let mut archive = zip::ZipArchive::new(file).expect("reads the central directory");
+    let names: Vec<_> = (0..archive.len())
+        .map(|index| archive.by_index(index).expect("entry").name().to_owned())
+        .collect();
+    assert_eq!(names, ["page0.jpg", "page1.jpg", "page2.jpg", "page3.jpg"]);
 }

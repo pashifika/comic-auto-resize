@@ -26,7 +26,13 @@ const MAX_SOURCE_PIXELS: u64 = 100_000_000;
 ///
 /// Chosen, not measured. A 1280-wide page is about 7 MB decoded; a 600dpi spread about
 /// 210 MB. 256 MiB admits that and refuses the 12.87 GB a `65500x65500` RGB header asks
-/// for. Peak memory is this times the worker count, so it is not a free number to raise.
+/// for.
+///
+/// Raising it is not free, and it is not the only term either: this bounds *one buffer*, a
+/// worker holds a decoded page and a resize destination at once, and libjpeg's own working
+/// set follows the source geometry rather than this — a progressive source at the pixel
+/// ceiling holds coefficient arrays of roughly 600 MB inside libjpeg alone, with no backing
+/// store, because mozjpeg links `jmemnobs`. Multiply the lot by the worker count.
 const MAX_IMAGE_BYTES: u64 = 256 << 20;
 
 /// What one page is allowed to cost.
@@ -60,16 +66,13 @@ impl Budget {
 
     /// Rejects a page whose header declares more pixels than the limit allows.
     ///
-    /// Widened to `u64`: two `u32` axes overflow `u32`, and a release build has overflow
-    /// checks off, so a wrapped product would accept the very header this refuses.
-    ///
     /// # Errors
     ///
     /// [`PageErrorKind::TooLarge`], naming the quantity, the value, and the limit.
     pub fn allow_source(&self, width: u32, height: u32) -> Result<(), PageErrorKind> {
         Self::check(
             "source pixels",
-            u64::from(width) * u64::from(height),
+            u128::from(width) * u128::from(height),
             self.max_source_pixels,
         )
     }
@@ -87,13 +90,20 @@ impl Budget {
     ) -> Result<(), PageErrorKind> {
         Self::check(
             "image bytes",
-            u64::from(width) * u64::from(height) * u64::from(channels.count()),
+            u128::from(width) * u128::from(height) * u128::from(channels.count()),
             self.max_image_bytes,
         )
     }
 
-    fn check(quantity: &'static str, actual: u64, limit: u64) -> Result<(), PageErrorKind> {
-        if actual > limit {
+    /// Widened to `u128`, as [`PageImage::new`] is and for the same reason: two `u32` axes
+    /// times three channels tops out just under `3 * u64::MAX`, a release build has overflow
+    /// checks off, and a wrapped product would compare below the limit and pass. Not
+    /// reachable through the binary, whose width is capped and whose JPEG axes are 16-bit,
+    /// but this check is what stands between a library caller and an infallible `vec![0; …]`.
+    ///
+    /// [`PageImage::new`]: super::PageImage::new
+    fn check(quantity: &'static str, actual: u128, limit: u64) -> Result<(), PageErrorKind> {
+        if actual > u128::from(limit) {
             return Err(PageErrorKind::TooLarge {
                 quantity,
                 actual,

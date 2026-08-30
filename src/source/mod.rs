@@ -80,4 +80,9 @@ pub enum SourceError {
     },
     #[error("{name}: entry is larger than the limit of {limit} bytes")]
     TooLarge { name: String, limit: u64 },
+    /// The stored name would be carried into the output archive, where a traversing or
+    /// absolute name is a hazard for whatever extracts it. Rejected rather than sanitised,
+    /// because rewriting it would produce an output whose entries do not match the input's.
+    #[error("{name}: refusing the entry name because {reason}")]
+    UnsafeName { name: String, reason: &'static str },
 }

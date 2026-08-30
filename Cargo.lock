@@ -313,7 +313,7 @@ dependencies = [
 [[package]]
 name = "mozjpeg"
 version = "0.10.13"
-source = "git+https://github.com/pashifika/mozjpeg-rust.git?rev=82b82b22da6ee20815bdc49895796de3c6089e86#82b82b22da6ee20815bdc49895796de3c6089e86"
+source = "git+https://github.com/pashifika/mozjpeg-rust.git?rev=a3effde52b989b6fb93d7fbf854869fa7931e4af#a3effde52b989b6fb93d7fbf854869fa7931e4af"
 dependencies = [
  "arrayvec",
  "bytemuck",

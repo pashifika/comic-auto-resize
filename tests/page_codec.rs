@@ -752,7 +752,7 @@ fn an_oversized_header_is_refused_before_libjpeg_allocates() {
     };
     assert_eq!(quantity, "source pixels");
     assert_eq!(actual, 65500 * 65500);
-    assert!(actual > limit);
+    assert!(actual > u128::from(limit));
     assert!(
         error.to_string().contains("huge.jpg"),
         "the message must name the page: {error}"
@@ -920,4 +920,41 @@ fn the_process_survives_a_repaired_page_refusal() {
         assert!(decode("corrupt.jpg", &damaged, DecodeSettings::default()).is_err());
     }
     assert!(decode("page.jpg", &jpeg, DecodeSettings::default()).is_ok());
+}
+
+/// A non-conforming header is not a repair, and refusing it would refuse the whole archive.
+///
+/// libjpeg has ten `JWRN_*` codes and only some mean it substituted data. Of the rest,
+/// `jdmarker.c` on `JWRN_JFIF_MAJOR`: "now it's a nonfatal warning, because some bozo at
+/// Hijaak couldn't read the spec." Treating every warning as a repair meant one such page
+/// refused the entire book, with a message saying libjpeg had repaired damage when it had
+/// not.
+#[test]
+fn a_non_conforming_header_is_not_treated_as_a_repair() {
+    let clean = fixture();
+
+    // APP0 is marker (2), length (2), "JFIF\0" (5), then the major version.
+    let app0 = clean
+        .windows(2)
+        .position(|pair| pair == [0xFF, 0xE0])
+        .expect("the fixture carries a JFIF APP0 segment");
+    assert_eq!(&clean[app0 + 4..app0 + 9], b"JFIF\0");
+    let mut quirky = clean.clone();
+    quirky[app0 + 9] = 2;
+
+    let decoded = decode("quirky.jpg", &quirky, DecodeSettings::default())
+        .expect("an unknown JFIF revision is a header quirk, not fabricated data");
+
+    // And the quirk changed nothing about the image, which is why ignoring it is right.
+    let reference = decode("page.jpg", &clean, DecodeSettings::default()).expect("decodes");
+    assert_eq!(decoded.pixels(), reference.pixels());
+
+    // The policy still discriminates: a repair-class fault in the same fixture is refused.
+    let error = decode(
+        "corrupt.jpg",
+        &corrupt_scan(&clean, 0),
+        DecodeSettings::default(),
+    )
+    .expect_err("a bad Huffman code is fabricated data");
+    assert!(matches!(error.kind, PageErrorKind::Repaired { .. }));
 }

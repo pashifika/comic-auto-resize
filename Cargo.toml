@@ -64,11 +64,15 @@ zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate
 # are discarded, because `emit_message` is an empty function, so a page libjpeg repaired
 # by fabricating coefficients decodes as if it were sound.
 #
-# The fork is the v0.10.13 tag (306a7da0) plus exactly two commits, one per item.
+# The fork is the v0.10.13 tag (306a7da0) plus exactly three commits: `set_dct_method`, the
+# warning accessors, and a follow-up that reports warnings from `finish` — libjpeg reads on
+# to the end-of-image marker there and warns about extraneous data before it — and holds the
+# error manager as a raw pointer, because `cinfo.common.err` points into that allocation and
+# a `Box` deref asserts uniqueness over it.
 #
 # Exit condition: both upstream pull requests landing in a release —
 # https://github.com/ImageOptim/mozjpeg-rust/pull/54 (`set_dct_method`) and
-# https://github.com/ImageOptim/mozjpeg-rust/pull/55 (warnings). This section and the
-# `allow-git` entry in `deny.toml` are deleted together once both have.
+# https://github.com/ImageOptim/mozjpeg-rust/pull/55 (warnings, carrying the follow-up).
+# This section and the `allow-git` entry in `deny.toml` are deleted together once both have.
 [patch.crates-io]
-mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "82b82b22da6ee20815bdc49895796de3c6089e86" }
+mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "a3effde52b989b6fb93d7fbf854869fa7931e4af" }

@@ -6,9 +6,9 @@
 //! entries in stored order, so the book would be shuffled for anyone whose viewer does not
 //! sort by name.
 
-use std::collections::BTreeMap;
-use std::fs::{self, File};
-use std::io::Write;
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use zip::write::SimpleFileOptions;
@@ -31,7 +31,9 @@ pub struct Page {
 
 /// The output archive, fed in read order from completions that may arrive out of order.
 pub struct Sink {
-    archive: ZipWriter<File>,
+    /// `Option` only so `finish` can take it: `ZipWriter::finish` consumes, and `Sink` has a
+    /// `Drop`. It is `Some` for the whole life of the sink until then.
+    archive: Option<ZipWriter<File>>,
     /// Completed pages above the one being waited for. Bounded by the pipeline's read-ahead
     /// window, not by the page count — see [`crate::pipeline`].
     pending: BTreeMap<PageKey, Page>,
@@ -41,15 +43,27 @@ pub struct Sink {
     /// failed run leaves nothing at the destination.
     partial: PathBuf,
     final_path: PathBuf,
+    /// Every name written, so a collision created by extension rewriting is reported as
+    /// itself rather than as `zip`'s "Duplicate filename".
+    names: HashSet<String>,
+    /// Set once the rename succeeded. Until then [`Sink::drop`] removes the partial, so no
+    /// error path can leave a full-size stray file beside the destination.
+    installed: bool,
 }
 
 impl Sink {
-    /// Creates the output archive, refusing to disturb an existing file at `path`.
+    /// Creates the output archive, refusing to disturb anything already at `path`.
+    ///
+    /// The partial file is created with `create_new`, so an existing path fails instead of
+    /// being opened. That matters because the partial's name is derived from the output's and
+    /// is therefore predictable: without exclusive creation, anyone able to write the output
+    /// directory could pre-place `<output>.part` as a symbolic or hard link and have this
+    /// process truncate and overwrite the link's target, then rename the link into place.
     ///
     /// # Errors
     ///
-    /// [`RunError::OutputExists`] when `path` is taken, and [`RunError::Io`] when the
-    /// partial file cannot be created.
+    /// [`RunError::OutputExists`] when `path` is taken, [`RunError::PartialExists`] when the
+    /// partial is, and [`RunError::Io`] when it cannot be created.
     pub fn create(path: &Path) -> Result<Self, RunError> {
         if path.exists() {
             return Err(RunError::OutputExists {
@@ -63,17 +77,31 @@ impl Sink {
         partial.push(".part");
         let partial = PathBuf::from(partial);
 
-        let file = File::create(&partial).map_err(|source| RunError::Io {
-            path: partial.clone(),
-            source,
-        })?;
+        let file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+        {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(RunError::PartialExists { path: partial });
+            }
+            Err(source) => {
+                return Err(RunError::Io {
+                    path: partial,
+                    source,
+                });
+            }
+        };
 
         Ok(Self {
-            archive: ZipWriter::new(file),
+            archive: Some(ZipWriter::new(file)),
             pending: BTreeMap::new(),
             next_index: 0,
             written: 0,
+            names: HashSet::new(),
             partial,
+            installed: false,
             final_path: path.to_path_buf(),
         })
     }
@@ -102,11 +130,16 @@ impl Sink {
 
     /// Finishes the archive and moves it onto the final path.
     ///
+    /// Every failure here leaves the partial for [`Sink::drop`] to remove, including a full
+    /// disk while the central directory is written — which is exactly when leaving a
+    /// full-size stray file would hurt most.
+    ///
     /// # Errors
     ///
-    /// [`RunError::Incomplete`] if a page never arrived, and [`RunError::Archive`] or
-    /// [`RunError::Io`] if the archive cannot be closed or renamed.
-    pub fn finish(self) -> Result<u32, RunError> {
+    /// [`RunError::Empty`] when no page was written, [`RunError::Incomplete`] if a page never
+    /// arrived, and [`RunError::Archive`] or [`RunError::Io`] if the archive cannot be closed
+    /// or renamed.
+    pub fn finish(mut self) -> Result<u32, RunError> {
         if let Some(key) = self.pending.keys().next().copied() {
             // Every page that was read is accounted for by the time the workers are joined,
             // so a leftover here means the ordering invariant broke rather than that a page
@@ -116,40 +149,72 @@ impl Sink {
                 stranded: key.0,
             });
         }
+        if self.written == 0 {
+            // An archive with no pages in it is not an output worth installing: it would
+            // report success, and then make the next run fail with "already exists".
+            return Err(RunError::Empty);
+        }
 
-        self.archive.finish().map_err(RunError::Archive)?;
+        let archive = self.archive.take().ok_or(RunError::StagePanicked {
+            stage: "the writer",
+        })?;
+        archive.finish().map_err(RunError::Archive)?;
         fs::rename(&self.partial, &self.final_path).map_err(|source| RunError::Io {
             path: self.final_path.clone(),
             source,
         })?;
+        self.installed = true;
         Ok(self.written)
     }
 
-    /// Removes the partial archive. Called when the run has already failed.
-    pub fn abandon(self) {
-        let partial = self.partial;
-        drop(self.archive);
-        // The run is already failing; a failure to clean up must not replace its error.
-        let _ = fs::remove_file(&partial);
-    }
-
     fn write(&mut self, page: &Page) -> Result<(), RunError> {
+        // Rewriting every extension to the encoder's can map two stored names onto one:
+        // `p.jpeg` and `p.jpg` both become `p.jpg`. `ZipWriter` rejects the second with
+        // "Duplicate filename", which never mentions the rename that caused it, so the
+        // collision is caught here where both halves are known. The set costs no asymptotic
+        // memory the writer was not already paying: it holds every name for the central
+        // directory regardless.
+        if !self.names.insert(page.name.clone()) {
+            return Err(RunError::NameCollision {
+                name: page.name.clone(),
+            });
+        }
+
         // Stored, because entropy-coded JPEG does not compress: deflating it spends a pass
         // over every byte for no reduction.
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
             .large_file(false);
-        self.archive
+        let partial = self.partial.clone();
+        let archive = self.archive.as_mut().ok_or(RunError::StagePanicked {
+            stage: "the writer",
+        })?;
+        archive
             .start_file(page.name.as_str(), options)
             .map_err(RunError::Archive)?;
-        self.archive
+        archive
             .write_all(&page.bytes)
             .map_err(|source| RunError::Io {
-                path: self.partial.clone(),
+                path: partial,
                 source,
             })?;
         self.written += 1;
         Ok(())
+    }
+}
+
+impl Drop for Sink {
+    /// Removes the partial unless it was installed.
+    ///
+    /// This is the single cleanup path, rather than each exit doing its own: `finish`
+    /// consumes the sink, so a failure inside it leaves the caller nothing to call, and a
+    /// panic in the pipeline skips the caller entirely.
+    fn drop(&mut self) {
+        if self.installed {
+            return;
+        }
+        // The run is already failing; a failure to clean up must not replace its error.
+        let _ = fs::remove_file(&self.partial);
     }
 }
 

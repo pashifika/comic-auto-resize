@@ -37,6 +37,7 @@
 
 use std::io::BufRead;
 use std::num::NonZeroUsize;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -102,10 +103,13 @@ pub struct Report {
 ///
 /// # Errors
 ///
-/// The first failure of any kind, after which no archive is left at `output`. One page that
-/// cannot be decoded, resized, or encoded ends the run: a book missing a page, or holding a
-/// page the tool did not process, is worse than no output, because it is the failure a
-/// reader notices last.
+/// The first failure the *writer dequeues*, which with several damaged pages is whichever
+/// worker finished first rather than the earliest in read order. After it, no archive is left
+/// at `output` and no partial beside it.
+///
+/// One page that cannot be decoded, resized, or encoded ends the run: a book missing a page,
+/// or holding a page the tool did not process, is worse than no output, because it is the
+/// failure a reader notices last.
 ///
 /// # Panics
 ///
@@ -133,8 +137,17 @@ where
     let mut sink = Sink::create(output)?;
 
     let outcome = thread::scope(|scope| {
-        let reader = scope.spawn(move || read_entries(source, &credit_rx, &work_tx));
-
+        let reader = scope.spawn(move || {
+            // Caught here rather than left to unwind out of the scope: `thread::scope`
+            // re-panics for any spawned thread that panicked, which would discard the
+            // payload, skip the error path below, and bypass the sink's cleanup.
+            panic::catch_unwind(AssertUnwindSafe(|| {
+                read_entries(source, &credit_rx, &work_tx)
+            }))
+            .unwrap_or(Err(RunError::StagePanicked {
+                stage: "the archive reader",
+            }))
+        });
         for _ in 0..settings.jobs.get() {
             let work_rx = work_rx.clone();
             let done_tx = done_tx.clone();
@@ -143,10 +156,11 @@ where
                 // rather than rebuilt per page.
                 let mut resampler = Resampler::new();
                 while let Ok(job) = work_rx.recv() {
-                    if done_tx
-                        .send(process(job, &mut resampler, settings))
-                        .is_err()
-                    {
+                    let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                        process(job, &mut resampler, settings)
+                    }))
+                    .unwrap_or_else(|_| Err(PageError::stage_panicked("a page worker")));
+                    if done_tx.send(outcome).is_err() {
                         break;
                     }
                 }
@@ -186,7 +200,7 @@ where
         drop(done_rx);
         drop(credit_tx);
 
-        let read = reader.join().unwrap_or(Err(RunError::WorkerPanicked {
+        let read = reader.join().unwrap_or(Err(RunError::StagePanicked {
             stage: "the archive reader",
         }));
 
@@ -202,10 +216,8 @@ where
         Ok(()) => Ok(Report {
             pages: sink.finish()?,
         }),
-        Err(error) => {
-            sink.abandon();
-            Err(error)
-        }
+        // The sink's `Drop` removes the partial; there is nothing else to undo.
+        Err(error) => Err(error),
     }
 }
 
@@ -280,6 +292,11 @@ pub enum RunError {
     Page(#[from] PageError),
     #[error("{}: already exists", path.display())]
     OutputExists { path: PathBuf },
+    /// The partial file was already there. It is created with `create_new`, so this is
+    /// either a leftover from a run that died, or something placed there deliberately —
+    /// possibly a link pointing somewhere else. Either way it is not overwritten.
+    #[error("{}: already exists; remove it or move it aside", path.display())]
+    PartialExists { path: PathBuf },
     #[error("{}: {source}", path.display())]
     Io {
         path: PathBuf,
@@ -287,8 +304,20 @@ pub enum RunError {
     },
     #[error("cannot write the archive: {0}")]
     Archive(::zip::result::ZipError),
+    /// A stage panicked. Caught rather than left to unwind out of `thread::scope`, which
+    /// would discard the payload and skip the cleanup path.
     #[error("{stage} stopped unexpectedly")]
-    WorkerPanicked { stage: &'static str },
+    StagePanicked { stage: &'static str },
+    /// The archive held no page this build can process, so there was nothing to write. An
+    /// empty output would report success and then make the next run fail with "already
+    /// exists".
+    #[error("no pages to process: the archive holds no image entry this build can read")]
+    Empty,
+    /// Two stored names became one output name when their extensions were rewritten.
+    #[error(
+        "{name}: two entries would be written under this name once renamed to the encoder's extension"
+    )]
+    NameCollision { name: String },
     /// The ordering invariant broke: a page above the one being waited for was left over
     /// after every worker finished.
     #[error("page {expected} never arrived, but page {stranded} did")]

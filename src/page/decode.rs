@@ -9,7 +9,11 @@ use std::os::raw::c_int;
 use std::panic;
 
 use mozjpeg::{ColorSpace, Decompress, Warnings};
-use mozjpeg_sys::{JWRN_EXTRANEOUS_DATA, JWRN_HIT_MARKER, JWRN_JPEG_EOF};
+use mozjpeg_sys::{
+    JWRN_ADOBE_XFORM, JWRN_BOGUS_ICC, JWRN_BOGUS_PROGRESSION, JWRN_EXTRANEOUS_DATA,
+    JWRN_HIT_MARKER, JWRN_HUFF_BAD_CODE, JWRN_JFIF_MAJOR, JWRN_JPEG_EOF, JWRN_MUST_RESYNC,
+    JWRN_NOT_SEQUENTIAL, JWRN_TOO_MUCH_DATA,
+};
 
 use super::{
     Budget, Channels, DctMethod, PageError, PageErrorKind, PageImage, SOI_MARKER, require_soi,
@@ -19,12 +23,43 @@ use super::{
 /// JPEG's end-of-image marker.
 const EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
 
-/// Every warning code a stream truncated after its headers can produce.
+/// Codes that mean libjpeg substituted data for something damaged and carried on. Refused:
+/// the page decoded to full size out of partly fabricated coefficients.
+///
+/// `JWRN_TOO_MUCH_DATA` is a caller-misuse warning rather than a data one and cannot arise
+/// from this decoder; it is listed here so that if it ever did, it would refuse rather than
+/// fall through.
+const REPAIR_CODES: [c_int; 5] = [
+    JWRN_BOGUS_PROGRESSION,
+    JWRN_EXTRANEOUS_DATA,
+    JWRN_HUFF_BAD_CODE,
+    JWRN_MUST_RESYNC,
+    JWRN_TOO_MUCH_DATA,
+];
+
+/// Codes that describe a non-conforming *header* libjpeg interpreted, not damage it
+/// repaired. Ignored, because refusing them would reject files that decode perfectly.
+///
+/// libjpeg says so itself. Of `JWRN_NOT_SEQUENTIAL`, `jdhuff.c`: "This ought to be an error
+/// condition, but we make it a warning because there are some baseline files out there with
+/// all zeroes in these bytes." Of `JWRN_JFIF_MAJOR`, `jdmarker.c`: "now it's a nonfatal
+/// warning, because some bozo at Hijaak couldn't read the spec." `JWRN_ADOBE_XFORM` makes
+/// libjpeg assume YCbCr and decode. `JWRN_BOGUS_ICC` concerns a profile this tool discards
+/// anyway.
+const BENIGN_CODES: [c_int; 4] = [
+    JWRN_ADOBE_XFORM,
+    JWRN_BOGUS_ICC,
+    JWRN_JFIF_MAJOR,
+    JWRN_NOT_SEQUENTIAL,
+];
+
+/// Codes a stream truncated after its headers produces, accepted only together with the
+/// structural test in [`is_truncated`].
 ///
 /// Measured by decoding the committed fixture truncated at every offset from the start of
-/// its scan: the sets observed were `{JWRN_JPEG_EOF}`, `{JWRN_HIT_MARKER, JWRN_JPEG_EOF}`,
-/// and `{JWRN_EXTRANEOUS_DATA, JWRN_JPEG_EOF}`.
-const TRUNCATION_CODES: [c_int; 3] = [JWRN_EXTRANEOUS_DATA, JWRN_HIT_MARKER, JWRN_JPEG_EOF];
+/// its scan: every observed set was a subset of these two plus `JWRN_EXTRANEOUS_DATA`, and
+/// every one contained `JWRN_JPEG_EOF`.
+const TRUNCATION_CODES: [c_int; 2] = [JWRN_HIT_MARKER, JWRN_JPEG_EOF];
 
 /// What the decoder is allowed to do to a page on the way in.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -161,16 +196,15 @@ fn decode_pixels(buffer: &[u8], settings: DecodeSettings) -> Result<DecodedPage,
         Channels::Gray => decompress.grayscale()?,
         Channels::Rgb => decompress.rgb()?,
     };
-    // Read before `finish`, which consumes the handle. These are the *output* dimensions,
-    // which differ from the header's whenever `scale` was applied.
+    // These are the *output* dimensions, which differ from the header's whenever `scale`
+    // was applied, and must be read before the handle is consumed.
     let pixels: Vec<u8> = started.read_scanlines()?;
     let width = dimension(started.width());
     let height = dimension(started.height());
-    // Entropy faults surface while scanlines are read, which is why this is enough without
-    // reaching past `finish` — measured: a truncated stream already reports `JWRN_JPEG_EOF`
-    // here.
-    let warnings = started.warnings();
-    started.finish()?;
+    // After finishing, not before: `jpeg_finish_decompress` reads on to the end-of-image
+    // marker, and `next_marker` warns there about extraneous data before it, so the set is
+    // only complete once that read has happened.
+    let warnings = started.finish_with_warnings()?;
 
     if !is_accepted(warnings, buffer) {
         return Err(PageErrorKind::Repaired {
@@ -190,26 +224,61 @@ fn decode_pixels(buffer: &[u8], settings: DecodeSettings) -> Result<DecodedPage,
 
 /// Whether libjpeg's report is one this build accepts.
 ///
-/// A warning means libjpeg found the data damaged, substituted something, and carried on,
-/// so the page decoded to full size out of partly fabricated coefficients. Post-header
-/// truncation is the recorded parity exception — the Go implementation accepted it through
-/// the same library, and it is the one class whose fabricated region is the tail rather
-/// than the middle. Everything else is refused.
+/// Every code is classified, and anything unclassified is refused, so a libjpeg that grows a
+/// new warning fails closed rather than silently passing.
 ///
-/// The code set alone cannot make that distinction. Measured over every single-byte
-/// corruption of the fixture's entropy data, corruption also produces `{JWRN_JPEG_EOF}` and
-/// `{JWRN_EXTRANEOUS_DATA, JWRN_JPEG_EOF}` — 266 of about 105,000 accepted cases — both of
-/// which truncation produces too. The structural test is what separates them: a complete
-/// file keeps its end-of-image marker and a truncated one cannot.
+/// - [`REPAIR_CODES`] mean fabricated data. Refused.
+/// - [`BENIGN_CODES`] describe a non-conforming header libjpeg interpreted. Ignored. Refusing
+///   these was a defect: one such page would have refused the whole archive, because a page
+///   failure ends the run, with a message saying libjpeg had repaired damage when it had not.
+/// - [`TRUNCATION_CODES`] are accepted only when the stream really is short, which is the
+///   recorded parity exception — the Go implementation accepted post-header truncation
+///   through the same library.
+///
+/// # What this does not prove
+///
+/// It separates *accidental* truncation from *accidental* corruption, and nothing stronger.
+/// Measured over every single-byte corruption of the fixture's entropy data that libjpeg
+/// accepted — about 105,000 cases — 11 produced `{JWRN_JPEG_EOF}` alone, which is also a set
+/// truncation produces. An attacker who corrupts entropy data *and* strips the end-of-image
+/// marker satisfies both tests and gets a page re-encoded from partly fabricated pixels.
+///
+/// That residue is accepted deliberately. Closing it means dropping the truncation exception
+/// entirely, and the cost of this bound is a damaged page in an output archive — not memory
+/// safety, not a privilege boundary. Requiring `JWRN_JPEG_EOF` and refusing
+/// `JWRN_EXTRANEOUS_DATA` narrowed the measured overlap from 266 cases to those 11.
 fn is_accepted(warnings: Warnings, buffer: &[u8]) -> bool {
     if warnings.is_empty() {
         return true;
     }
-    !warnings.has_unnamed_code()
-        && warnings
-            .codes()
-            .all(|code| TRUNCATION_CODES.contains(&code))
-        && is_truncated(buffer)
+    // A code this build cannot name is a code it cannot classify.
+    if warnings.has_unnamed_code() {
+        return false;
+    }
+
+    let mut truncation_shaped = false;
+    for code in warnings.codes() {
+        if REPAIR_CODES.contains(&code) {
+            return false;
+        }
+        if BENIGN_CODES.contains(&code) {
+            continue;
+        }
+        if TRUNCATION_CODES.contains(&code) {
+            truncation_shaped = true;
+            continue;
+        }
+        // A code no list names. Refused, so a libjpeg that grows a new warning fails closed.
+        return false;
+    }
+
+    if !truncation_shaped {
+        // Only benign codes: the page decoded normally.
+        return true;
+    }
+    // A genuinely short stream always runs out of data, so the EOF code must be there, and
+    // the buffer must actually lack its closing marker.
+    warnings.contains(JWRN_JPEG_EOF) && is_truncated(buffer)
 }
 
 /// Whether the stream ends before its end-of-image marker.
@@ -312,6 +381,66 @@ fn dimension(value: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::scale_numerator;
+    use super::{BENIGN_CODES, REPAIR_CODES, TRUNCATION_CODES, is_truncated, scan_offset};
+
+    /// Every warning code libjpeg defines is classified exactly once.
+    ///
+    /// The lists are what decides whether a page is refused, so a code appearing twice, or in
+    /// none of them, is a policy hole rather than an untidy constant. An unlisted code is
+    /// refused at runtime, which is the safe direction, but silently — this makes it loud.
+    #[test]
+    fn the_three_classifications_are_disjoint_and_total() {
+        // `mozjpeg_sys`' table, codes 114 to 128. `JWRN_ARITH_BAD_CODE` is absent from this
+        // build's table; were it present it would be refused as unlisted.
+        let known = [
+            mozjpeg_sys::JWRN_ADOBE_XFORM,
+            mozjpeg_sys::JWRN_BOGUS_ICC,
+            mozjpeg_sys::JWRN_BOGUS_PROGRESSION,
+            mozjpeg_sys::JWRN_EXTRANEOUS_DATA,
+            mozjpeg_sys::JWRN_HIT_MARKER,
+            mozjpeg_sys::JWRN_HUFF_BAD_CODE,
+            mozjpeg_sys::JWRN_JFIF_MAJOR,
+            mozjpeg_sys::JWRN_JPEG_EOF,
+            mozjpeg_sys::JWRN_MUST_RESYNC,
+            mozjpeg_sys::JWRN_NOT_SEQUENTIAL,
+            mozjpeg_sys::JWRN_TOO_MUCH_DATA,
+        ];
+
+        for code in known {
+            let listed = usize::from(REPAIR_CODES.contains(&code))
+                + usize::from(BENIGN_CODES.contains(&code))
+                + usize::from(TRUNCATION_CODES.contains(&code));
+            assert_eq!(
+                listed, 1,
+                "warning code {code} is classified {listed} times"
+            );
+        }
+
+        assert_eq!(
+            REPAIR_CODES.len() + BENIGN_CODES.len() + TRUNCATION_CODES.len(),
+            known.len(),
+            "a list holds a code that is not one of libjpeg's warnings"
+        );
+    }
+
+    #[test]
+    fn truncation_is_decided_from_the_scan_onwards() {
+        // A complete stream: header, scan, entropy byte, closing marker.
+        let complete = [0xFF, 0xD8, 0xFF, 0xDA, 0x00, 0x02, 0x42, 0xFF, 0xD9];
+        assert_eq!(scan_offset(&complete), Some(2));
+        assert!(!is_truncated(&complete));
+
+        // The same stream with its closing marker cut off.
+        assert!(is_truncated(&complete[..complete.len() - 2]));
+
+        // A closing marker that belongs to a thumbnail *before* the scan must not count as
+        // the page's own, or a truncated page would read as complete.
+        let thumbnail_eoi = [
+            0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x04, 0xFF, 0xD9, 0xFF, 0xDA, 0x00, 0x02, 0x42,
+        ];
+        assert_eq!(scan_offset(&thumbnail_eoi), Some(8));
+        assert!(is_truncated(&thumbnail_eoi));
+    }
 
     #[test]
     fn picks_the_smallest_numerator_that_clears_the_target() {

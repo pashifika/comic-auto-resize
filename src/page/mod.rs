@@ -302,6 +302,16 @@ impl PageError {
             kind,
         }
     }
+
+    /// A page whose worker panicked, named for the stage rather than the page: the page's
+    /// name went with the unwind.
+    #[must_use]
+    pub fn stage_panicked(stage: &'static str) -> Self {
+        Self {
+            name: stage.to_owned(),
+            kind: PageErrorKind::Panicked,
+        }
+    }
 }
 
 /// What went wrong with a page, independent of which page it was.
@@ -328,16 +338,23 @@ pub enum PageErrorKind {
     Buffer(#[from] InvalidPixelBuffer),
     /// Refused before allocating for it, because an input-controlled size exceeded an
     /// internal limit. See [`Budget`].
+    ///
+    /// `actual` is `u128` because that is the width the product is computed in; a narrower
+    /// one would misreport the very number this exists to explain.
     #[error("{quantity} is {actual}, over the limit of {limit}")]
     TooLarge {
         quantity: &'static str,
-        actual: u64,
+        actual: u128,
         limit: u64,
     },
     /// libjpeg found the data damaged, substituted coefficients for it, and reported
     /// success. Refused rather than re-encoded, because the pixels are partly fabricated.
     #[error("libjpeg repaired damaged data and reported success (warning codes {codes:?})")]
     Repaired { codes: Vec<i32> },
+    /// The worker processing the page panicked. Caught at the stage boundary so one page
+    /// cannot take the run's error reporting down with it.
+    #[error("processing panicked")]
+    Panicked,
 }
 
 impl From<io::Error> for PageErrorKind {

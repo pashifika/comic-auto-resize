@@ -29,6 +29,13 @@ const LOCAL_HEADER: [u8; 4] = [b'P', b'K', 3, 4];
 /// these, which is why the signature is checked rather than assumed.
 const TERMINATORS: [[u8; 4]; 3] = [[b'P', b'K', 1, 2], [b'P', b'K', 5, 6], [b'P', b'K', 6, 6]];
 
+/// How much capacity an entry's declared size may reserve.
+///
+/// A real page is tens of kilobytes to a few megabytes, so a megabyte is a useful hint and
+/// anything beyond it is the archive's claim rather than a measurement. `read_to_end` grows
+/// geometrically from there.
+const HINT_CEILING: u64 = 1 << 20;
+
 /// An archive read once, from start to finish.
 pub struct ZipSource<R> {
     reader: R,
@@ -104,10 +111,13 @@ impl<R: BufRead> ZipSource<R> {
             }
         }
 
-        // `file.size()` comes from the local header, so it is attacker-controlled and is
-        // used only as a capacity hint, clamped. The limit below is what actually bounds
-        // the read.
-        let hint = usize::try_from(file.size().min(MAX_ENTRY_BYTES)).unwrap_or(0);
+        // `file.size()` comes from the local header, so it is attacker-controlled. Clamping
+        // it to `MAX_ENTRY_BYTES` is not enough on its own: a hundred-byte entry could
+        // declare 64 MiB and get 64 MiB reserved, and up to `2 * jobs` of those buffers are
+        // alive at once, which on Windows is committed rather than merely reserved. So the
+        // hint is capped at a real page's order of magnitude and `read_to_end` grows from
+        // there, which it does geometrically anyway.
+        let hint = usize::try_from(file.size().min(HINT_CEILING)).unwrap_or(0);
         let mut bytes = Vec::with_capacity(hint.saturating_add(head.len()));
         bytes.extend_from_slice(head);
 
@@ -124,6 +134,15 @@ impl<R: BufRead> ZipSource<R> {
                 name,
                 limit: MAX_ENTRY_BYTES,
             });
+        }
+
+        // The stored name goes into the *output* archive, so a traversing or absolute name
+        // would be carried to whatever extracts it. `zip`'s own documentation warns that
+        // `ZipFile::name` may be absolute or escape via `..`. Rejected rather than
+        // sanitised: silently rewriting a name would produce an archive whose entries do not
+        // match the input's, which is worse than refusing.
+        if let Some(reason) = unsafe_name(&name) {
+            return Yielded::Failed(SourceError::UnsafeName { name, reason });
         }
 
         Yielded::Entry(Entry {
@@ -159,6 +178,33 @@ impl<R: BufRead> ZipSource<R> {
             .iter()
             .any(|terminator| available.starts_with(terminator))
     }
+}
+
+/// Why a stored name must not be carried into the output archive, or `None` if it may be.
+///
+/// Every check is on the name as the archive stored it, before the extension is rewritten,
+/// and both separators are treated as separators because a Windows-written archive may use
+/// either.
+fn unsafe_name(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("the name is empty");
+    }
+    if name.contains('\0') {
+        return Some("the name contains a NUL byte");
+    }
+    if name.starts_with('/') || name.starts_with('\\') {
+        return Some("the name is absolute");
+    }
+    // A drive letter (`C:\…`) or a UNC prefix (`\\host\share`), which are absolute on
+    // Windows however the leading characters read on a unix host.
+    let bytes = name.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return Some("the name carries a drive letter");
+    }
+    if name.split(['/', '\\']).any(|component| component == "..") {
+        return Some("the name escapes its own directory");
+    }
+    None
 }
 
 /// What one pass over an entry produced.
