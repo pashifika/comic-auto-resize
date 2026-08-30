@@ -23,12 +23,28 @@ use super::{
 /// JPEG's end-of-image marker.
 const EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
 
-/// Codes that mean libjpeg substituted data for something damaged and carried on. Refused:
-/// the page decoded to full size out of partly fabricated coefficients.
+/// Codes that mean libjpeg found the data damaged and decoded it anyway. Refused: the page
+/// came back at full size with part of it invented.
 ///
 /// `JWRN_TOO_MUCH_DATA` is a caller-misuse warning rather than a data one and cannot arise
 /// from this decoder; it is listed here so that if it ever did, it would refuse rather than
 /// fall through.
+///
+/// `JWRN_EXTRANEOUS_DATA` is here on the strength of a measurement, against the argument that
+/// it belongs elsewhere. `next_marker` emits it after counting bytes skipped while looking for
+/// a marker (`jdmarker.c:920-925`), and for a *sound* file with junk spliced before its
+/// closing marker those bytes were never going to be decoded, so nothing is invented and this
+/// refusal is a false positive. But that is not the common way to reach the code: of about
+/// 105,000 single-byte corruptions of the fixture's entropy data that libjpeg accepted,
+/// **80,804 reported exactly `{JWRN_EXTRANEOUS_DATA}` and nothing else**, every one returning
+/// a full image decoded from a desynchronised entropy stream. Accepting the code would accept
+/// all of those.
+///
+/// So the trade is a narrow false positive — a file with junk between its last scan and its
+/// closing marker, which trailing bytes *after* the marker do not cause, because libjpeg stops
+/// there — against the largest single class of genuinely fabricated pages. For a tool whose
+/// purpose is not shipping invented pixels, the loud refusal is the right side: a false refusal
+/// is visible and investigable, a false accept silently degrades the book.
 const REPAIR_CODES: [c_int; 5] = [
     JWRN_BOGUS_PROGRESSION,
     JWRN_EXTRANEOUS_DATA,

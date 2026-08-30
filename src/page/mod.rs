@@ -347,9 +347,9 @@ pub enum PageErrorKind {
         actual: u128,
         limit: u64,
     },
-    /// libjpeg found the data damaged, substituted coefficients for it, and reported
-    /// success. Refused rather than re-encoded, because the pixels are partly fabricated.
-    #[error("libjpeg repaired damaged data and reported success (warning codes {codes:?})")]
+    /// libjpeg found the data damaged and decoded it anyway. Refused rather than re-encoded,
+    /// because part of the page is invented.
+    #[error("libjpeg reported damaged data and decoded it anyway (warning codes {codes:?})")]
     Repaired { codes: Vec<i32> },
     /// The worker processing the page panicked. Caught at the stage boundary so one page
     /// cannot take the run's error reporting down with it.
