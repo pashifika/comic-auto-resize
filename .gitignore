@@ -21,6 +21,10 @@ __pycache__/
 # reference during the rewrite. Machine-local; the branch itself is the real reference.
 /examples/
 
+# Real archives used to exercise the tool by hand. Machine-local, not test data and not
+# evidence: they are someone's library, so they must never be committed.
+/samples/
+
 # The machine-global excludes file ignores `AGENTS.md` so that agent scratch files stay
 # out of unrelated repositories. Here it is a tracked symbolic link to `CLAUDE.md` and
 # is part of the repository, so that rule is cancelled.
