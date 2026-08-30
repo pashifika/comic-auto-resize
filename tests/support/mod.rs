@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use comic_auto_resize::page::{Channels, EncodeSettings, PageImage, encode};
-use flate2::Crc;
+use flate2::write::DeflateEncoder;
+use flate2::{Compression, Crc};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -149,9 +150,14 @@ pub struct Framing {
     /// The length of the archive comment the end record states and carries. The format allows
     /// up to 65,535 bytes there, which pushes the record that far from the end of the file.
     pub comment_bytes: usize,
+    /// The entry data is Deflate-compressed rather than Stored. Together with a
+    /// `declared_size` smaller than the data, this is the shape a decompression bomb takes
+    /// once the recorded size is checked before the read: the record is modest and the stream
+    /// is not.
+    pub deflated: bool,
 }
 
-/// Writes a Stored zip byte by byte, with `framing`'s departures from the ordinary form.
+/// Writes a zip byte by byte, with `framing`'s departures from the ordinary form.
 pub fn framed_archive(entries: &[(&str, Vec<u8>)], framing: Framing) -> Vec<u8> {
     const LOCAL_HEADER: u32 = 0x0403_4b50;
     const DATA_DESCRIPTOR: u32 = 0x0807_4b50;
@@ -160,6 +166,7 @@ pub fn framed_archive(entries: &[(&str, Vec<u8>)], framing: Framing) -> Vec<u8> 
     /// Version 2.0, the floor for Stored with a data descriptor.
     const VERSION: u16 = 20;
     const STORED: u16 = 0;
+    const DEFLATED: u16 = 8;
     /// General-purpose bit 3: the sizes are in a trailing descriptor, not this header.
     const SIZES_IN_DESCRIPTOR: u16 = 1 << 3;
 
@@ -175,36 +182,45 @@ pub fn framed_archive(entries: &[(&str, Vec<u8>)], framing: Framing) -> Vec<u8> 
     if framing.data_reversed {
         layout.reverse();
     }
+    let method = if framing.deflated { DEFLATED } else { STORED };
     for index in layout {
         let (name, data) = &entries[index];
-        let size = framing.declared_size.unwrap_or_else(|| len32(data));
+        let payload = if framing.deflated {
+            deflate(data)
+        } else {
+            data.clone()
+        };
+        // The recorded sizes: the compressed one is real, because the entry has to be
+        // readable, and the uncompressed one is whatever the fixture wants recorded.
+        let compressed = len32(&payload);
+        let uncompressed = framing.declared_size.unwrap_or_else(|| len32(data));
         offsets[index] = len32(&bytes);
         // Zeroed here and repeated after the data when the descriptor form is asked for,
         // which is the whole of what makes such an archive unreadable from local headers.
-        let (header_crc, header_size) = if framing.data_descriptors {
-            (0, 0)
+        let (header_crc, header_compressed, header_uncompressed) = if framing.data_descriptors {
+            (0, 0, 0)
         } else {
-            (crc32(data), size)
+            (crc32(data), compressed, uncompressed)
         };
 
         push32(&mut bytes, LOCAL_HEADER);
         push16(&mut bytes, VERSION);
         push16(&mut bytes, flag);
-        push16(&mut bytes, STORED);
+        push16(&mut bytes, method);
         push32(&mut bytes, 0); // modification time and date
         push32(&mut bytes, header_crc);
-        push32(&mut bytes, header_size); // compressed
-        push32(&mut bytes, header_size); // uncompressed
+        push32(&mut bytes, header_compressed);
+        push32(&mut bytes, header_uncompressed);
         push16(&mut bytes, len16(name));
         push16(&mut bytes, 0); // extra field
         bytes.extend_from_slice(name.as_bytes());
-        bytes.extend_from_slice(data);
+        bytes.extend_from_slice(&payload);
 
         if framing.data_descriptors {
             push32(&mut bytes, DATA_DESCRIPTOR);
             push32(&mut bytes, crc32(data));
-            push32(&mut bytes, size);
-            push32(&mut bytes, size);
+            push32(&mut bytes, compressed);
+            push32(&mut bytes, uncompressed);
         }
     }
 
@@ -218,16 +234,21 @@ pub fn framed_archive(entries: &[(&str, Vec<u8>)], framing: Framing) -> Vec<u8> 
     let directory_offset = len32(&bytes);
     let mut directory = Vec::new();
     for (index, (name, data)) in entries.iter().enumerate() {
-        let size = framing.declared_size.unwrap_or_else(|| len32(data));
+        let compressed = if framing.deflated {
+            len32(&deflate(data))
+        } else {
+            len32(data)
+        };
+        let uncompressed = framing.declared_size.unwrap_or_else(|| len32(data));
         push32(&mut directory, CENTRAL_HEADER);
         push16(&mut directory, VERSION); // version made by
         push16(&mut directory, VERSION); // version needed
         push16(&mut directory, flag);
-        push16(&mut directory, STORED);
+        push16(&mut directory, method);
         push32(&mut directory, 0); // modification time and date
         push32(&mut directory, crc32(data));
-        push32(&mut directory, size); // compressed
-        push32(&mut directory, size); // uncompressed
+        push32(&mut directory, compressed);
+        push32(&mut directory, uncompressed);
         push16(&mut directory, len16(name));
         push16(&mut directory, 0); // extra field
         push16(&mut directory, 0); // comment
@@ -280,6 +301,13 @@ fn crc32(data: &[u8]) -> u32 {
     let mut crc = Crc::new();
     crc.update(data);
     crc.sum()
+}
+
+/// Raw Deflate, which is what a zip entry carries — no zlib wrapper.
+fn deflate(data: &[u8]) -> Vec<u8> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+    encoder.write_all(data).expect("deflate accepts any input");
+    encoder.finish().expect("deflate finishes")
 }
 
 /// A directory removed when it goes out of scope.
