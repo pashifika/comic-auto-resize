@@ -154,6 +154,42 @@ cp "$page" "$d/page01.jpeg"
 printf '<ComicInfo/>' > "$d/notes.xml"
 ( cd "$d" && "$rar" a -m0 -ma5 -idq "$out/mixed-entries.rar" page00.jpg notes.xml page01.jpeg )
 
+# A stored name longer than the DLL's fixed 1024-wchar field. The dependency used to hand
+# back a name cut at 1023 characters with nothing to say it had been, so the page lost its
+# extension and was passed over — a page silently missing from the book. Two entries, so a
+# reader that drops the long one still looks like it worked.
+step "long-name.rar"
+d="$(build_dir longname)"
+cp "$page" "$d/page00.jpg"
+cp "$page" "$d/page01.jpg"
+long="$(printf 'a%.0s' $(seq 250))"
+( cd "$d" && "$rar" a -m0 -ma5 -idq -ap"$long/$long/$long/$long/$long" \
+    "$out/long-name.rar" page00.jpg )
+( cd "$d" && "$rar" a -m0 -ma5 -idq "$out/long-name.rar" page01.jpg )
+
+# An over-large entry followed by a good page. One error must end the source: a reader that
+# carried on would yield the second page under the index the first would have had.
+step "oversize-then-page.rar"
+d="$(build_dir oversize2)"
+cp "$page" "$d/page01.jpg"
+dd if=/dev/zero of="$d/huge.jpg" bs=1048576 count=65 status=none
+( cd "$d" && "$rar" a -m5 -ma5 -idq "$out/oversize-then-page.rar" huge.jpg page01.jpg )
+
+# Wrong in two ways at once: a traversing name on an entry that is not a JPEG. The documented
+# check order says the content mismatch wins, because a name is only worth refusing on once
+# the thing it names is a page.
+step "traversing-nonjpeg.rar"
+d="$(build_dir tnj)"
+printf 'not a jpeg at all' > "$d/page00.jpg"
+( cd "$d" && "$rar" a -m0 -ma5 -idq -ap../ "$out/traversing-nonjpeg.rar" page00.jpg )
+
+# Plain headers, encrypted data: the archive reads and one entry does not, so the refusal has
+# to name the entry rather than blame the archive.
+step "encrypted-data.rar"
+d="$(build_dir enc)"
+cp "$page" "$d/page00.jpg"
+( cd "$d" && "$rar" a -m0 -ma5 -idq -pSecret1 "$out/encrypted-data.rar" page00.jpg )
+
 # An entry whose extension claims a page and whose leading bytes do not. An error rather than
 # a skip: the archive is inconsistent, and dropping the page would shorten the book.
 step "mismatch-entry.rar"
@@ -211,7 +247,7 @@ for f in "$out"/*.rar; do
         case "${f##*/}" in
             # A later volume has no beginning, and the oversize entry is 65 MiB of zeros
             # that there is no reason to materialise. Listed, not extracted.
-            split-entry.part[2-9]*|oversize-entry.rar)
+            split-entry.part[2-9]*|oversize-entry.rar|oversize-then-page.rar)
                 bsdtar -tf "$f" >/dev/null 2>&1 \
                     && printf 'data=listed' || printf 'data=UNREADABLE'
                 ;;

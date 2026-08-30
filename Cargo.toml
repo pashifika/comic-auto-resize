@@ -87,14 +87,14 @@ zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate
 [patch.crates-io]
 mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "a3effde52b989b6fb93d7fbf854869fa7931e4af" }
 
-# rar, from a fork carrying one commit. Taken out because neither upstream can be relied on
+# rar, from a fork carrying three commits. Taken out because neither upstream can be relied on
 # to answer in time: `muja/unrar.rs`, the original, has had one commit in sixteen months
 # with twenty issues open, and `ttys3/unrar.rs`, the maintained line this forks, is one
 # person with five stars. Doing the paperwork — this block, the `allow-git` entry, the CI
 # run — before anything was broken is what let the first fix land the same day it was
 # needed.
 #
-# Drift: 2 commits on top of v0.7.7.
+# Drift: 3 commits on top of v0.7.7.
 #
 # What it carries:
 #
@@ -109,6 +109,12 @@ mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "a3effd
 #   — so a bad archive fails before an output file exists — and then moves it to the reader
 #   thread. Nothing claimed `Send` for a raw `NonNull`, so that move did not compile. This
 #   crate cannot add the impl itself: it declares `unsafe_code = "forbid"`.
+# - Two fixes to the above, found by adversarial review rather than by use. An entry name
+#   longer than 1023 characters came back cut, because `HeaderDataEx::FileNameW` is a fixed
+#   `[wchar_t; 1024]` — which made a page with a deep path vanish from the archive silently,
+#   the one outcome this project refuses. And the `Send` impl was unsound as justified: a
+#   thread sanitiser found races in libunrar's process-wide state, so it now rests on a lock
+#   inside the fork rather than on per-archive ownership.
 #
 # Not offered upstream yet, and that is a decision rather than an omission: contributing to
 # a third party's repository is the maintainer's call, not this Change's. The shape was
@@ -125,4 +131,4 @@ mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "a3effd
 # resolves out of this git checkout too and `Cargo.lock` records both at this revision. A
 # second entry here would be redundant. The pin is by revision because `required-git-spec
 # = "rev"` makes a branch or tag a policy violation, not merely a bad habit.
-unrar-ng = { git = "https://github.com/pashifika/unrar.rs.git", rev = "a48b00841f11491e8272bf492123b25dcc820c3d" }
+unrar-ng = { git = "https://github.com/pashifika/unrar.rs.git", rev = "ca9cb595a9a3fd45c9f2d6eafe76f8610693a5b3" }

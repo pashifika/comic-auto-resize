@@ -10,7 +10,7 @@ mod support;
 use std::path::{Path, PathBuf};
 
 use comic_auto_resize::source::{
-    ArchiveFormat, Entry, MAX_ENTRY_BYTES, Source, SourceError, detect,
+    ArchiveFormat, Entries, Entry, MAX_ENTRY_BYTES, Source, SourceError, detect,
 };
 
 use support::{TempDir, write_pages};
@@ -367,5 +367,113 @@ fn reading_a_rar_writes_nothing_to_disk() {
             .filter(|name| name != "book.rar")
             .collect();
         assert!(left.is_empty(), "reading left files behind: {left:?}");
+    });
+}
+
+// ---------------------------------------------------------------- from the review cycle
+//
+// Each of these reproduces a defect adversarial review found by building an archive. They
+// are grouped so a later reader can see what was actually wrong rather than inferring it
+// from the assertions.
+
+/// A page whose stored name is longer than the DLL's fixed 1024-wchar field used to vanish:
+/// the name came back cut at 1023 characters, lost its `.jpg`, and the extension filter
+/// passed the entry over. Silent, with a success message — the one outcome this reader
+/// exists to prevent.
+#[test]
+fn a_page_with_a_very_long_name_is_not_dropped() {
+    with_fixture("long-name.rar", |path| {
+        let entries = read_all(path).expect("reads");
+        assert_eq!(entries.len(), 2, "a page went missing: {entries:?}");
+
+        let long = &entries[0].name;
+        assert!(
+            long.chars().count() > 1023,
+            "the name came back cut at {} characters",
+            long.chars().count()
+        );
+        // Compared against the fixture's exact suffix rather than as an extension, because
+        // what is being asserted is that the last four characters survived the cut.
+        assert!(
+            long.ends_with("/page00.jpg"),
+            "the extension is at the end that was cut off: {long}"
+        );
+        assert_eq!(entries[1].name, "page01.jpg");
+    });
+}
+
+/// One error ends the source. A reader that carried on would yield the following page under
+/// the index the failed entry would have had, which is a book with two page ones.
+#[test]
+fn an_error_ends_the_source_rather_than_resuming_at_a_used_index() {
+    with_fixture("oversize-then-page.rar", |path| {
+        let mut source = Source::open(path).expect("opens");
+        let first = Entries::next_entry(&mut source).expect("an entry");
+        assert!(
+            matches!(first, Err(SourceError::TooLarge { .. })),
+            "expected the over-large entry to be refused, got {first:?}"
+        );
+        assert!(
+            Entries::next_entry(&mut source).is_none(),
+            "the source resumed after an error"
+        );
+    });
+}
+
+/// The same rule for an error raised after the entry has been read, which is the pair of
+/// paths that used to put the cursor back.
+#[test]
+fn a_mismatch_also_ends_the_source() {
+    with_fixture("mismatch-entry.rar", |path| {
+        let mut source = Source::open(path).expect("opens");
+        let mut seen = 0;
+        let mut errored = false;
+        while let Some(entry) = Entries::next_entry(&mut source) {
+            if entry.is_err() {
+                errored = true;
+                break;
+            }
+            seen += 1;
+        }
+        assert_eq!(seen, 1, "the good page before the mismatch");
+        assert!(errored);
+        assert!(
+            Entries::next_entry(&mut source).is_none(),
+            "the source resumed after a mismatch"
+        );
+    });
+}
+
+/// Wrong in two ways at once. The documented check order puts the stored name last, so the
+/// content mismatch is what the user is told about: a name is only worth refusing on once
+/// the thing it names is a page.
+#[test]
+fn a_traversing_name_on_a_non_page_reports_the_content_mismatch() {
+    with_fixture("traversing-nonjpeg.rar", |path| {
+        let error = read_all(path).expect_err("must be refused");
+        match error {
+            SourceError::Mismatch { name, declared } => {
+                assert_eq!(name, "../page00.jpg");
+                assert_eq!(declared, "JPEG");
+            }
+            other => panic!("the documented order says Mismatch wins, got {other}"),
+        }
+    });
+}
+
+/// An entry that cannot be read inside an archive that reads fine. Blaming the archive would
+/// be wrong, and the reader knew which entry it was.
+#[test]
+fn an_unreadable_entry_is_named_rather_than_blamed_on_the_archive() {
+    with_fixture("encrypted-data.rar", |path| {
+        let error = read_all(path).expect_err("an encrypted entry cannot be read");
+        match error {
+            SourceError::RarEntry { ref name, .. } => assert_eq!(name, "page00.jpg"),
+            other => panic!("expected RarEntry naming the entry, got {other}"),
+        }
+        assert!(
+            !error.to_string().starts_with("cannot read the archive"),
+            "the archive reads; only this entry does not: {error}"
+        );
     });
 }

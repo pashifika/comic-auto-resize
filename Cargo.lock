@@ -501,7 +501,7 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 [[package]]
 name = "unrar-ng"
 version = "0.7.7"
-source = "git+https://github.com/pashifika/unrar.rs.git?rev=a48b00841f11491e8272bf492123b25dcc820c3d#a48b00841f11491e8272bf492123b25dcc820c3d"
+source = "git+https://github.com/pashifika/unrar.rs.git?rev=ca9cb595a9a3fd45c9f2d6eafe76f8610693a5b3#ca9cb595a9a3fd45c9f2d6eafe76f8610693a5b3"
 dependencies = [
  "bitflags",
  "regex",
@@ -512,7 +512,7 @@ dependencies = [
 [[package]]
 name = "unrar-ng-sys"
 version = "0.7.7"
-source = "git+https://github.com/pashifika/unrar.rs.git?rev=a48b00841f11491e8272bf492123b25dcc820c3d#a48b00841f11491e8272bf492123b25dcc820c3d"
+source = "git+https://github.com/pashifika/unrar.rs.git?rev=ca9cb595a9a3fd45c9f2d6eafe76f8610693a5b3#ca9cb595a9a3fd45c9f2d6eafe76f8610693a5b3"
 dependencies = [
  "cc",
  "libc",

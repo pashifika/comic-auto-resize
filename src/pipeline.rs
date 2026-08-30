@@ -323,7 +323,7 @@ pub enum RunError {
     /// The archive held no page this build can process, so there was nothing to write. An
     /// empty output would report success and then make the next run fail with "already
     /// exists".
-    #[error("no pages to process: the archive holds no image entry this build can read")]
+    #[error("no pages to process: the archive yielded no image entry this build can read")]
     Empty,
     /// Two stored names became one output name when their extensions were rewritten.
     #[error(

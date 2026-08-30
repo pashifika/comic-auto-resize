@@ -111,7 +111,7 @@ impl Source {
     /// # Errors
     ///
     /// [`SourceError::NotAnArchive`] when the leading bytes match no format this build reads,
-    /// [`SourceError::Entry`] when `path` cannot be opened or read, and whatever the chosen
+    /// [`SourceError::Input`] when `path` cannot be opened or read, and whatever the chosen
     /// reader returns.
     pub fn open(path: &Path) -> Result<Self, SourceError> {
         let mut file = File::open(path).map_err(|source| SourceError::Input { source })?;
@@ -126,8 +126,13 @@ impl Source {
                     .map_err(|source| SourceError::Input { source })?;
                 Self::zip(file)
             }
-            // The handle is dropped: `unrar` is given the path, not a stream.
-            Some(ArchiveFormat::Rar) => Self::rar(path),
+            Some(ArchiveFormat::Rar) => {
+                // `unrar` is given the path, not a stream, so the probe handle has no further
+                // use. Dropped explicitly: left to the end of this scope it would still be
+                // open while `unrar` opened the same file a second time.
+                drop(file);
+                Self::rar(path)
+            }
             None => Err(SourceError::NotAnArchive {
                 formats: readable_formats(),
             }),
@@ -294,6 +299,15 @@ pub enum SourceError {
     /// because rewriting it would produce an output whose entries do not match the input's.
     #[error("{name}: refusing the entry name because {reason}")]
     UnsafeName { name: String, reason: &'static str },
+    /// One entry could not be read, where the archive itself is fine — an encrypted entry in
+    /// an archive whose headers are not encrypted is the case that reaches here. Named
+    /// separately from [`SourceError::Rar`], which says "cannot read the archive" and would
+    /// be saying it about an archive that reads.
+    #[error("{name}: cannot read the entry: {source}")]
+    RarEntry {
+        name: String,
+        source: unrar_ng::error::UnrarError,
+    },
     /// The rar archive's own structure, the counterpart to [`SourceError::Archive`]. A
     /// separate variant only because `unrar`'s error type is not `zip`'s; the case is the
     /// same one.

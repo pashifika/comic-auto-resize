@@ -118,7 +118,17 @@ fn run(cli: &Cli) -> Result<u32, CliError> {
         source,
     })?;
     let output = default_output(&cli.input);
-    let report = pipeline::run(source, &output, &settings)?;
+    // A `SourceError` raised during iteration would otherwise reach the user through two
+    // transparent wrappers with no path at all, while the same error raised inside
+    // `Source::open` arrives as `{path}: {source}`. rar is where that shows: it walks headers
+    // as it goes, so a damaged entry surfaces here rather than at open.
+    let report = pipeline::run(source, &output, &settings).map_err(|error| match error {
+        pipeline::RunError::Source(source) => CliError::Archive {
+            path: cli.input.clone(),
+            source,
+        },
+        other => CliError::Run(other),
+    })?;
     Ok(report.pages)
 }
 

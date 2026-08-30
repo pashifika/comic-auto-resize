@@ -22,6 +22,20 @@
 //! zip; for RAR4-without-Unicode-names it is not recoverable without changing this dependency.
 //!
 //! Latent rather than live today: both real samples are pure UTF-8.
+//!
+//! # A truncated archive is indistinguishable from a complete one
+//!
+//! `RARReadHeaderEx` returns `ERAR_END_ARCHIVE` both at a genuine end and at a clean EOF
+//! part-way through the header chain: `dll.cpp` reaches that return when `SearchBlock`
+//! finds no further file header and `BrokenHeader` is false, which is exactly what a cut-off
+//! download looks like. So a truncated rar is reported as an archive that yielded no page,
+//! not as a damaged one, and RARLAB's own `unrar l` says `Unexpected end of archive` for the
+//! same input.
+//!
+//! Not recoverable through this dependency — the distinction is discarded inside the DLL, not
+//! here — so `RunError::Empty` says the archive *yielded* no image entry rather than that it
+//! holds none. Fixing it properly means a patch to the vendored C++ to report the missing
+//! end-of-archive record, which is the fork's job and not this Change's.
 
 use std::path::Path;
 
@@ -39,11 +53,17 @@ pub struct RarSource {
     /// `read_into(self, …)`, `skip(self)` all take `self` by value — and `next_entry` has
     /// only `&mut self`. So the cursor is `take`n for each step and the successor put back.
     ///
-    /// `None` is reachable only if a step panics between the take and the put-back. That path
-    /// already has an owner: `pipeline::run` catches a reader-thread panic and reports
-    /// `StagePanicked`. So `None` here means "a previous step did not complete" and yields
-    /// `None` — the end of the archive — rather than being unwrapped. Written down because an
-    /// `Option` that is always `Some` in practice invites an `expect()`.
+    /// `None` means this source is finished, by either route: the archive ended, or a step
+    /// failed and consumed the cursor. Every error path leaves it `None` deliberately, so one
+    /// error ends the source rather than leaving it half-usable — which matches the policy
+    /// the rest of the pipeline already runs on, that one page which cannot be read ends the
+    /// run. `next_entry` therefore returns `None` after an error rather than resuming, and
+    /// nothing here needs an `expect()`.
+    ///
+    /// An earlier version of this comment claimed `None` was reachable only through a panic.
+    /// That was false — six ordinary error paths reach it — and worse, two paths used to put
+    /// the cursor back and carry on without advancing `next_index`, so the next page arrived
+    /// under the index the failed one would have had. Both are now uniform.
     archive: Option<OpenArchive<Process, CursorBeforeHeader>>,
     /// Position in the sequence of *yielded* entries, so the writer's key has no gaps where
     /// the archive held something that was not a page.
@@ -97,11 +117,15 @@ impl RarSource {
             //   4. the extension filter    — not a page, and cheap to decide from the name
             //   5. the recorded size       — refusable before any data is read
             //   6. the bytes               — bounded on the way in, then probed
+            //   7. the stored name         — refused only once it is a page worth naming
             //
             // 1 before 4 is the point of the flag: `SourceError::Mismatch` ("named as JPEG but
             // its leading bytes are not") would be the wrong diagnosis for a directory. 2 that
             // early because a volume set is refused whatever the entry happens to be — the
-            // failure is that the input is one part of a set, not that some page is odd.
+            // failure is that the input is one part of a set, not that some page is odd. 7
+            // last, and it matters: a traversing name that is also not a JPEG is reported as
+            // the mismatch, because a name is only worth refusing on once the thing it names
+            // is a page. `zip.rs` orders it the same way.
             if header.entry().is_directory() {
                 match header.skip() {
                     Ok(next) => {
@@ -116,18 +140,28 @@ impl RarSource {
                 return Some(Err(SourceError::Split { name }));
             }
 
-            // One lookup, so there is no second call to disagree with the first and no
-            // `expect` to justify. A directory that failed to set its flag and an extension no
-            // candidate claims are the same answer: not a page, pass over it.
-            let declared = match probe::declared_format(&name) {
-                Some(declared) if !is_directory(&name) => declared,
-                _ => match header.skip() {
+            // 3 before 4, which is the only order in which 3 can fire at all: a name ending in
+            // a separator has no extension for `declared_format` to claim, so checking it
+            // afterwards would make it unreachable. `zip.rs` checks it first for the same
+            // reason.
+            if is_directory(&name) {
+                match header.skip() {
                     Ok(next) => {
                         self.archive = Some(next);
                         continue;
                     }
                     Err(error) => return Some(Err(error.into())),
-                },
+                }
+            }
+
+            let Some(declared) = probe::declared_format(&name) else {
+                match header.skip() {
+                    Ok(next) => {
+                        self.archive = Some(next);
+                        continue;
+                    }
+                    Err(error) => return Some(Err(error.into())),
+                }
             };
 
             // The header records the size away from the data, so an entry claiming more than
@@ -158,8 +192,8 @@ impl RarSource {
             };
 
             let (sink, result) = header.read_into(sink);
-            match result {
-                Ok(next) => self.archive = Some(next),
+            let next = match result {
+                Ok(next) => next,
                 // The sink refused, so the entry holds more than it declared. The archive is
                 // not returned on this path and is not wanted: one page that fails ends the
                 // run.
@@ -169,9 +203,19 @@ impl RarSource {
                         limit: MAX_ENTRY_BYTES,
                     }));
                 }
-                Err(error) => return Some(Err(error.into())),
-            }
+                // The archive is readable and this entry is not — an encrypted entry in a
+                // plain-header archive is the case that reaches here — so the entry is named.
+                // `SourceError::Rar` is for the archive's own structure and would say
+                // "cannot read the archive" about an archive that is fine.
+                Err(source) => return Some(Err(SourceError::RarEntry { name, source })),
+            };
             let bytes = sink.bytes;
+
+            // The cursor is deliberately not stored back until this entry has passed every
+            // check. Every `return Some(Err(..))` below drops `next`, which closes the
+            // archive and leaves `self.archive` at `None` — so one error ends the source
+            // rather than leaving it resumable at an index it has already used. See the
+            // field's doc.
 
             // Probed after the read rather than before it, which is the one place this reader
             // cannot mirror `zip.rs`. There the entry is a reader the caller drives, so the
@@ -193,6 +237,8 @@ impl RarSource {
             if let Some(reason) = unsafe_name(&name) {
                 return Some(Err(SourceError::UnsafeName { name, reason }));
             }
+
+            self.archive = Some(next);
 
             self.next_index += 1;
             return Some(Ok(Entry {
