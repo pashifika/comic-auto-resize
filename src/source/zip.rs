@@ -1,97 +1,144 @@
-//! Sequential zip reading.
+//! Ordered, single-pass zip reading, through the archive's central directory.
 //!
-//! `zip::ZipArchive` offers `by_index` over a `Read + Seek` source, which for zip alone
-//! would be simpler. The reader is sequential anyway, for two reasons that outlive zip: a
-//! solid rar or 7z archive cannot be accessed randomly at all, so a seeking reader would
-//! have to be replaced rather than extended when the source enum gains its second variant;
-//! and sequential reading is the pipeline's premise, because a reader that seeks invites the
-//! look-ahead that makes peak memory a function of page count.
+//! `ZipArchive::new` reads the entry table once and `by_index` then reads one entry at a
+//! time, in that table's order. The table is where the format records each entry's real
+//! size, so an archive written by a writer streaming to a non-seekable output — zero sizes
+//! and general-purpose flag bit 3 in every local header, the real sizes in a trailing data
+//! descriptor — reads like any other. Go read the central directory too.
 //!
-//! The cost is recorded rather than hidden: an archive written by a streaming writer puts
-//! zero sizes in each local header and the real ones in a trailing data descriptor, and
-//! `zip` refuses such an entry outright — "The file length is not available in the local
-//! header". Go read the central directory and so accepted them. Archives from `WinRAR`,
-//! `7-Zip`, and Windows Explorer all carry real local sizes, so the common case is
-//! unaffected, and the failure is loud rather than a silently empty entry.
+//! This replaces `read_zipfile_from_stream`, which takes each size from the local header and
+//! so refuses such an entry outright: "The file length is not available in the local
+//! header". The reader was sequential deliberately, on the grounds that one able to seek
+//! invites the look-ahead that makes peak memory a function of page count. That is answered
+//! elsewhere now: the pipeline's credit window bounds the entries in flight however the
+//! reader obtained them, so restraint is no longer the reader's job to exercise.
+//!
+//! The sequential discipline is gone from zip rather than from the design. A solid rar or 7z
+//! archive cannot be addressed by index at all, so the source enum will hold both.
+//!
+//! The entry table is also the authority on order. A malformed archive can lay its data out
+//! in one order and list it in another; the table's order is the one every other reader
+//! presents, including the viewer the output will be opened in.
+//!
+//! One thing the table does not survive intact. `ZipArchive` keys it on the stored name, so
+//! two entries stored under one name byte for byte collapse into a single record and the
+//! loser would leave the book without a word. The end record counts what the archive says it
+//! holds; a disagreement with what the table kept is refused rather than shortened.
 
-use std::io::{BufRead, Read};
+use std::io::{Read, Seek, SeekFrom};
 
-use zip::read::read_zipfile_from_stream;
+use zip::ZipArchive;
 
 use super::probe::{self, MAGIC_MAX};
 use super::{Entry, MAX_ENTRY_BYTES, SourceError};
 
-/// The local file header every stored entry begins with.
-const LOCAL_HEADER: [u8; 4] = [b'P', b'K', 3, 4];
-
-/// Signatures that mean the entries are finished: the central directory, the end of it, and
-/// the Zip64 form of the end of it. An archive with no entries at all starts with one of
-/// these, which is why the signature is checked rather than assumed.
-const TERMINATORS: [[u8; 4]; 3] = [[b'P', b'K', 1, 2], [b'P', b'K', 5, 6], [b'P', b'K', 6, 6]];
-
-/// How much capacity an entry's declared size may reserve.
+/// How much capacity an entry's recorded size may reserve.
 ///
 /// A real page is tens of kilobytes to a few megabytes, so a megabyte is a useful hint and
 /// anything beyond it is the archive's claim rather than a measurement. `read_to_end` grows
 /// geometrically from there.
 const HINT_CEILING: u64 = 1 << 20;
 
-/// An archive read once, from start to finish.
+/// The signature of the 32-bit end-of-central-directory record.
+const END_OF_DIRECTORY: [u8; 4] = [b'P', b'K', 5, 6];
+
+/// An archive whose entry table has been read, walked once in that table's order.
 pub struct ZipSource<R> {
-    reader: R,
+    archive: ZipArchive<R>,
+    /// The next position in the entry table.
+    next_position: usize,
     /// Position in the sequence of *yielded* entries, so the writer's key has no gaps where
     /// the archive held something that was not a page.
     next_index: u32,
 }
 
-impl<R: BufRead> ZipSource<R> {
-    pub const fn new(reader: R) -> Self {
-        Self {
-            reader,
-            next_index: 0,
+impl<R: Read + Seek> ZipSource<R> {
+    /// Reads the archive's entry table.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceError::Archive`] when the entry table cannot be read. It is read here, before
+    /// any entry, so a truncated or malformed one fails the run before a page is processed.
+    /// [`SourceError::RepeatedName`] when the table kept fewer entries than the archive
+    /// records, which is what two entries stored under one name look like from here.
+    pub fn new(mut reader: R) -> Result<Self, SourceError> {
+        let recorded = recorded_entry_count(&mut reader).map_err(::zip::result::ZipError::Io)?;
+        let archive = ZipArchive::new(reader)?;
+        if let Some(recorded) = recorded {
+            let kept = archive.len() as u64;
+            if recorded > kept {
+                return Err(SourceError::RepeatedName { recorded, kept });
+            }
         }
+        Ok(Self {
+            archive,
+            next_position: 0,
+            next_index: 0,
+        })
     }
 
     /// The next page, or `None` at the end of the archive.
     ///
-    /// Entries that are not pages are passed over without being read: a directory, and any
-    /// entry whose extension no candidate claims, cost their header alone.
+    /// Entries that are not pages are passed over without being reached at all: a directory,
+    /// and any entry whose extension no candidate claims, cost nothing beyond the name the
+    /// entry table already holds.
     pub fn next_entry(&mut self) -> Option<Result<Entry, SourceError>> {
-        loop {
-            match self.read_one() {
+        while self.next_position < self.archive.len() {
+            let position = self.next_position;
+            self.next_position += 1;
+            match self.read_one(position) {
                 Yielded::Entry(entry) => {
                     self.next_index += 1;
                     return Some(Ok(entry));
                 }
                 Yielded::Skipped => {}
-                Yielded::Done => return None,
                 Yielded::Failed(error) => return Some(Err(error)),
             }
         }
+        None
     }
 
-    /// One pass over one entry. Separate so the borrow of `self.reader` ends before
-    /// `next_entry` returns.
-    fn read_one(&mut self) -> Yielded {
-        if self.at_end() {
-            return Yielded::Done;
+    /// One pass over the entry at `position` in the table.
+    fn read_one(&mut self, position: usize) -> Yielded {
+        let Some(name) = self.archive.name_for_index(position) else {
+            // `position` came from the archive's own entry count, so this is unreachable.
+            // Reported rather than asserted: the reader runs on its own thread, where a
+            // panic costs the run its message and buys nothing.
+            return Yielded::Failed(SourceError::Archive(::zip::result::ZipError::FileNotFound));
+        };
+        if is_directory(name) {
+            return Yielded::Skipped;
         }
+        // The extension filter, before the entry is located, let alone read.
+        let Some(declared) = probe::declared_format(name) else {
+            return Yielded::Skipped;
+        };
+        // Ends the borrow of the entry table, which reading the entry needs mutably.
+        let name = name.to_owned();
 
         let index = self.next_index;
-        let mut file = match read_zipfile_from_stream(&mut self.reader) {
-            Ok(Some(file)) => file,
-            Ok(None) => return Yielded::Done,
-            Err(error) => return Yielded::Failed(SourceError::Archive(error)),
+        let mut file = match self.archive.by_index(position) {
+            Ok(file) => file,
+            // Named, which the sequential reader could not do: it met a malformed entry
+            // before its name, where the entry table carries the name of every entry
+            // whether or not the entry itself can be read.
+            Err(error) => {
+                return Yielded::Failed(SourceError::Entry {
+                    name,
+                    source: error.into(),
+                });
+            }
         };
 
-        let name = file.name().to_owned();
-        if file.is_dir() {
-            return Yielded::Skipped;
+        // The recorded size is still the archive's claim, but the entry table records it
+        // away from the entry's data, so it is known before that data is reached: an entry
+        // claiming more than the limit costs nothing to refuse and is not read at all.
+        if file.size() > MAX_ENTRY_BYTES {
+            return Yielded::Failed(SourceError::TooLarge {
+                name,
+                limit: MAX_ENTRY_BYTES,
+            });
         }
-        // The extension filter, before any of the entry's data is touched.
-        let Some(declared) = probe::declared_format(&name) else {
-            return Yielded::Skipped;
-        };
 
         let mut head = [0; MAGIC_MAX];
         let head = match fill(&mut file, &mut head) {
@@ -111,9 +158,8 @@ impl<R: BufRead> ZipSource<R> {
             }
         }
 
-        // `file.size()` comes from the local header, so it is attacker-controlled. Clamping
-        // it to `MAX_ENTRY_BYTES` is not enough on its own: a hundred-byte entry could
-        // declare 64 MiB and get 64 MiB reserved, and up to `2 * jobs` of those buffers are
+        // Checking the recorded size is not enough on its own: a hundred-byte entry could
+        // record 64 MiB and get 64 MiB reserved, and up to `2 * jobs` of those buffers are
         // alive at once, which on Windows is committed rather than merely reserved. So the
         // hint is capped at a real page's order of magnitude and `read_to_end` grows from
         // there, which it does geometrically anyway.
@@ -121,8 +167,11 @@ impl<R: BufRead> ZipSource<R> {
         let mut bytes = Vec::with_capacity(hint.saturating_add(head.len()));
         bytes.extend_from_slice(head);
 
-        // One byte past the limit, so an entry exactly at it is accepted and anything
-        // larger is detectable without reading the rest of it.
+        // The bound on the read stays, rather than trusting the size just checked: a
+        // recorded size that disagrees with what the entry actually holds is precisely the
+        // malformed case, and a check that trusts the number it is validating is not a
+        // check. One byte past the limit, so an entry exactly at it is accepted and
+        // anything larger is detectable without reading the rest of it.
         let remaining = MAX_ENTRY_BYTES
             .saturating_sub(bytes.len() as u64)
             .saturating_add(1);
@@ -152,32 +201,15 @@ impl<R: BufRead> ZipSource<R> {
             bytes,
         })
     }
+}
 
-    /// Whether the entries are finished, decided from the next signature without consuming
-    /// it.
-    ///
-    /// `read_zipfile_from_stream` reports the end only when it meets the central directory,
-    /// so an archive with no entries — which begins with the end-of-central-directory
-    /// record — would otherwise be reported as a malformed local header.
-    ///
-    /// Returns `false` unless a terminator is positively recognised. `fill_buf` may hand
-    /// back fewer than four bytes, and `PK` alone is a prefix of every signature, so an
-    /// undecidable peek falls through to `read_zipfile_from_stream` and lets it report the
-    /// real problem. An I/O error does the same, because the next read hits it too.
-    fn at_end(&mut self) -> bool {
-        let Ok(available) = self.reader.fill_buf() else {
-            return false;
-        };
-        if available.is_empty() {
-            return true;
-        }
-        if available.starts_with(&LOCAL_HEADER) {
-            return false;
-        }
-        TERMINATORS
-            .iter()
-            .any(|terminator| available.starts_with(terminator))
-    }
+/// Whether a stored name is a directory rather than a file.
+///
+/// The archive says so by ending the name with a separator, and both are separators because
+/// a Windows-written archive may use either. The same rule `zip` applies internally, spelled
+/// out here because its helper is crate-private.
+fn is_directory(name: &str) -> bool {
+    matches!(name.as_bytes().last(), Some(b'/' | b'\\'))
 }
 
 /// Why a stored name must not be carried into the output archive, or `None` if it may be.
@@ -201,7 +233,17 @@ fn unsafe_name(name: &str) -> Option<&'static str> {
     if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
         return Some("the name carries a drive letter");
     }
-    if name.split(['/', '\\']).any(|component| component == "..") {
+    // A component that escapes, in every spelling that resolves to one. Windows strips
+    // trailing dots and spaces from a path component, so `.. ` names the parent directory
+    // there while an exact comparison against `..` lets it through — and the name is going
+    // into an archive somebody will extract on Windows. A component of nothing but dots and
+    // spaces is refused whenever it holds two or more dots, which costs `...` and `. .` as
+    // well: neither is a page directory, and refusing is the answer this function exists to
+    // give.
+    if name.split(['/', '\\']).any(|component| {
+        let dots = component.bytes().filter(|&byte| byte == b'.').count();
+        dots >= 2 && component.bytes().all(|byte| byte == b'.' || byte == b' ')
+    }) {
         return Some("the name escapes its own directory");
     }
     None
@@ -210,9 +252,8 @@ fn unsafe_name(name: &str) -> Option<&'static str> {
 /// What one pass over an entry produced.
 enum Yielded {
     Entry(Entry),
-    /// Not a page. Dropping the handle skips the rest of its data.
+    /// Not a page. The entry is left where it is rather than read past.
     Skipped,
-    Done,
     Failed(SourceError),
 }
 
@@ -231,4 +272,99 @@ fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
         }
     }
     Ok(filled)
+}
+
+/// How many entries the archive's end record says it holds, or `None` when that cannot be
+/// established from the 32-bit end record alone.
+///
+/// Not a second archive parser, and deliberately not a general one: it locates the single
+/// record the format puts at a defined place — last in the file, followed only by its own
+/// comment — and reads one field from it under the rules `zip` applies to the same record.
+/// Every disagreement resolves to `None`, so the cross-check is skipped rather than a valid
+/// archive refused.
+///
+/// The rules, each mirroring the dependency or narrowing safely:
+///
+/// - Searched from the end, as `zip`'s backwards finder searches.
+/// - The comment must end at or before the end of the file, not exactly at it. `zip` relaxed
+///   that check for archives carrying garbage after the comment, so requiring an exact fit
+///   would let one trailing byte silence the cross-check.
+/// - The directory must end where the record begins. `zip` does not check this; it is what
+///   stops a `PK\x05\x06` inside entry data from passing for the real record, and it also
+///   excludes an archive with data prepended, whose recorded offsets are relative to the
+///   archive rather than to the file.
+/// - The count is the entries *on this disk*, at offset 8, because that is the field `zip`
+///   bounds its record loop with. Offset 10 never bounds that loop: it reaches `zip` as one of
+///   three Zip64 hints in `may_be_zip64`, and as the empty-archive short-circuit in the zip32
+///   branch, and neither is a count of records read. Counting with it would compare two
+///   independent numbers.
+/// - A Zip64 locator immediately before the record, or a count of `0xFFFF`, means the
+///   authoritative count is in the Zip64 end record. That chain is not followed: no book has
+///   65,535 pages, and a second footer parser is the thing this function exists not to be.
+///
+/// The search covers the last 65,577 bytes: the locator that may precede the record, the
+/// record, and the longest comment the format allows after it — a record whose preceding bytes
+/// cannot be read is a record whose Zip64 status cannot be established, so the window has to
+/// hold both. Within it a record begins at `65,555 - comment - trailing`, so the count is
+/// established for every conformant archive, whose comment is at most 65,535 bytes with
+/// nothing after it, and given up on when comment and trailing garbage together exceed 65,535.
+/// `zip` searches the whole file, so such an archive is read by `zip` and not cross-checked
+/// here. It is not conformant, and the check exists to catch an archive that lost an entry by
+/// accident rather than one built to lose one — scanning a 300 MB file backwards for a
+/// signature would be its own guess about where to stop.
+fn recorded_entry_count(reader: &mut (impl Read + Seek)) -> std::io::Result<Option<u64>> {
+    /// Signature, four `u16` fields, two `u32`, then the comment length: 22 bytes.
+    const RECORD: usize = 22;
+    /// The Zip64 end-of-central-directory locator, which sits immediately before the 32-bit
+    /// record when the archive is Zip64.
+    const ZIP64_LOCATOR: [u8; 4] = [b'P', b'K', 6, 7];
+    /// The locator's signature plus its fixed block.
+    const LOCATOR: usize = 20;
+    /// The comment length is a `u16` and the locator that may precede the record is another
+    /// 20 bytes, so the window begins no earlier than this from the end.
+    const MAX_TRAILER: u64 = RECORD as u64 + u16::MAX as u64 + LOCATOR as u64;
+
+    let length = reader.seek(SeekFrom::End(0))?;
+    let window = length.min(MAX_TRAILER);
+    if window < RECORD as u64 {
+        return Ok(None);
+    }
+    let base = length - window;
+    reader.seek(SeekFrom::Start(base))?;
+    let window = usize::try_from(window).expect("the window is at most 65,577 bytes");
+    let mut tail = vec![0; window];
+    reader.read_exact(&mut tail)?;
+
+    for start in (0..=window - RECORD).rev() {
+        let record = &tail[start..];
+        if record[..END_OF_DIRECTORY.len()] != END_OF_DIRECTORY {
+            continue;
+        }
+        let comment = usize::from(u16::from_le_bytes([record[20], record[21]]));
+        if start + RECORD + comment > window {
+            continue;
+        }
+        let size = u32::from_le_bytes([record[12], record[13], record[14], record[15]]);
+        let offset = u32::from_le_bytes([record[16], record[17], record[18], record[19]]);
+        if u64::from(offset) + u64::from(size) != base + start as u64 {
+            continue;
+        }
+
+        let zip64 = match start.checked_sub(LOCATOR) {
+            Some(at) => tail[at..at + ZIP64_LOCATOR.len()] == ZIP64_LOCATOR,
+            // The bytes before the record are outside the window, so the locator's absence
+            // cannot be established. The window holds the locator ahead of the longest comment
+            // the format allows, so this needs comment plus trailing garbage over 65,535 —
+            // which no conformant archive has.
+            None if base > 0 => return Ok(None),
+            None => false,
+        };
+        if zip64 {
+            return Ok(None);
+        }
+
+        let count = u16::from_le_bytes([record[8], record[9]]);
+        return Ok((count != u16::MAX).then(|| u64::from(count)));
+    }
+    Ok(None)
 }

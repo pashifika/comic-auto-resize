@@ -35,7 +35,7 @@
 //! it is written a credit is returned. `credits` never blocks the writer either: at most `W`
 //! tokens exist, and the entry just written holds one of them, so there is always room.
 
-use std::io::BufRead;
+use std::io::{Read, Seek};
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -118,7 +118,7 @@ pub struct Report {
 /// disconnected yet.
 pub fn run<R>(source: Source<R>, output: &Path, settings: &Settings) -> Result<Report, RunError>
 where
-    R: BufRead + Send,
+    R: Read + Seek + Send,
 {
     let capacities = Capacities::for_jobs(settings.jobs);
 
@@ -229,7 +229,7 @@ struct Job {
 }
 
 /// Reads the archive once, taking a credit before each entry.
-fn read_entries<R: BufRead>(
+fn read_entries<R: Read + Seek>(
     mut source: Source<R>,
     credits: &crossbeam_channel::Receiver<()>,
     work: &crossbeam_channel::Sender<Job>,

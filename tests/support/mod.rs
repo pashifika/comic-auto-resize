@@ -9,12 +9,18 @@
 //! not this crate's, and the zip framing is verified independently in
 //! `tests/archive_source.rs`.
 
+// Shared by several integration-test binaries, each of which uses a subset: an item unused
+// by `archive_source` is exercised by `pipeline`, so `dead_code` here reports the split
+// rather than genuinely unreachable code.
+#![allow(dead_code)]
+
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use comic_auto_resize::page::{Channels, EncodeSettings, PageImage, encode};
+use flate2::Crc;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -76,8 +82,8 @@ pub fn page_bytes(width: u32, height: u32) -> Vec<u8> {
 
 /// Writes a Stored zip holding `entries` in exactly the order given.
 ///
-/// `large_file(false)` so each local header carries real sizes, which is what a sequential
-/// reader needs.
+/// `large_file(false)` so no Zip64 extra field appears and the fixture stays a plain 32-bit
+/// archive, which is what the hand-written framings in `framed_archive` are written against.
 pub fn write_archive(path: &Path, entries: &[(String, Vec<u8>)]) {
     let file = File::create(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let mut writer = ZipWriter::new(file);
@@ -107,6 +113,173 @@ pub fn write_pages(path: &Path, count: u32, width: u32, height: u32) {
         .map(|index| (format!("pages/page{:04}.jpg", index + 1), bytes.clone()))
         .collect();
     write_archive(path, &entries);
+}
+
+/// How a hand-written zip departs from what `ZipWriter` produces.
+///
+/// `ZipWriter::new_stream` can write the data-descriptor form, but nothing can write an
+/// archive whose directory order and layout disagree, whose entries record a size they do not
+/// hold, whose directory is cut short, or whose record points at no local header. One
+/// generator for all five, assembled field by field, rather than two sources of fixture.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Framing {
+    /// Each local header records zero sizes and sets general-purpose flag bit 3; the real
+    /// sizes follow the entry's data in a trailing descriptor.
+    pub data_descriptors: bool,
+    /// Entry data is laid out back to front, so the central directory's order and the
+    /// local-header sequence disagree.
+    pub data_reversed: bool,
+    /// The size every entry records, in place of its real one. The data is written as it is,
+    /// so an archive declaring more than it holds is shorter than its own claim — which is
+    /// what makes "refused without being read" observable.
+    pub declared_size: Option<u32>,
+    /// Bytes cut from the end of the central directory, while the end-of-central-directory
+    /// record still describes its full length.
+    pub truncated_directory: usize,
+    /// The entry whose central-directory record points at an offset holding no local
+    /// header, so the table reads but that one entry cannot be located.
+    pub orphaned_entry: Option<usize>,
+    /// The *total* entry count the end record states, in place of the real one, leaving the
+    /// count of entries on this disk truthful. The two fields are equal in every conformant
+    /// single-disk archive, and a reader must count with the one `zip` counts with.
+    pub recorded_total: Option<u16>,
+    /// Bytes appended after the end record. The format allows only the record's own comment
+    /// there, but readers tolerate garbage, so a reader must too.
+    pub trailing_bytes: usize,
+    /// The length of the archive comment the end record states and carries. The format allows
+    /// up to 65,535 bytes there, which pushes the record that far from the end of the file.
+    pub comment_bytes: usize,
+}
+
+/// Writes a Stored zip byte by byte, with `framing`'s departures from the ordinary form.
+pub fn framed_archive(entries: &[(&str, Vec<u8>)], framing: Framing) -> Vec<u8> {
+    const LOCAL_HEADER: u32 = 0x0403_4b50;
+    const DATA_DESCRIPTOR: u32 = 0x0807_4b50;
+    const CENTRAL_HEADER: u32 = 0x0201_4b50;
+    const END_OF_DIRECTORY: u32 = 0x0605_4b50;
+    /// Version 2.0, the floor for Stored with a data descriptor.
+    const VERSION: u16 = 20;
+    const STORED: u16 = 0;
+    /// General-purpose bit 3: the sizes are in a trailing descriptor, not this header.
+    const SIZES_IN_DESCRIPTOR: u16 = 1 << 3;
+
+    let flag = if framing.data_descriptors {
+        SIZES_IN_DESCRIPTOR
+    } else {
+        0
+    };
+    let mut bytes = Vec::new();
+    let mut offsets = vec![0; entries.len()];
+
+    let mut layout: Vec<usize> = (0..entries.len()).collect();
+    if framing.data_reversed {
+        layout.reverse();
+    }
+    for index in layout {
+        let (name, data) = &entries[index];
+        let size = framing.declared_size.unwrap_or_else(|| len32(data));
+        offsets[index] = len32(&bytes);
+        // Zeroed here and repeated after the data when the descriptor form is asked for,
+        // which is the whole of what makes such an archive unreadable from local headers.
+        let (header_crc, header_size) = if framing.data_descriptors {
+            (0, 0)
+        } else {
+            (crc32(data), size)
+        };
+
+        push32(&mut bytes, LOCAL_HEADER);
+        push16(&mut bytes, VERSION);
+        push16(&mut bytes, flag);
+        push16(&mut bytes, STORED);
+        push32(&mut bytes, 0); // modification time and date
+        push32(&mut bytes, header_crc);
+        push32(&mut bytes, header_size); // compressed
+        push32(&mut bytes, header_size); // uncompressed
+        push16(&mut bytes, len16(name));
+        push16(&mut bytes, 0); // extra field
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.extend_from_slice(data);
+
+        if framing.data_descriptors {
+            push32(&mut bytes, DATA_DESCRIPTOR);
+            push32(&mut bytes, crc32(data));
+            push32(&mut bytes, size);
+            push32(&mut bytes, size);
+        }
+    }
+
+    if let Some(orphan) = framing.orphaned_entry {
+        // The last entry's final data byte, which is past every entry's start, so no entry's
+        // data region overruns the orphan's own. The four bytes read there are that byte
+        // followed by the central directory's signature, which is not a local header's.
+        offsets[orphan] = len32(&bytes).saturating_sub(1);
+    }
+
+    let directory_offset = len32(&bytes);
+    let mut directory = Vec::new();
+    for (index, (name, data)) in entries.iter().enumerate() {
+        let size = framing.declared_size.unwrap_or_else(|| len32(data));
+        push32(&mut directory, CENTRAL_HEADER);
+        push16(&mut directory, VERSION); // version made by
+        push16(&mut directory, VERSION); // version needed
+        push16(&mut directory, flag);
+        push16(&mut directory, STORED);
+        push32(&mut directory, 0); // modification time and date
+        push32(&mut directory, crc32(data));
+        push32(&mut directory, size); // compressed
+        push32(&mut directory, size); // uncompressed
+        push16(&mut directory, len16(name));
+        push16(&mut directory, 0); // extra field
+        push16(&mut directory, 0); // comment
+        push16(&mut directory, 0); // starting disk
+        push16(&mut directory, 0); // internal attributes
+        push32(&mut directory, 0); // external attributes
+        push32(&mut directory, offsets[index]);
+        directory.extend_from_slice(name.as_bytes());
+    }
+
+    // Recorded before truncation, so the end record describes a directory longer than the
+    // one that is there.
+    let directory_len = len32(&directory);
+    directory.truncate(directory.len().saturating_sub(framing.truncated_directory));
+    bytes.extend_from_slice(&directory);
+
+    let count = u16::try_from(entries.len()).expect("the fixture holds few entries");
+    push32(&mut bytes, END_OF_DIRECTORY);
+    push16(&mut bytes, 0); // this disk
+    push16(&mut bytes, 0); // the disk the directory starts on
+    push16(&mut bytes, count); // entries on this disk
+    push16(&mut bytes, framing.recorded_total.unwrap_or(count)); // entries in total
+    push32(&mut bytes, directory_len);
+    push32(&mut bytes, directory_offset);
+    let comment = u16::try_from(framing.comment_bytes).expect("a comment is at most 65,535 bytes");
+    push16(&mut bytes, comment); // archive comment length
+    bytes.resize(bytes.len() + framing.comment_bytes, b'#');
+    bytes.resize(bytes.len() + framing.trailing_bytes, 0);
+    bytes
+}
+
+fn push16(bytes: &mut Vec<u8>, value: u16) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push32(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_le_bytes());
+}
+
+fn len32(bytes: &[u8]) -> u32 {
+    u32::try_from(bytes.len()).expect("a fixture archive stays well under 4 GiB")
+}
+
+fn len16(name: &str) -> u16 {
+    u16::try_from(name.len()).expect("a fixture entry name is short")
+}
+
+/// The checksum every zip entry records, from the crate `zip` itself uses.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = Crc::new();
+    crc.update(data);
+    crc.sum()
 }
 
 /// A directory removed when it goes out of scope.
@@ -210,7 +383,8 @@ pub fn corrupt_scan(jpeg: &[u8], offset: usize) -> Vec<u8> {
 /// Every entry of a zip, in stored order, as `(name, bytes)`.
 pub fn read_archive(path: &Path) -> Vec<(String, Vec<u8>)> {
     let bytes = fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    let mut source = comic_auto_resize::source::Source::zip(std::io::Cursor::new(bytes));
+    let mut source = comic_auto_resize::source::Source::zip(std::io::Cursor::new(bytes))
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let mut entries = Vec::new();
     while let Some(entry) = source.next_entry() {
         let entry = entry.unwrap_or_else(|error| panic!("{}: {error}", path.display()));
