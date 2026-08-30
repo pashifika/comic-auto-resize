@@ -40,10 +40,11 @@ pub enum Source<R> {
     Zip(zip::ZipSource<R>),
 }
 
-/// The bound is the zip variant's, not the enum's: `Source<R>` can be named without it, which
-/// is what keeps it out of `pipeline::run`'s signature. It is not yet the whole story for rar
-/// and 7z — `next_entry` lives on this block too, so a variant over a `Read`-only reader needs
-/// more than moving a bound. That is the Change that adds one to decide.
+/// The bound is the zip variant's, not the enum's: the `enum` declaration carries none, so
+/// `Source<R>` can be named without one. It is not yet the whole story for rar and 7z —
+/// `next_entry` lives on this block too, and `pipeline::run` repeats the bound because it
+/// drives `next_entry`, so a variant over a `Read`-only reader needs more than moving a bound.
+/// That is the Change that adds one to decide.
 impl<R: Read + Seek> Source<R> {
     /// Opens `reader` as a zip, reading its entry table.
     ///
@@ -82,7 +83,7 @@ pub enum SourceError {
     /// record — and the page that lost would leave the book without a word. Refused rather
     /// than shortened: a book missing a page is the failure a reader notices last.
     #[error(
-        "the archive records {recorded} entries but only {kept} can be addressed: two entries share a stored name"
+        "the archive records {recorded} entries but only {kept} can be addressed, which happens when two entries share a stored name"
     )]
     RepeatedName { recorded: u64, kept: u64 },
     #[error("{name}: cannot read the entry: {source}")]

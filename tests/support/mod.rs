@@ -139,6 +139,13 @@ pub struct Framing {
     /// The entry whose central-directory record points at an offset holding no local
     /// header, so the table reads but that one entry cannot be located.
     pub orphaned_entry: Option<usize>,
+    /// The *total* entry count the end record states, in place of the real one, leaving the
+    /// count of entries on this disk truthful. The two fields are equal in every conformant
+    /// single-disk archive, and a reader must count with the one `zip` counts with.
+    pub recorded_total: Option<u16>,
+    /// Bytes appended after the end record. The format allows only the record's own comment
+    /// there, but readers tolerate garbage, so a reader must too.
+    pub trailing_bytes: usize,
 }
 
 /// Writes a Stored zip byte by byte, with `framing`'s departures from the ordinary form.
@@ -199,9 +206,9 @@ pub fn framed_archive(entries: &[(&str, Vec<u8>)], framing: Framing) -> Vec<u8> 
     }
 
     if let Some(orphan) = framing.orphaned_entry {
-        // The last byte before the central directory: past every entry, so no entry's data
-        // overruns it, and the four bytes read there begin with the directory's own
-        // signature rather than a local header's.
+        // The last entry's final data byte, which is past every entry's start, so no entry's
+        // data region overruns the orphan's own. The four bytes read there are that byte
+        // followed by the central directory's signature, which is not a local header's.
         offsets[orphan] = len32(&bytes).saturating_sub(1);
     }
 
@@ -238,11 +245,12 @@ pub fn framed_archive(entries: &[(&str, Vec<u8>)], framing: Framing) -> Vec<u8> 
     push32(&mut bytes, END_OF_DIRECTORY);
     push16(&mut bytes, 0); // this disk
     push16(&mut bytes, 0); // the disk the directory starts on
-    push16(&mut bytes, count);
-    push16(&mut bytes, count);
+    push16(&mut bytes, count); // entries on this disk
+    push16(&mut bytes, framing.recorded_total.unwrap_or(count)); // entries in total
     push32(&mut bytes, directory_len);
     push32(&mut bytes, directory_offset);
     push16(&mut bytes, 0); // archive comment
+    bytes.resize(bytes.len() + framing.trailing_bytes, 0);
     bytes
 }
 

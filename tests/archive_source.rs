@@ -128,8 +128,9 @@ fn a_non_image_entry_is_passed_over() {
     let yielded = read_all(&bytes).expect("reads");
     let names: Vec<_> = yielded.iter().map(|(_, name)| name.as_str()).collect();
     assert_eq!(names, ["page01.jpg"], "only the page is a page");
-    // The skipped leading entry costs no index: the writer's key sequence has no gaps,
-    // whether the reader counted table positions or yielded entries.
+    // The skipped leading entry costs no index. A reader that used the entry table's position
+    // as the index — the likely slip now that two counters exist — would yield 1 here and hand
+    // the writer a sequence with a gap in it.
     let indices: Vec<_> = yielded.iter().map(|(index, _)| *index).collect();
     assert_eq!(
         indices,
@@ -298,6 +299,16 @@ fn an_entry_the_table_lists_but_cannot_locate_is_named() {
 /// `zip` keys its entry table on the stored name, so the second record replaces the first and
 /// `len()` counts one. Without the cross-check against what the archive records, the run would
 /// write a book one page short and report success.
+///
+/// The two framings after the plain case are the ways the cross-check was got wrong once, so
+/// they are the ways it can silently stop working:
+///
+/// - The end record states the entry count twice, once for this disk and once in total. `zip`
+///   counts records with the first; a reader taking the second compares two independent
+///   numbers, and an archive that states them differently escapes the check.
+/// - The record's comment is the last thing the format puts in the file, but readers tolerate
+///   garbage after it — `zip` deliberately relaxed that check. A reader requiring the comment
+///   to end exactly at the end of the file is disabled by one trailing byte.
 #[test]
 fn two_entries_stored_under_one_name_are_refused() {
     let entries = [
@@ -305,15 +316,59 @@ fn two_entries_stored_under_one_name_are_refused() {
         ("pages/page01.jpg", page(64, 96)),
         ("pages/page02.jpg", page(8, 8)),
     ];
-    let bytes = framed_archive(&entries, Framing::default());
+    for framing in [
+        Framing::default(),
+        Framing {
+            recorded_total: Some(2),
+            ..Framing::default()
+        },
+        Framing {
+            recorded_total: Some(u16::MAX),
+            ..Framing::default()
+        },
+        Framing {
+            trailing_bytes: 1,
+            ..Framing::default()
+        },
+    ] {
+        let bytes = framed_archive(&entries, framing);
 
-    let error = read_all(&bytes).expect_err("a repeated stored name must be refused");
-    assert!(
-        matches!(
-            &error,
-            SourceError::RepeatedName { recorded, kept } if *recorded == 3 && *kept == 2
-        ),
-        "expected a repeated-name refusal counting both sides, got {error}"
+        let error = read_all(&bytes).expect_err("a repeated stored name must be refused");
+        assert!(
+            matches!(
+                &error,
+                SourceError::RepeatedName { recorded, kept } if *recorded == 3 && *kept == 2
+            ),
+            "{framing:?}: expected a repeated-name refusal counting both sides, got {error}"
+        );
+    }
+}
+
+/// An entry table the reader can address in full is read, and a collision the extension
+/// rewriting creates is the writer's to report rather than the reader's.
+///
+/// The guard against the cross-check refusing what it should not: two distinct stored names,
+/// with the end record's total field lying in the direction that would trip a reader counting
+/// with it.
+#[test]
+fn an_addressable_entry_table_is_not_refused() {
+    let entries = [
+        ("pages/page01.jpeg", page(8, 8)),
+        ("pages/page01.jpg", page(64, 96)),
+    ];
+    let bytes = framed_archive(
+        &entries,
+        Framing {
+            recorded_total: Some(3),
+            ..Framing::default()
+        },
+    );
+
+    let yielded = read_all_sized(&bytes).expect("an addressable entry table reads");
+    assert_eq!(
+        yielded.len(),
+        2,
+        "both entries are addressable, so both are read: {yielded:?}"
     );
 }
 
