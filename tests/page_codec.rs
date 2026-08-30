@@ -9,7 +9,7 @@ use std::iter;
 use std::path::PathBuf;
 
 use comic_auto_resize::page::{
-    Channels, DctMethod, DecodeSettings, EncodeSettings, Filter, PageErrorKind, PageImage,
+    Budget, Channels, DctMethod, DecodeSettings, EncodeSettings, Filter, PageErrorKind, PageImage,
     Resampler, decode, encode, height_for_width, scale_numerator,
 };
 
@@ -105,6 +105,53 @@ fn start_of_frame(jpeg: &[u8]) -> Option<u8> {
 fn frame_components(jpeg: &[u8]) -> Option<u8> {
     // Marker (2), length (2), sample precision (1), height (2), width (2), then the count.
     start_of_frame_offset(jpeg).and_then(|offset| jpeg.get(offset + 9).copied())
+}
+
+/// Rewrites the geometry the start-of-frame header declares, leaving the entropy data as
+/// it was.
+///
+/// That inconsistency is the point: a header is cheap to write and a decoder trusts it
+/// long enough to reserve a buffer, which is exactly the case the budget refuses. The
+/// segment's layout is marker (2), length (2), precision (1), height (2), width (2).
+fn declare_size(jpeg: &[u8], width: u16, height: u16) -> Vec<u8> {
+    let offset = start_of_frame_offset(jpeg).expect("the fixture has a frame header");
+    let mut patched = jpeg.to_vec();
+    patched[offset + 5..offset + 7].copy_from_slice(&height.to_be_bytes());
+    patched[offset + 7..offset + 9].copy_from_slice(&width.to_be_bytes());
+    patched
+}
+
+/// The offset of the start-of-scan marker, walked the same way as the frame header.
+fn start_of_scan_offset(jpeg: &[u8]) -> Option<usize> {
+    assert_eq!(&jpeg[..2], b"\xFF\xD8", "not a JPEG stream");
+
+    let mut index = 2;
+    while index + 3 < jpeg.len() {
+        match jpeg[index + 1] {
+            0xFF => index += 1,
+            0xDA => return Some(index),
+            0xD9 => return None,
+            0x01 | 0xD0..=0xD8 => index += 2,
+            _ => {
+                let length = usize::from(u16::from_be_bytes([jpeg[index + 2], jpeg[index + 3]]));
+                index += 2 + length;
+            }
+        }
+    }
+    None
+}
+
+/// Flips every bit of one byte of entropy-coded data.
+///
+/// `offset` counts from the first byte after the start-of-scan header, so the damage lands
+/// in the Huffman-coded coefficients rather than in a marker. Deterministic on purpose: the
+/// fixture is produced here rather than committed, so how it was damaged is readable.
+fn corrupt_scan(jpeg: &[u8], offset: usize) -> Vec<u8> {
+    let sos = start_of_scan_offset(jpeg).expect("the fixture has a scan");
+    let header_len = usize::from(u16::from_be_bytes([jpeg[sos + 2], jpeg[sos + 3]]));
+    let mut damaged = jpeg.to_vec();
+    damaged[sos + 2 + header_len + offset] ^= 0xFF;
+    damaged
 }
 
 #[test]
@@ -619,15 +666,13 @@ fn a_jpeg_truncated_inside_its_headers_is_reported() {
     );
 }
 
-/// Pins a limitation rather than a feature.
+/// The recorded parity exception, now a decision rather than an oversight.
 ///
 /// mozjpeg's source manager synthesises an end-of-image marker when the input runs out, so
 /// a JPEG truncated after its headers decodes to a partially filled image instead of
-/// failing. Truncation is one case of a general behaviour: libjpeg recovers from damaged
-/// entropy data by substituting fabricated coefficients and continuing, and mozjpeg
-/// silences the warnings that say so, so any such page returns `Ok`. The Go implementation
-/// had the same behaviour, through the same library. This test exists so that the day it
-/// changes is a deliberate day.
+/// failing. The Go implementation accepted that, through the same library, and this build
+/// still does — but deliberately: every other damage class is now refused, and the pinned
+/// fork is what makes the two distinguishable at all.
 #[test]
 fn a_jpeg_truncated_after_its_headers_decodes_partially() {
     let jpeg = fixture();
@@ -680,4 +725,199 @@ fn the_process_survives_an_encode_failure() {
 
     // The unwind left nothing behind: a valid page still encodes afterwards.
     assert!(encode("good.jpg", &good, EncodeSettings::default()).is_ok());
+}
+
+/// The 12.87 GB reservation, refused.
+///
+/// `65500x65500` is inside what a start-of-frame header may declare, and libjpeg reserves
+/// the full geometry once it believes it. The check sits between `jpeg_read_header` and
+/// `jpeg_start_decompress`, so the refusal happens before any buffer is sized from those
+/// numbers — and an allocator abort or an OOM kill is not something `catch_unwind` could
+/// have recovered.
+#[test]
+fn an_oversized_header_is_refused_before_libjpeg_allocates() {
+    let jpeg = fixture();
+    let huge = declare_size(&jpeg, 65500, 65500);
+
+    let error = decode("huge.jpg", &huge, DecodeSettings::default())
+        .expect_err("4.29 gigapixels is over the budget");
+
+    let PageErrorKind::TooLarge {
+        quantity,
+        actual,
+        limit,
+    } = error.kind
+    else {
+        panic!("expected a budget refusal, got {:?}", error.kind);
+    };
+    assert_eq!(quantity, "source pixels");
+    assert_eq!(actual, 65500 * 65500);
+    assert!(actual > limit);
+    assert!(
+        error.to_string().contains("huge.jpg"),
+        "the message must name the page: {error}"
+    );
+
+    // The process is still here, and still able to decode.
+    assert!(decode("page.jpg", &jpeg, DecodeSettings::default()).is_ok());
+}
+
+/// The scaled-decode step is checked, not just the source.
+///
+/// A page can clear the source-pixel limit and still ask for more bytes than allowed, so
+/// the byte check uses the geometry libjpeg would actually produce at the chosen step. Here
+/// the chosen step is the smallest one, `1/8`, and the page is refused rather than decoded
+/// at it.
+#[test]
+fn the_smallest_scaled_decode_step_is_checked_too() {
+    let jpeg = fixture();
+    // 1/8 of 160x240 is 20x30, which is 1800 bytes as RGB.
+    assert_eq!(
+        scale_numerator(FIXTURE_WIDTH, FIXTURE_HEIGHT, 20, 30),
+        Some(1)
+    );
+
+    let settings = DecodeSettings {
+        scale_to: Some((20, 30)),
+        budget: Budget::new(u64::MAX, 1_000),
+        ..DecodeSettings::default()
+    };
+    let error =
+        decode("page.jpg", &jpeg, settings).expect_err("1800 bytes is over a 1000 byte limit");
+
+    let PageErrorKind::TooLarge { quantity, .. } = error.kind else {
+        panic!("expected a budget refusal, got {:?}", error.kind);
+    };
+    assert_eq!(quantity, "image bytes");
+}
+
+/// The resize destination is checked before `Image::new`, which cannot fail.
+#[test]
+fn an_oversized_resize_destination_is_refused_before_allocation() {
+    let source = banded(64, 96, Channels::Rgb);
+    // 1280 wide keeps the 2:3 ratio, so 1280x1920x3 is 7,372,800 bytes.
+    let error = Resampler::with_budget(Budget::new(u64::MAX, 1_000_000))
+        .resize("page.jpg", &source, 1280, Filter::default())
+        .expect_err("7.4 MB is over a 1 MB limit");
+
+    let PageErrorKind::TooLarge { actual, .. } = error.kind else {
+        panic!("expected a budget refusal, got {:?}", error.kind);
+    };
+    assert_eq!(actual, 1280 * 1920 * 3);
+}
+
+/// An ordinary page notices nothing.
+#[test]
+fn the_budget_does_not_change_an_ordinary_page() {
+    let jpeg = fixture();
+    let unlimited = DecodeSettings {
+        budget: Budget::new(u64::MAX, u64::MAX),
+        ..DecodeSettings::default()
+    };
+
+    let with_default = decode("page.jpg", &jpeg, DecodeSettings::default()).expect("decodes");
+    let without_limit = decode("page.jpg", &jpeg, unlimited).expect("decodes");
+    assert_eq!(with_default, without_limit);
+
+    let resized_default = resize_to_width("page.jpg", &with_default, 80, Filter::default());
+    let resized_unlimited = Resampler::with_budget(Budget::new(u64::MAX, u64::MAX))
+        .resize("page.jpg", &without_limit, 80, Filter::default())
+        .expect("resizes");
+    assert_eq!(resized_default, resized_unlimited);
+}
+
+/// The second entry precondition: a page libjpeg repaired is refused, not re-encoded.
+///
+/// Without the pinned fork this test cannot exist. libjpeg substitutes a coefficient for
+/// the damaged Huffman code and returns a full-size image, and the released binding
+/// discards the warning that says so, so the page is indistinguishable from a sound one.
+#[test]
+fn a_page_libjpeg_repaired_is_refused() {
+    let damaged = corrupt_scan(&fixture(), 2);
+
+    let error = decode("pages/page01.jpg", &damaged, DecodeSettings::default())
+        .expect_err("a fabricated coefficient is not a page this tool re-encodes");
+
+    let PageErrorKind::Repaired { codes } = &error.kind else {
+        panic!("expected a repaired-page refusal, got {:?}", error.kind);
+    };
+    // JWRN_HUFF_BAD_CODE, which truncation cannot produce — that is what makes this page
+    // refusable rather than the accepted parity exception. JWRN_HIT_MARKER often
+    // accompanies it and is fixture-dependent, so the set is not asserted exactly.
+    assert!(
+        codes.contains(&118),
+        "expected JWRN_HUFF_BAD_CODE, got {codes:?}"
+    );
+    assert!(
+        error.to_string().contains("pages/page01.jpg"),
+        "the message must name the page: {error}"
+    );
+}
+
+/// Truncation is accepted and corruption is not, though both are damage.
+///
+/// The warning codes cannot tell them apart on their own: truncation reports
+/// `{JWRN_JPEG_EOF}`, `{JWRN_HIT_MARKER, JWRN_JPEG_EOF}`, or
+/// `{JWRN_EXTRANEOUS_DATA, JWRN_JPEG_EOF}`, and corruption can report the first and third
+/// of those too. The end-of-image marker is what separates them.
+#[test]
+fn truncation_is_accepted_where_corruption_is_refused() {
+    let jpeg = fixture();
+    let truncated = &jpeg[..jpeg.len() * 3 / 4];
+
+    let page = decode("truncated.jpg", truncated, DecodeSettings::default())
+        .expect("post-header truncation is the recorded parity exception");
+    assert_eq!(
+        (page.width(), page.height()),
+        (FIXTURE_WIDTH, FIXTURE_HEIGHT)
+    );
+
+    // Same fixture, damaged rather than shortened, and the marker still present.
+    assert!(
+        decode(
+            "corrupt.jpg",
+            &corrupt_scan(&jpeg, 2),
+            DecodeSettings::default()
+        )
+        .is_err(),
+        "a complete file with damaged entropy data must not pass as truncation"
+    );
+}
+
+/// "Repaired" and "clean" are distinguishable without reading the pixels.
+#[test]
+fn a_clean_page_reports_no_condition() {
+    let jpeg = fixture();
+
+    assert!(decode("clean.jpg", &jpeg, DecodeSettings::default()).is_ok());
+
+    // Every offset in the first few bytes of entropy data, so the refusal is not one
+    // lucky byte. Some offsets leave the stream sound, which is why this counts rather
+    // than requiring all of them.
+    let refused = (0..16)
+        .filter(|&offset| {
+            decode(
+                "corrupt.jpg",
+                &corrupt_scan(&jpeg, offset),
+                DecodeSettings::default(),
+            )
+            .is_err()
+        })
+        .count();
+    assert!(
+        refused >= 8,
+        "expected most single-byte corruptions to be refused, got {refused} of 16"
+    );
+}
+
+/// The process is still usable after a refusal, as it is after an unwind.
+#[test]
+fn the_process_survives_a_repaired_page_refusal() {
+    let jpeg = fixture();
+    let damaged = corrupt_scan(&jpeg, 2);
+
+    for _ in 0..10 {
+        assert!(decode("corrupt.jpg", &damaged, DecodeSettings::default()).is_err());
+    }
+    assert!(decode("page.jpg", &jpeg, DecodeSettings::default()).is_ok());
 }

@@ -15,7 +15,7 @@ use fast_image_resize::{
 };
 use thiserror::Error;
 
-use super::{Channels, PageError, PageErrorKind, PageImage};
+use super::{Budget, Channels, PageError, PageErrorKind, PageImage};
 
 /// The resampling filters the tool offers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -124,12 +124,23 @@ pub struct UnknownFilter {
 #[derive(Debug, Default)]
 pub struct Resampler {
     resizer: Resizer,
+    budget: Budget,
 }
 
 impl Resampler {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A resampler with an explicit budget, for tests that would otherwise need a huge
+    /// source page.
+    #[must_use]
+    pub fn with_budget(budget: Budget) -> Self {
+        Self {
+            resizer: Resizer::new(),
+            budget,
+        }
     }
 
     /// Resizes `source` to `target_width`, keeping its channel count and the aspect ratio
@@ -205,6 +216,12 @@ impl Resampler {
                 )),
             ));
         }
+
+        // `Image::new` allocates with an infallible `vec![0; …]`, so this is the last point
+        // an over-large destination can be refused rather than aborting the process.
+        self.budget
+            .allow_image(target_width, target_height, source.channels())
+            .map_err(|kind| PageError::new(name, kind))?;
 
         let pixel_type = match source.channels() {
             Channels::Gray => PixelType::U8,

@@ -5,12 +5,26 @@
 //! decoder offers either, so the decoder that is already linked for its encoder is used
 //! for both directions.
 
-use std::io;
+use std::os::raw::c_int;
 use std::panic;
 
-use mozjpeg::{ColorSpace, Decompress};
+use mozjpeg::{ColorSpace, Decompress, Warnings};
+use mozjpeg_sys::{JWRN_EXTRANEOUS_DATA, JWRN_HIT_MARKER, JWRN_JPEG_EOF};
 
-use super::{Channels, DctMethod, PageError, PageErrorKind, PageImage, require_soi, unwind_reason};
+use super::{
+    Budget, Channels, DctMethod, PageError, PageErrorKind, PageImage, SOI_MARKER, require_soi,
+    unwind_reason,
+};
+
+/// JPEG's end-of-image marker.
+const EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
+
+/// Every warning code a stream truncated after its headers can produce.
+///
+/// Measured by decoding the committed fixture truncated at every offset from the start of
+/// its scan: the sets observed were `{JWRN_JPEG_EOF}`, `{JWRN_HIT_MARKER, JWRN_JPEG_EOF}`,
+/// and `{JWRN_EXTRANEOUS_DATA, JWRN_JPEG_EOF}`.
+const TRUNCATION_CODES: [c_int; 3] = [JWRN_EXTRANEOUS_DATA, JWRN_HIT_MARKER, JWRN_JPEG_EOF];
 
 /// What the decoder is allowed to do to a page on the way in.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -22,6 +36,9 @@ pub struct DecodeSettings {
     /// resampling, but it is coarse — eighths of the original — so the resampler still
     /// does the final step.
     pub scale_to: Option<(u32, u32)>,
+    /// What the page is allowed to cost. Checked after the header is read and before
+    /// libjpeg allocates for it.
+    pub budget: Budget,
 }
 
 /// Decodes `buffer` into 8-bit pixels, keeping the source's channel count.
@@ -32,10 +49,11 @@ pub struct DecodeSettings {
 ///
 /// # Errors
 ///
-/// [`PageErrorKind::NotJpeg`] when `buffer` does not begin with the start-of-image
-/// marker, and [`PageErrorKind::Decode`] when libjpeg rejects the stream. libjpeg
-/// reports a fatal error by unwinding out of C; that unwind is caught here and returned,
-/// so one unreadable page cannot take the process down with it.
+/// [`PageErrorKind::NotJpeg`] when `buffer` does not begin with the start-of-image marker,
+/// [`PageErrorKind::TooLarge`] when the header or the decode target exceeds
+/// `settings.budget`, and [`PageErrorKind::Decode`] when libjpeg rejects the stream.
+/// libjpeg reports a fatal error by unwinding out of C; that unwind is caught here and
+/// returned, so one unreadable page cannot take the process down with it.
 pub fn decode(name: &str, buffer: &[u8], settings: DecodeSettings) -> Result<PageImage, PageError> {
     require_soi(name, buffer)?;
 
@@ -50,7 +68,7 @@ pub fn decode(name: &str, buffer: &[u8], settings: DecodeSettings) -> Result<Pag
         .map_err(|payload| {
             PageError::new(name, PageErrorKind::Decode(unwind_reason(payload.as_ref())))
         })?
-        .map_err(|error| PageError::new(name, PageErrorKind::Decode(error.to_string())))?;
+        .map_err(|kind| PageError::new(name, kind))?;
 
     PageImage::new(width, height, channels, pixels)
         .map(|page| page.scaled_from(original_width, original_height))
@@ -71,7 +89,7 @@ struct DecodedPage {
 }
 
 /// The part that may unwind. Kept separate so the `catch_unwind` closure stays trivial.
-fn decode_pixels(buffer: &[u8], settings: DecodeSettings) -> io::Result<DecodedPage> {
+fn decode_pixels(buffer: &[u8], settings: DecodeSettings) -> Result<DecodedPage, PageErrorKind> {
     let mut decompress = Decompress::new_mem(buffer)?;
     decompress.dct_method(settings.dct_method.into());
 
@@ -80,12 +98,17 @@ fn decode_pixels(buffer: &[u8], settings: DecodeSettings) -> io::Result<DecodedP
     let original_width = dimension(decompress.width());
     let original_height = dimension(decompress.height());
 
-    if let Some((target_width, target_height)) = settings.scale_to {
-        let numerator =
-            scale_numerator(original_width, original_height, target_width, target_height);
-        if let Some(numerator) = numerator {
-            decompress.scale(numerator);
-        }
+    // `jpeg_read_header` has run and `jpeg_start_decompress` has not, so this is after the
+    // geometry is trustworthy and before anything is allocated from it.
+    settings
+        .budget
+        .allow_source(original_width, original_height)?;
+
+    let numerator = settings.scale_to.and_then(|(target_width, target_height)| {
+        scale_numerator(original_width, original_height, target_width, target_height)
+    });
+    if let Some(numerator) = numerator {
+        decompress.scale(numerator);
     }
 
     // `color_space()` reports the *source* colour space, before any conversion is chosen,
@@ -98,6 +121,14 @@ fn decode_pixels(buffer: &[u8], settings: DecodeSettings) -> io::Result<DecodedP
     } else {
         Channels::Rgb
     };
+
+    // The buffer libjpeg is about to fill, at whichever step was chosen — so a page whose
+    // smallest step still exceeds the budget is refused rather than decoded at `1/8`.
+    let scaled = scaled_dimension(numerator);
+    settings
+        .budget
+        .allow_image(scaled(original_width), scaled(original_height), channels)?;
+
     let mut started = match channels {
         Channels::Gray => decompress.grayscale()?,
         Channels::Rgb => decompress.rgb()?,
@@ -107,7 +138,17 @@ fn decode_pixels(buffer: &[u8], settings: DecodeSettings) -> io::Result<DecodedP
     let pixels: Vec<u8> = started.read_scanlines()?;
     let width = dimension(started.width());
     let height = dimension(started.height());
+    // Entropy faults surface while scanlines are read, which is why this is enough without
+    // reaching past `finish` — measured: a truncated stream already reports `JWRN_JPEG_EOF`
+    // here.
+    let warnings = started.warnings();
     started.finish()?;
+
+    if !is_accepted(warnings, buffer) {
+        return Err(PageErrorKind::Repaired {
+            codes: warnings.codes().collect(),
+        });
+    }
 
     Ok(DecodedPage {
         width,
@@ -117,6 +158,72 @@ fn decode_pixels(buffer: &[u8], settings: DecodeSettings) -> io::Result<DecodedP
         channels,
         pixels,
     })
+}
+
+/// Whether libjpeg's report is one this build accepts.
+///
+/// A warning means libjpeg found the data damaged, substituted something, and carried on,
+/// so the page decoded to full size out of partly fabricated coefficients. Post-header
+/// truncation is the recorded parity exception — the Go implementation accepted it through
+/// the same library, and it is the one class whose fabricated region is the tail rather
+/// than the middle. Everything else is refused.
+///
+/// The code set alone cannot make that distinction. Measured over every single-byte
+/// corruption of the fixture's entropy data, corruption also produces `{JWRN_JPEG_EOF}` and
+/// `{JWRN_EXTRANEOUS_DATA, JWRN_JPEG_EOF}` — 266 of about 105,000 accepted cases — both of
+/// which truncation produces too. The structural test is what separates them: a complete
+/// file keeps its end-of-image marker and a truncated one cannot.
+fn is_accepted(warnings: Warnings, buffer: &[u8]) -> bool {
+    if warnings.is_empty() {
+        return true;
+    }
+    !warnings.has_unnamed_code()
+        && warnings
+            .codes()
+            .all(|code| TRUNCATION_CODES.contains(&code))
+        && is_truncated(buffer)
+}
+
+/// Whether the stream ends before its end-of-image marker.
+///
+/// Searched from the start of the scan rather than across the whole buffer: an EXIF
+/// thumbnail is itself a JPEG and carries its own marker, so a whole-buffer search would
+/// call a truncated page complete. Within valid entropy data a literal `FF` is stuffed as
+/// `FF 00`, so the marker cannot occur there; corruption can synthesise one, which reports
+/// "complete" and refuses the page — the safe direction.
+fn is_truncated(buffer: &[u8]) -> bool {
+    let Some(scan) = scan_offset(buffer) else {
+        return false;
+    };
+    !buffer[scan..].windows(2).any(|pair| pair == EOI_MARKER)
+}
+
+/// The offset of the start-of-scan marker, found by walking each segment's declared length.
+///
+/// Not a byte scan for `FF DA`: a quantisation table forced into the baseline range holds
+/// entries of exactly `FF`, so `FF` followed by an arbitrary quantiser byte occurs inside
+/// `DQT` and a naive scan stops early.
+fn scan_offset(buffer: &[u8]) -> Option<usize> {
+    let mut index = SOI_MARKER.len();
+    while index + 3 < buffer.len() {
+        if buffer[index] != 0xFF {
+            return None;
+        }
+        match buffer[index + 1] {
+            // A fill byte is legal between segments.
+            0xFF => index += 1,
+            0xDA => return Some(index),
+            0xD9 => return None,
+            // Markers that carry no payload: TEM, the restart markers, and SOI.
+            0x01 | 0xD0..=0xD8 => index += 2,
+            _ => {
+                let length =
+                    usize::from(u16::from_be_bytes([buffer[index + 2], buffer[index + 3]]));
+                index = index.checked_add(2)?.checked_add(length)?;
+            }
+        }
+    }
+    None
 }
 
 /// Picks libjpeg's `scale_num` for a decode that is heading for `target_width` ×
@@ -146,10 +253,23 @@ pub fn scale_numerator(
     }
 
     (1..8u8).find(|&numerator| {
-        let scaled = |dimension: u32| (u64::from(numerator) * u64::from(dimension)).div_ceil(8);
-        scaled(src_width) >= u64::from(target_width)
-            && scaled(src_height) >= u64::from(target_height)
+        let scaled = scaled_dimension(Some(numerator));
+        scaled(src_width) >= target_width && scaled(src_height) >= target_height
     })
+}
+
+/// libjpeg's output size for one axis at `numerator`/8, where `None` means a full-size
+/// decode.
+///
+/// `ceil` per axis, independently, which is why a scaled buffer no longer carries the
+/// page's aspect ratio. Shared with the budget check so the size it refuses is the size
+/// libjpeg would produce.
+fn scaled_dimension(numerator: Option<u8>) -> impl Fn(u32) -> u32 {
+    let numerator = u64::from(numerator.unwrap_or(8));
+    move |dimension| {
+        let scaled = (numerator * u64::from(dimension)).div_ceil(8);
+        u32::try_from(scaled).unwrap_or(u32::MAX)
+    }
 }
 
 /// Narrows one of libjpeg's `usize` dimensions.

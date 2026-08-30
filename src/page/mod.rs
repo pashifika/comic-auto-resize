@@ -17,16 +17,19 @@
 //! way through the same library, so this is parity rather than a regression; it is recorded
 //! here because nothing in the signatures says so.
 
+mod budget;
 mod decode;
 mod encode;
 mod resize;
 
+pub use budget::Budget;
 pub use decode::{DecodeSettings, decode, scale_numerator};
 pub use encode::{EncodeSettings, encode};
 pub use resize::{Filter, Resampler, UnknownFilter, height_for_width};
 
 use std::any::Any;
 use std::fmt;
+use std::io;
 
 use thiserror::Error;
 
@@ -272,6 +275,26 @@ pub enum PageErrorKind {
     /// A buffer handed between the two libraries did not match its own dimensions.
     #[error("inconsistent pixel buffer: {0}")]
     Buffer(#[from] InvalidPixelBuffer),
+    /// Refused before allocating for it, because an input-controlled size exceeded an
+    /// internal limit. See [`Budget`].
+    #[error("{quantity} is {actual}, over the limit of {limit}")]
+    TooLarge {
+        quantity: &'static str,
+        actual: u64,
+        limit: u64,
+    },
+    /// libjpeg found the data damaged, substituted coefficients for it, and reported
+    /// success. Refused rather than re-encoded, because the pixels are partly fabricated.
+    #[error("libjpeg repaired damaged data and reported success (warning codes {codes:?})")]
+    Repaired { codes: Vec<i32> },
+}
+
+impl From<io::Error> for PageErrorKind {
+    /// Both native libraries report a refusal as an `io::Error`, and every such refusal
+    /// reaching this crate came out of a decode.
+    fn from(error: io::Error) -> Self {
+        Self::Decode(error.to_string())
+    }
 }
 
 /// Rejects a buffer that cannot be a JPEG before libjpeg is handed it.
