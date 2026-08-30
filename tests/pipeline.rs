@@ -7,18 +7,22 @@
 mod support;
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use comic_auto_resize::page::{DecodeSettings, EncodeSettings, Filter, PageErrorKind};
-use comic_auto_resize::pipeline::{self, RunError, Settings};
+use comic_auto_resize::pipeline::{self, Capacities, RunError, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
 use comic_auto_resize::sink::default_output;
 use comic_auto_resize::source::{Source, SourceError};
 
 use support::{
-    TempDir, corrupt_scan, jpeg_size, page_bytes, read_archive, write_archive, write_pages,
+    Framing, TempDir, corrupt_scan, framed_archive, jpeg_size, page_bytes, read_archive,
+    write_archive, write_pages,
 };
 
 /// The binary under test, built by Cargo for this integration test at the same profile.
@@ -34,9 +38,33 @@ fn settings(jobs: usize) -> Settings {
     }
 }
 
+/// A reader that records how many bytes have been drawn through it.
+///
+/// The pipeline's window is a claim about the reader's restraint, and the reader is where it
+/// has to be observed: an index-addressable reader knows where every entry is before it has
+/// read any of them, so nothing but the window stops it from reading them all.
+struct Counting<R> {
+    inner: R,
+    read: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for Counting<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.read.fetch_add(read as u64, Ordering::Relaxed);
+        Ok(read)
+    }
+}
+
+impl<R: Seek> Seek for Counting<R> {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(from)
+    }
+}
+
 /// Runs the pipeline over an in-memory archive, writing to `output`.
 fn run(input: &[u8], output: &Path, jobs: usize) -> Result<u32, RunError> {
-    let source = Source::zip(std::io::Cursor::new(input.to_vec()));
+    let source = Source::zip(std::io::Cursor::new(input.to_vec()))?;
     pipeline::run(source, output, &settings(jobs)).map(|report| report.pages)
 }
 
@@ -164,6 +192,53 @@ fn a_run_that_fails_partway_leaves_no_output_archive() {
         .filter(|name| name != "in.zip")
         .collect();
     assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
+}
+
+/// The credit window bounds the reader, and bounds it whether or not the reader can address
+/// entries by index.
+///
+/// Observable only while nothing is written: the *first* page fails, so no credit is ever
+/// returned and the reader can have taken no more than the window's worth. A reader free to
+/// read ahead would have drawn the whole archive through by the time the failure surfaced.
+#[test]
+fn an_index_addressable_reader_does_not_read_past_the_window() {
+    let page = page_bytes(1520, 2150);
+    let mut entries: Vec<_> = (0..20)
+        .map(|index| (format!("page{index:02}.jpg"), page.clone()))
+        .collect();
+    entries[0].1 = corrupt_scan(&page, 0);
+    let input = archive_bytes(&entries);
+
+    let jobs = NonZeroUsize::new(1).expect("non-zero");
+    let window = Capacities::for_jobs(jobs).credits as u64;
+    let read = Arc::new(AtomicU64::new(0));
+    let source = Source::zip(Counting {
+        inner: std::io::Cursor::new(input.clone()),
+        read: Arc::clone(&read),
+    })
+    .expect("the entry table reads");
+
+    let directory = TempDir::new("window");
+    let output = directory.join("out.zip");
+    let error = pipeline::run(source, &output, &settings(jobs.get()))
+        .expect_err("the first page ends the run");
+    assert!(
+        matches!(&error, RunError::Page(_)),
+        "expected a page failure, so that nothing was ever written: {error}"
+    );
+
+    let read = read.load(Ordering::Relaxed);
+    let per_entry = page.len() as u64;
+    assert!(
+        read > per_entry,
+        "the reader never read a page, so the bound below is vacuous: {read} B"
+    );
+    assert!(
+        read < per_entry * (window + 1),
+        "the reader drew {read} B at about {per_entry} B an entry, past the {window}-entry \
+         window; the whole archive is {} B",
+        input.len()
+    );
 }
 
 #[test]
@@ -312,6 +387,52 @@ fn the_binary_refuses_a_missing_input_and_a_non_archive() {
         "stderr must say why: {message}"
     );
     assert!(!default_output(&not_zip).exists());
+}
+
+/// An unreadable entry table fails the run, and fails it before anything is written.
+#[test]
+fn the_binary_refuses_an_archive_whose_entry_table_is_truncated() {
+    let directory = TempDir::new("bad-directory");
+    let input = directory.join("in.zip");
+    let entries = [
+        ("page01.jpg", page_bytes(320, 440)),
+        ("page02.jpg", page_bytes(320, 440)),
+    ];
+    // The last central-directory record is cut mid-header, while the end record still says
+    // how long the directory should have been.
+    let bytes = framed_archive(
+        &entries,
+        Framing {
+            truncated_directory: 24,
+            ..Framing::default()
+        },
+    );
+    fs::write(&input, &bytes).expect("writes the fixture");
+
+    let output = Command::new(BINARY)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(
+        !output.status.success(),
+        "a truncated entry table must fail the run"
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("in.zip"),
+        "stderr must name the input: {message}"
+    );
+
+    let leftovers: Vec<_> = fs::read_dir(directory.path())
+        .expect("reads the directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name != "in.zip")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "a refused archive left something behind: {leftovers:?}"
+    );
 }
 
 /// Writes the fixtures for the peak-memory measurement.

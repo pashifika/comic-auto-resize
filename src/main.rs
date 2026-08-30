@@ -7,7 +7,7 @@
 //! ignored. Absence is the honest form of "not yet".
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -98,8 +98,14 @@ fn run(cli: &Cli) -> Result<u32, CliError> {
     };
 
     let file = open_zip(&cli.input)?;
+    // The entry table is read here, so a malformed archive fails before the output is
+    // created. No `BufReader`: `ZipArchive` buffers its own reads.
+    let source = Source::zip(file).map_err(|source| CliError::Archive {
+        path: cli.input.clone(),
+        source,
+    })?;
     let output = default_output(&cli.input);
-    let report = pipeline::run(Source::zip(BufReader::new(file)), &output, &settings)?;
+    let report = pipeline::run(source, &output, &settings)?;
     Ok(report.pages)
 }
 
@@ -183,6 +189,13 @@ enum CliError {
     NotAFile { path: PathBuf },
     #[error("{}: not a zip archive", path.display())]
     NotZip { path: PathBuf },
+    /// Named with the path, because the entry table is read when the input is opened and a
+    /// malformed one is a property of the file rather than of an entry.
+    #[error("{}: {source}", path.display())]
+    Archive {
+        path: PathBuf,
+        source: comic_auto_resize::source::SourceError,
+    },
     #[error(transparent)]
     Filter(comic_auto_resize::page::UnknownFilter),
     #[error(transparent)]

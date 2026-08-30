@@ -1,97 +1,126 @@
-//! Sequential zip reading.
+//! Ordered, single-pass zip reading, through the archive's central directory.
 //!
-//! `zip::ZipArchive` offers `by_index` over a `Read + Seek` source, which for zip alone
-//! would be simpler. The reader is sequential anyway, for two reasons that outlive zip: a
-//! solid rar or 7z archive cannot be accessed randomly at all, so a seeking reader would
-//! have to be replaced rather than extended when the source enum gains its second variant;
-//! and sequential reading is the pipeline's premise, because a reader that seeks invites the
-//! look-ahead that makes peak memory a function of page count.
+//! `ZipArchive::new` reads the entry table once and `by_index` then reads one entry at a
+//! time, in that table's order. The table is where the format records each entry's real
+//! size, so an archive written by a writer streaming to a non-seekable output — zero sizes
+//! and general-purpose flag bit 3 in every local header, the real sizes in a trailing data
+//! descriptor — reads like any other. Go read the central directory too.
 //!
-//! The cost is recorded rather than hidden: an archive written by a streaming writer puts
-//! zero sizes in each local header and the real ones in a trailing data descriptor, and
-//! `zip` refuses such an entry outright — "The file length is not available in the local
-//! header". Go read the central directory and so accepted them. Archives from `WinRAR`,
-//! `7-Zip`, and Windows Explorer all carry real local sizes, so the common case is
-//! unaffected, and the failure is loud rather than a silently empty entry.
+//! This replaces `read_zipfile_from_stream`, which takes each size from the local header and
+//! so refuses such an entry outright: "The file length is not available in the local
+//! header". The reader was sequential deliberately, on the grounds that one able to seek
+//! invites the look-ahead that makes peak memory a function of page count. That is answered
+//! elsewhere now: the pipeline's credit window bounds the entries in flight however the
+//! reader obtained them, so restraint is no longer the reader's job to exercise.
+//!
+//! The sequential discipline is gone from zip rather than from the design. A solid rar or 7z
+//! archive cannot be addressed by index at all, so the source enum will hold both.
+//!
+//! The entry table is also the authority on order. A malformed archive can lay its data out
+//! in one order and list it in another; the table's order is the one every other reader
+//! presents, including the viewer the output will be opened in.
 
-use std::io::{BufRead, Read};
+use std::io::{Read, Seek};
 
-use zip::read::read_zipfile_from_stream;
+use zip::ZipArchive;
 
 use super::probe::{self, MAGIC_MAX};
 use super::{Entry, MAX_ENTRY_BYTES, SourceError};
 
-/// The local file header every stored entry begins with.
-const LOCAL_HEADER: [u8; 4] = [b'P', b'K', 3, 4];
-
-/// Signatures that mean the entries are finished: the central directory, the end of it, and
-/// the Zip64 form of the end of it. An archive with no entries at all starts with one of
-/// these, which is why the signature is checked rather than assumed.
-const TERMINATORS: [[u8; 4]; 3] = [[b'P', b'K', 1, 2], [b'P', b'K', 5, 6], [b'P', b'K', 6, 6]];
-
-/// How much capacity an entry's declared size may reserve.
+/// How much capacity an entry's recorded size may reserve.
 ///
 /// A real page is tens of kilobytes to a few megabytes, so a megabyte is a useful hint and
 /// anything beyond it is the archive's claim rather than a measurement. `read_to_end` grows
 /// geometrically from there.
 const HINT_CEILING: u64 = 1 << 20;
 
-/// An archive read once, from start to finish.
+/// An archive whose entry table has been read, walked once in that table's order.
 pub struct ZipSource<R> {
-    reader: R,
+    archive: ZipArchive<R>,
+    /// The next position in the entry table.
+    next_position: usize,
     /// Position in the sequence of *yielded* entries, so the writer's key has no gaps where
     /// the archive held something that was not a page.
     next_index: u32,
 }
 
-impl<R: BufRead> ZipSource<R> {
-    pub const fn new(reader: R) -> Self {
-        Self {
-            reader,
+impl<R: Read + Seek> ZipSource<R> {
+    /// Reads the archive's entry table.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceError::Archive`] when the entry table cannot be read. It is read here, before
+    /// any entry, so a truncated or malformed one fails the run before a page is processed.
+    pub fn new(reader: R) -> Result<Self, SourceError> {
+        Ok(Self {
+            archive: ZipArchive::new(reader)?,
+            next_position: 0,
             next_index: 0,
-        }
+        })
     }
 
     /// The next page, or `None` at the end of the archive.
     ///
-    /// Entries that are not pages are passed over without being read: a directory, and any
-    /// entry whose extension no candidate claims, cost their header alone.
+    /// Entries that are not pages are passed over without being reached at all: a directory,
+    /// and any entry whose extension no candidate claims, cost nothing beyond the name the
+    /// entry table already holds.
     pub fn next_entry(&mut self) -> Option<Result<Entry, SourceError>> {
-        loop {
-            match self.read_one() {
+        while self.next_position < self.archive.len() {
+            let position = self.next_position;
+            self.next_position += 1;
+            match self.read_one(position) {
                 Yielded::Entry(entry) => {
                     self.next_index += 1;
                     return Some(Ok(entry));
                 }
                 Yielded::Skipped => {}
-                Yielded::Done => return None,
                 Yielded::Failed(error) => return Some(Err(error)),
             }
         }
+        None
     }
 
-    /// One pass over one entry. Separate so the borrow of `self.reader` ends before
-    /// `next_entry` returns.
-    fn read_one(&mut self) -> Yielded {
-        if self.at_end() {
-            return Yielded::Done;
+    /// One pass over the entry at `position` in the table.
+    fn read_one(&mut self, position: usize) -> Yielded {
+        let Some(name) = self.archive.name_for_index(position) else {
+            // `position` came from the archive's own entry count, so this is unreachable.
+            // Reported rather than asserted: the reader runs on its own thread, where a
+            // panic costs the run its message and buys nothing.
+            return Yielded::Failed(SourceError::Archive(::zip::result::ZipError::FileNotFound));
+        };
+        if is_directory(name) {
+            return Yielded::Skipped;
         }
+        // The extension filter, before the entry is located, let alone read.
+        let Some(declared) = probe::declared_format(name) else {
+            return Yielded::Skipped;
+        };
+        // Ends the borrow of the entry table, which reading the entry needs mutably.
+        let name = name.to_owned();
 
         let index = self.next_index;
-        let mut file = match read_zipfile_from_stream(&mut self.reader) {
-            Ok(Some(file)) => file,
-            Ok(None) => return Yielded::Done,
-            Err(error) => return Yielded::Failed(SourceError::Archive(error)),
+        let mut file = match self.archive.by_index(position) {
+            Ok(file) => file,
+            // Named, which the sequential reader could not do: it met a malformed entry
+            // before its name, where the entry table carries the name of every entry
+            // whether or not the entry itself can be read.
+            Err(error) => {
+                return Yielded::Failed(SourceError::Entry {
+                    name,
+                    source: error.into(),
+                });
+            }
         };
 
-        let name = file.name().to_owned();
-        if file.is_dir() {
-            return Yielded::Skipped;
+        // The recorded size is still the archive's claim, but the entry table records it
+        // away from the entry's data, so it is known before that data is reached: an entry
+        // claiming more than the limit costs nothing to refuse and is not read at all.
+        if file.size() > MAX_ENTRY_BYTES {
+            return Yielded::Failed(SourceError::TooLarge {
+                name,
+                limit: MAX_ENTRY_BYTES,
+            });
         }
-        // The extension filter, before any of the entry's data is touched.
-        let Some(declared) = probe::declared_format(&name) else {
-            return Yielded::Skipped;
-        };
 
         let mut head = [0; MAGIC_MAX];
         let head = match fill(&mut file, &mut head) {
@@ -111,9 +140,8 @@ impl<R: BufRead> ZipSource<R> {
             }
         }
 
-        // `file.size()` comes from the local header, so it is attacker-controlled. Clamping
-        // it to `MAX_ENTRY_BYTES` is not enough on its own: a hundred-byte entry could
-        // declare 64 MiB and get 64 MiB reserved, and up to `2 * jobs` of those buffers are
+        // Checking the recorded size is not enough on its own: a hundred-byte entry could
+        // record 64 MiB and get 64 MiB reserved, and up to `2 * jobs` of those buffers are
         // alive at once, which on Windows is committed rather than merely reserved. So the
         // hint is capped at a real page's order of magnitude and `read_to_end` grows from
         // there, which it does geometrically anyway.
@@ -121,8 +149,11 @@ impl<R: BufRead> ZipSource<R> {
         let mut bytes = Vec::with_capacity(hint.saturating_add(head.len()));
         bytes.extend_from_slice(head);
 
-        // One byte past the limit, so an entry exactly at it is accepted and anything
-        // larger is detectable without reading the rest of it.
+        // The bound on the read stays, rather than trusting the size just checked: a
+        // recorded size that disagrees with what the entry actually holds is precisely the
+        // malformed case, and a check that trusts the number it is validating is not a
+        // check. One byte past the limit, so an entry exactly at it is accepted and
+        // anything larger is detectable without reading the rest of it.
         let remaining = MAX_ENTRY_BYTES
             .saturating_sub(bytes.len() as u64)
             .saturating_add(1);
@@ -152,32 +183,15 @@ impl<R: BufRead> ZipSource<R> {
             bytes,
         })
     }
+}
 
-    /// Whether the entries are finished, decided from the next signature without consuming
-    /// it.
-    ///
-    /// `read_zipfile_from_stream` reports the end only when it meets the central directory,
-    /// so an archive with no entries — which begins with the end-of-central-directory
-    /// record — would otherwise be reported as a malformed local header.
-    ///
-    /// Returns `false` unless a terminator is positively recognised. `fill_buf` may hand
-    /// back fewer than four bytes, and `PK` alone is a prefix of every signature, so an
-    /// undecidable peek falls through to `read_zipfile_from_stream` and lets it report the
-    /// real problem. An I/O error does the same, because the next read hits it too.
-    fn at_end(&mut self) -> bool {
-        let Ok(available) = self.reader.fill_buf() else {
-            return false;
-        };
-        if available.is_empty() {
-            return true;
-        }
-        if available.starts_with(&LOCAL_HEADER) {
-            return false;
-        }
-        TERMINATORS
-            .iter()
-            .any(|terminator| available.starts_with(terminator))
-    }
+/// Whether a stored name is a directory rather than a file.
+///
+/// The archive says so by ending the name with a separator, and both are separators because
+/// a Windows-written archive may use either. The same rule `zip` applies internally, spelled
+/// out here because its helper is crate-private.
+fn is_directory(name: &str) -> bool {
+    matches!(name.as_bytes().last(), Some(b'/' | b'\\'))
 }
 
 /// Why a stored name must not be carried into the output archive, or `None` if it may be.
@@ -210,9 +224,8 @@ fn unsafe_name(name: &str) -> Option<&'static str> {
 /// What one pass over an entry produced.
 enum Yielded {
     Entry(Entry),
-    /// Not a page. Dropping the handle skips the rest of its data.
+    /// Not a page. The entry is left where it is rather than read past.
     Skipped,
-    Done,
     Failed(SourceError),
 }
 

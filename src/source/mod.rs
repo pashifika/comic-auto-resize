@@ -9,7 +9,7 @@ mod zip;
 
 pub use probe::{CANDIDATES, Candidate, Format, MAGIC_MAX, declared_format, output_name, probe};
 
-use std::io::BufRead;
+use std::io::{Read, Seek};
 
 use thiserror::Error;
 
@@ -22,7 +22,7 @@ use thiserror::Error;
 /// Chosen, not measured. A 1280-wide JPEG page is tens of kilobytes and a 600dpi scan a few
 /// megabytes, so 64 MiB is orders of magnitude of headroom while still refusing an archive
 /// that claims a gigabyte in one entry.
-const MAX_ENTRY_BYTES: u64 = 64 << 20;
+pub const MAX_ENTRY_BYTES: u64 = 64 << 20;
 
 /// One page read out of an archive.
 pub struct Entry {
@@ -35,14 +35,23 @@ pub struct Entry {
     pub bytes: Vec<u8>,
 }
 
-/// An archive being read once, from start to finish.
+/// An archive being read once, in the order its entries are recorded in.
 pub enum Source<R> {
     Zip(zip::ZipSource<R>),
 }
 
-impl<R: BufRead> Source<R> {
-    pub const fn zip(reader: R) -> Self {
-        Self::Zip(zip::ZipSource::new(reader))
+/// The bound is the zip variant's, not the enum's: rar and 7z are solid, cannot be addressed
+/// by index, and will want `Read` alone. Keeping it here rather than on `Source` is what
+/// leaves room for variants whose readers differ.
+impl<R: Read + Seek> Source<R> {
+    /// Opens `reader` as a zip, reading its entry table.
+    ///
+    /// # Errors
+    ///
+    /// [`SourceError::Archive`] when the entry table cannot be read, which is established
+    /// here rather than at the first entry.
+    pub fn zip(reader: R) -> Result<Self, SourceError> {
+        Ok(Self::Zip(zip::ZipSource::new(reader)?))
     }
 
     /// The next page, or `None` at the end of the archive.
@@ -60,9 +69,9 @@ impl<R: BufRead> Source<R> {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SourceError {
-    /// The archive's own structure. Carries no entry name because `zip` reports a malformed
-    /// local header before the name is available — including the refusal of an entry whose
-    /// sizes live in a trailing data descriptor.
+    /// The archive's own structure, rather than one entry's: the entry table is read when
+    /// the source is opened, so a truncated or malformed one is reported before any entry.
+    /// An entry that cannot be read is [`SourceError::Entry`], which names it.
     #[error("cannot read the archive: {0}")]
     Archive(#[from] ::zip::result::ZipError),
     #[error("{name}: cannot read the entry: {source}")]
