@@ -60,8 +60,9 @@ unknown-git = "deny"
 # branch that can move underneath a previously green build.
 required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# The `mozjpeg` fork carrying `Compress::set_dct_method`. Deleted together with
-# `[patch.crates-io]` in `Cargo.toml` when
-# https://github.com/ImageOptim/mozjpeg-rust/pull/54 lands in a release.
+# The `mozjpeg` fork carrying `Compress::set_dct_method` and the warning accessors.
+# Deleted together with `[patch.crates-io]` in `Cargo.toml` when both
+# https://github.com/ImageOptim/mozjpeg-rust/pull/54 and
+# https://github.com/ImageOptim/mozjpeg-rust/pull/55 land in a release.
 allow-git = ["https://github.com/pashifika/mozjpeg-rust.git"]
 unused-allowed-source = "allow"

@@ -3,10 +3,10 @@ name = "comic-auto-resize"
 version = "2.0.0-dev"
 edition = "2024"
 # The crate's own floor, separate from the channel pinned in `rust-toolchain.toml`.
-# Raised from 1.85 to 1.87 because `fast_image_resize` 6.1.0 declares 1.87; nothing here
-# needs more yet. Later changes raise it when a dependency actually demands it, not
-# pre-emptively.
-rust-version = "1.87"
+# Raised from 1.87 to 1.88 because `zip` 8.6.0 declares 1.88; `fast_image_resize` 6.1.0
+# declares 1.87 and was the previous reason. Lowering it again means dropping `zip`, so
+# the dependency that demands it is named rather than left to be bisected for.
+rust-version = "1.88"
 description = "Auto-resize the pages of a comic archive and repack them as zip"
 license = "Apache-2.0"
 repository = "https://github.com/pashifika/comic-auto-resize"
@@ -27,21 +27,52 @@ pedantic = "deny"
 
 [dependencies]
 clap = { version = "=4.6.6", features = ["derive"] }
+# The pipeline's queues. Bounded MPMC is the primitive it needs — many workers drawing
+# from one queue, with a declared capacity — and `std::sync::mpsc` is single-consumer, so
+# sharing a `Receiver` would mean holding a lock across a blocking `recv`. Chosen over
+# `rayon`, whose work-stealing a fixed pool draining one queue never uses, and whose
+# global pool is what makes a blocking send from inside a task a deadlock risk. Nothing
+# here runs on a shared pool.
+crossbeam-channel = "=0.5.16"
 # Both pinned exactly: a native build that changes underneath a previously green run is
 # the hardest kind of failure to attribute.
 fast_image_resize = "=6.1.0"
+# Not used directly. `zip` declares `flate2` with defaults off and only its
+# `deflate-flate2-zlib-*` variants pick a backend, so naming one needs a direct
+# dependency. `rust_backend` is `miniz_oxide`, pure safe Rust; `zlib-rs` is faster but a
+# large translated C body, and inflate here reads JPEG, which Deflate keeps in stored
+# blocks. Swap both lines to `deflate-flate2-zlib-rs` if the reader ever measures as the
+# bottleneck.
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
 mozjpeg = "=0.10.13"
+# Not a new crate: `mozjpeg` already builds it. Direct only for libjpeg's `JWRN_*`
+# message-code constants, which the corruption policy classifies by — the alternative is
+# hard-coded integers from a C enum. Features are left off here so the native build stays
+# entirely `mozjpeg`'s to configure.
+mozjpeg-sys = { version = "=2.2.3", default-features = false }
 # Already in the tree through `fast_image_resize`, so it adds no dependency and no new
 # licence: typed page errors the pipeline can branch on, without hand-written `Display`.
 thiserror = "=2.0.20"
+# Reading needs Deflate; writing uses Stored, because JPEG data does not compress. So one
+# backend, and defaults off to keep `aes-crypto`, `bzip2`, `deflate64`, `lzma`, `ppmd`,
+# `time`, `zstd`, and `xz` out of a binary that cannot invoke them. An entry in one of
+# those codings is reported as unsupported rather than skipped.
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
 
-# Temporary. `mozjpeg` 0.10.13 exposes `Decompress::dct_method` but no encoder-side
-# counterpart, and `Compress` keeps `cinfo` private, so `--dct` cannot reach the
-# compressor through the released crate. The fork is the v0.10.13 tag plus one commit
-# adding `Compress::set_dct_method`, and nothing else.
+# Temporary, for two things the released crate cannot do. `--dct` cannot reach the
+# compressor, because `Compress` keeps `cinfo` private. And libjpeg's recoverable warnings
+# are discarded, because `emit_message` is an empty function, so a page libjpeg repaired
+# by fabricating coefficients decodes as if it were sound.
 #
-# Exit condition: https://github.com/ImageOptim/mozjpeg-rust/pull/54 landing in a
-# release. When it does, this section and the matching `allow-git` entry in `deny.toml`
-# are deleted together and the requirement above is raised to that release.
+# The fork is the v0.10.13 tag (306a7da0) plus exactly three commits: `set_dct_method`, the
+# warning accessors, and a follow-up that reports warnings from `finish` — libjpeg reads on
+# to the end-of-image marker there and warns about extraneous data before it — and holds the
+# error manager as a raw pointer, because `cinfo.common.err` points into that allocation and
+# a `Box` deref asserts uniqueness over it.
+#
+# Exit condition: both upstream pull requests landing in a release —
+# https://github.com/ImageOptim/mozjpeg-rust/pull/54 (`set_dct_method`) and
+# https://github.com/ImageOptim/mozjpeg-rust/pull/55 (warnings, carrying the follow-up).
+# This section and the `allow-git` entry in `deny.toml` are deleted together once both have.
 [patch.crates-io]
-mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "58f4e0ef91f2a0c477140734ef8b3fe5403befc3" }
+mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "a3effde52b989b6fb93d7fbf854869fa7931e4af" }
