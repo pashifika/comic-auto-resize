@@ -44,4 +44,4 @@ thiserror = "=2.0.20"
 # release. When it does, this section and the matching `allow-git` entry in `deny.toml`
 # are deleted together and the requirement above is raised to that release.
 [patch.crates-io]
-mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "4c4c651e01d35fe7e52cf56a8c64b469821984a0" }
+mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "58f4e0ef91f2a0c477140734ef8b3fe5403befc3" }
