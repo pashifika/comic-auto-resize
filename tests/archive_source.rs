@@ -274,6 +274,51 @@ fn an_entry_whose_recorded_size_exceeds_the_limit_is_refused_without_being_read(
     );
 }
 
+/// An entry that records a modest size and then inflates past the limit is refused too.
+///
+/// This is why the bound on the read survives alongside the check on the recorded size. `zip`
+/// bounds a Stored entry by the size the entry table records, but it hands a Deflate entry to
+/// `flate2` without that bound, so the stream decides how many bytes arrive. An archive of
+/// 66 kilobytes can therefore deliver 64 mebibytes, and the recorded-size check waves it
+/// through because the record is modest.
+///
+/// Costs one buffer past the limit while it runs, which is the smallest fixture that can reach
+/// the branch at all: the limit is what is being tested.
+#[test]
+fn an_entry_that_inflates_past_the_limit_is_refused() {
+    let head = page(8, 8);
+    let mut payload = head.clone();
+    payload.resize(
+        usize::try_from(MAX_ENTRY_BYTES).expect("the limit fits") + 1,
+        0,
+    );
+    let entries = [("page01.jpg", payload)];
+
+    let bytes = framed_archive(
+        &entries,
+        Framing {
+            deflated: true,
+            declared_size: Some(4096),
+            ..Framing::default()
+        },
+    );
+    assert!(
+        (bytes.len() as u64) < MAX_ENTRY_BYTES / 64,
+        "the fixture must be orders of magnitude smaller than what it inflates to: {} B",
+        bytes.len()
+    );
+
+    let error = read_all(&bytes).expect_err("an entry past the limit is refused");
+    assert!(
+        matches!(
+            &error,
+            SourceError::TooLarge { name, limit }
+                if name == "page01.jpg" && *limit == MAX_ENTRY_BYTES
+        ),
+        "expected a size refusal naming the entry and the limit, got {error}"
+    );
+}
+
 /// A malformed entry is named, which the sequential reader could not do: it met the damage
 /// before the name, where the entry table carries every name up front.
 #[test]
