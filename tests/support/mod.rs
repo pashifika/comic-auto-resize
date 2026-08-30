@@ -347,6 +347,103 @@ impl Drop for TempDir {
     }
 }
 
+/// The 7-Zip command-line archiver, or `None` with a message naming what to install.
+///
+/// Unlike rar, 7z has an open writer, so the fixtures need no committed blob and no manual
+/// step — but a machine without `7zz` should say so rather than fail, the way the rar tests
+/// already do. A test that silently does not run is worse than one that says why.
+pub fn seven_zip() -> Option<&'static str> {
+    for program in ["7zz", "7z"] {
+        if std::process::Command::new(program)
+            .arg("i")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            return Some(program);
+        }
+    }
+    eprintln!(
+        "SKIP: no 7-Zip command-line archiver on PATH. Install one (`brew install sevenzip`, \
+         `choco install 7zip`, or your distribution's `p7zip`) to run the 7z tests."
+    );
+    None
+}
+
+/// Writes `files` into a 7z at `archive`, staging them under `staging` first.
+///
+/// `flags` go to `7zz a` before the archive name, which is where the shape of the fixture is
+/// chosen: `-m0=LZMA2:d…` for a dictionary size, `-ms=off` for one block per entry, `-spf`
+/// for a name the archiver would otherwise strip, `-p…` for encryption.
+///
+/// The entry order is 7-Zip's, not this call's: it sorts, so a fixture that needs a stored
+/// order asserts the order `7zz l` reports rather than the order the names were given in.
+pub fn write_seven_zip(archive: &Path, staging: &Path, files: &[(&str, Vec<u8>)], flags: &[&str]) {
+    let program = seven_zip().expect("the caller checked for 7-Zip");
+    write_tree(staging, files);
+
+    // One argument per top-level name, so a subdirectory is added whole and its entries keep
+    // their path prefix.
+    let mut tops: Vec<&str> = files
+        .iter()
+        .map(|(name, _)| name.split('/').next().unwrap_or(name))
+        .collect();
+    tops.sort_unstable();
+    tops.dedup();
+
+    let output = std::process::Command::new(program)
+        .args(["a", "-t7z", "-bso0", "-bsp0"])
+        .args(flags)
+        .arg(archive)
+        .args(&tops)
+        .current_dir(staging)
+        .output()
+        .expect("runs the 7-Zip archiver");
+    assert!(
+        output.status.success(),
+        "{program} a {flags:?} {} {tops:?} failed: {}{}",
+        archive.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Every entry name a 7z holds, in stored order, according to an implementation that is not
+/// the one under test.
+///
+/// Change 1's lesson: a fixture validated only by the reader it was written for cannot
+/// attribute a failure. `7zz l -slt` reports the header's own order.
+pub fn seven_zip_listing(archive: &Path) -> Vec<String> {
+    let program = seven_zip().expect("the caller checked for 7-Zip");
+    let output = std::process::Command::new(program)
+        .args(["l", "-ba", "-slt"])
+        .arg(archive)
+        .output()
+        .expect("runs the 7-Zip archiver");
+    assert!(output.status.success(), "{program} l failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("Path = "))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Writes `files` as a directory tree under `root`, creating the directories each needs.
+///
+/// A name may carry `/` separators; everything before the last one becomes a directory.
+pub fn write_tree(root: &Path, files: &[(&str, Vec<u8>)]) {
+    fs::create_dir_all(root).unwrap_or_else(|error| panic!("{}: {error}", root.display()));
+    for (name, bytes) in files {
+        let path = root.join(name);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .unwrap_or_else(|error| panic!("{}: {error}", parent.display()));
+        }
+        fs::write(&path, bytes).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    }
+}
+
 /// The dimensions a JPEG's start-of-frame header declares.
 ///
 /// Walked by segment length rather than scanned for `FF C0`: a quantisation table entry of
@@ -411,8 +508,11 @@ pub fn corrupt_scan(jpeg: &[u8], offset: usize) -> Vec<u8> {
 /// Every entry of a zip, in stored order, as `(name, bytes)`.
 pub fn read_archive(path: &Path) -> Vec<(String, Vec<u8>)> {
     let bytes = fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    let mut source = comic_auto_resize::source::ZipSource::new(std::io::Cursor::new(bytes))
-        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let mut source = comic_auto_resize::source::ZipSource::new(
+        std::io::Cursor::new(bytes),
+        comic_auto_resize::source::Naming::Stored,
+    )
+    .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let mut entries = Vec::new();
     while let Some(entry) = source.next_entry() {
         let entry = entry.unwrap_or_else(|error| panic!("{}: {error}", path.display()));

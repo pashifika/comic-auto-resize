@@ -79,6 +79,25 @@ and UnRAR's unpacker threads work at all.
 
 Set `CAR_RAR_FIXTURES` to write them somewhere other than `tools/rar-fixtures/`.
 
+### 7z fixtures, if you are touching the 7z reader
+
+Nothing to run. Unlike rar, 7z has an open writer, so `tests/sevenz_source.rs` builds every
+fixture it needs at test time — but it needs a 7-Zip command-line archiver to do it, and skips
+with a message naming what to install when there is none:
+
+```sh
+brew install sevenzip      # macOS, provides `7zz`
+choco install 7zip         # Windows, provides `7z`
+```
+
+Both names are tried, in that order. Both runner images already ship one — 7-Zip 26.02 on
+`windows-2025`, p7zip 17.05 on `macos-15` — and CI asserts it is there rather than trusting
+the image, because a suite that skipped every test is not a suite that passed.
+
+Worth knowing what the fixtures stand in for: `samples/` holds two zips and two rars and no 7z
+at all, so unlike rar — where two real archives caught a dropped page no synthetic fixture
+would have — every 7z claim in this repository rests on an archive `7zz` wrote.
+
 ## Building
 
 ```sh

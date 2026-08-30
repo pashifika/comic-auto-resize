@@ -44,7 +44,7 @@ use unrar_ng::{
     error::{Code, When},
 };
 
-use super::probe::{self, MAGIC_MAX};
+use super::probe::{self, MAGIC_MAX, Names, Naming};
 use super::{Entry, HINT_CEILING, MAX_ENTRY_BYTES, SourceError, is_directory, unsafe_name};
 
 /// An archive being walked once, header by header.
@@ -68,16 +68,23 @@ pub struct RarSource {
     /// Position in the sequence of *yielded* entries, so the writer's key has no gaps where
     /// the archive held something that was not a page.
     next_index: u32,
+    names: Names,
 }
 
 impl RarSource {
     /// Opens the archive at `path`, reading its archive header only.
     ///
+    /// [`Naming::ByPosition`] needs an entry total, and rar is the one format with no entry
+    /// table to read it from, so it costs a second open in List mode. That mode walks headers
+    /// without decoding: measured at 2 ms against a 399 ms read on a solid 95-entry archive,
+    /// under one percent of an end-to-end run. It is taken only when the total is wanted, so
+    /// a default run pays nothing.
+    ///
     /// # Errors
     ///
     /// [`SourceError::UnsafePath`] when `path` holds an interior NUL, and
     /// [`SourceError::Rar`] when the archive header cannot be read.
-    pub fn open(path: &Path) -> Result<Self, SourceError> {
+    pub fn open(path: &Path, naming: Naming) -> Result<Self, SourceError> {
         // Before the path reaches `unrar`, which panics rather than erroring on an interior
         // NUL: `open_for_processing` is documented `# Panics`, via
         // `WideCString::from_os_str(path).expect("Unexpected nul in path")`. A command-line
@@ -87,9 +94,15 @@ impl RarSource {
             return Err(SourceError::UnsafePath);
         }
 
+        let names = match naming {
+            Naming::Stored => Names::stored(),
+            Naming::ByPosition => Names::by_position(count_entries(path)?),
+        };
+
         Ok(Self {
             archive: Some(unrar_ng::Archive::new(path).open_for_processing()?),
             next_index: 0,
+            names,
         })
     }
 
@@ -243,12 +256,31 @@ impl RarSource {
             self.next_index += 1;
             return Some(Ok(Entry {
                 index,
-                name: probe::output_name(&name, declared),
+                name: self.names.of(&name, declared),
                 format: declared,
                 bytes,
             }));
         }
     }
+}
+
+/// How many entries the archive at `path` holds, from a header-only walk.
+///
+/// List mode does not decode, which is what makes this affordable on a solid archive: a
+/// counting pass built on `skip()` would decode every entry to keep the dictionary coherent,
+/// and cost a second full read. Measured on a solid 95-entry RAR 5.0 archive at 2 ms against
+/// a 399 ms read.
+///
+/// The count is entries rather than pages, matching every other format: an exact page count
+/// would make this pass duplicate the extension filter to move a digit in a book of exactly
+/// 100 candidate pages holding one entry that is not a page.
+fn count_entries(path: &Path) -> Result<usize, SourceError> {
+    let mut entries = 0;
+    for header in unrar_ng::Archive::new(path).open_for_listing()? {
+        header?;
+        entries += 1;
+    }
+    Ok(entries)
 }
 
 /// Accumulates an entry, refusing the chunk that would take it past `limit`.

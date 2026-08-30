@@ -5,6 +5,9 @@
 //! this build does not (`--charset`, `--pwd`, `--delete-org`, `-o/--out`, `-r/--ratio`,
 //! `--small-skip`, `--optimizer`, `--progressive`) are absent rather than accepted and
 //! ignored. Absence is the honest form of "not yet".
+//!
+//! `--fix-idx` is the first flag added since the rewrite began, and it is here in the same
+//! Change that implements it, which is that rule read the other way round.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -15,8 +18,8 @@ use clap::Parser;
 use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter};
 use comic_auto_resize::pipeline::{self, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
-use comic_auto_resize::sink::default_output;
-use comic_auto_resize::source::Source;
+use comic_auto_resize::sink::{InputKind, default_output};
+use comic_auto_resize::source::{Naming, Source};
 use thiserror::Error;
 
 /// The largest width a JPEG can express, so the largest worth accepting.
@@ -26,8 +29,8 @@ const MAX_WIDTH: i64 = 65535;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// The comic archive to shrink. A new archive is written beside it, with `_resize`
-    /// appended to the name.
+    /// The comic archive or directory of pages to shrink. A new archive is written beside
+    /// it, with `_resize` appended to the name.
     input: PathBuf,
 
     /// Normalise every page to this width in pixels; the height follows the page's aspect
@@ -56,17 +59,21 @@ struct Cli {
     /// Resize interpolation mode.
     #[arg(long, default_value = Filter::default().name(), value_parser = Filter::NAMES)]
     resize_mode: String,
+
+    /// Rewrite each page's name to carry its own position: the trailing digits of the name
+    /// are replaced by the page's place in read order, restarting at one inside each
+    /// directory, zero-padded to the width the entry total needs. The number the input
+    /// recorded is not consulted and a name with no trailing digits is left alone. Off by
+    /// default; enable it when a viewer orders pages by name rather than numerically.
+    #[arg(long)]
+    fix_idx: bool,
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
-        Ok(pages) => {
-            println!(
-                "{} page(s) written to {}",
-                pages,
-                default_output(&cli.input).display()
-            );
+        Ok((pages, output)) => {
+            println!("{pages} page(s) written to {}", output.display());
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -77,7 +84,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: &Cli) -> Result<u32, CliError> {
+fn run(cli: &Cli) -> Result<(u32, PathBuf), CliError> {
     // Option values were range-checked by the parser, before this point and before the
     // input is opened. The remaining checks are on the input itself.
     let settings = Settings {
@@ -94,30 +101,32 @@ fn run(cli: &Cli) -> Result<u32, CliError> {
             ..EncodeSettings::default()
         },
     };
+    let naming = if cli.fix_idx {
+        Naming::ByPosition
+    } else {
+        Naming::Stored
+    };
 
-    // The input is established as a readable file before anything is opened, so a missing or
-    // wrong input names itself before the output file is created. Which reader runs is
-    // decided by the file's leading bytes, never by its extension: `.cbz` and `.cbr` are
-    // conventions that the tools writing them get mixed up.
+    // The input's *kind* is established before its format, and both before anything is
+    // written: a directory is an input in its own right and has no leading bytes to probe,
+    // while a file's reader is decided by those bytes and never by its extension — `.cbz`
+    // and `.cbr` are conventions that the tools writing them get mixed up.
     //
-    // For zip the entry table is read here too, so a malformed archive fails before the
-    // output is created. No `BufReader`: `by_index` seeks to every entry and `BufReader::seek`
-    // throws its buffer away, so a wrapper would be discarded once a page. The table's own
-    // reads are small and unbuffered — measured at 2 ms for 1000 entries.
-    let metadata = std::fs::metadata(&cli.input).map_err(|source| CliError::Input {
+    // For zip and 7z the header is read here too, so a malformed archive fails before the
+    // output is created; for a directory the listing is made here, so an unreadable tree
+    // does the same. No `BufReader` for zip: `by_index` seeks to every entry and
+    // `BufReader::seek` throws its buffer away, so a wrapper would be discarded once a page.
+    // The table's own reads are small and unbuffered — measured at 2 ms for 1000 entries.
+    let source = Source::open(&cli.input, naming).map_err(|source| CliError::Archive {
         path: cli.input.clone(),
         source,
     })?;
-    if !metadata.is_file() {
-        return Err(CliError::NotAFile {
-            path: cli.input.clone(),
-        });
-    }
-    let source = Source::open(&cli.input).map_err(|source| CliError::Archive {
-        path: cli.input.clone(),
-        source,
-    })?;
-    let output = default_output(&cli.input);
+    let kind = match source {
+        Source::Directory(_) => InputKind::Directory,
+        _ => InputKind::File,
+    };
+    let output = default_output(&cli.input, kind)?;
+
     // A `SourceError` raised during iteration would otherwise reach the user through two
     // transparent wrappers with no path at all, while the same error raised inside
     // `Source::open` arrives as `{path}: {source}`. rar is where that shows: it walks headers
@@ -129,7 +138,7 @@ fn run(cli: &Cli) -> Result<u32, CliError> {
         },
         other => CliError::Run(other),
     })?;
-    Ok(report.pages)
+    Ok((report.pages, output))
 }
 
 /// How many pages are processed at once.
@@ -145,16 +154,14 @@ fn worker_count() -> NonZeroUsize {
 
 #[derive(Debug, Error)]
 enum CliError {
-    #[error("{}: {source}", path.display())]
-    Input {
-        path: PathBuf,
-        source: std::io::Error,
-    },
-    #[error("{}: not a file", path.display())]
-    NotAFile { path: PathBuf },
-    /// `NotZip` is gone with `open_zip`: which formats the build reads is the reader's
-    /// knowledge, so the refusal is `SourceError::NotAnArchive` and names them.
-    /// Named with the path, because the entry table is read when the input is opened and a
+    /// `NotAFile` and `Input` are gone with the `metadata` call that raised them: the input's
+    /// kind is the reader's question now, because a directory is an input and "not a file"
+    /// stopped being the right refusal. Both reach the user through `Archive`, which prefixes
+    /// the path exactly as they did.
+    ///
+    /// `NotZip` went the same way one Change earlier: which formats the build reads is the
+    /// reader's knowledge, so the refusal is `SourceError::NotAnArchive` and names them.
+    /// Named with the path, because a header is read when the input is opened and a
     /// malformed one is a property of the file rather than of an entry.
     #[error("{}: {source}", path.display())]
     Archive {

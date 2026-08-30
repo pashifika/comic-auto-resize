@@ -7,13 +7,17 @@
 //! Trusting the archive's extension while distrusting its entries' would be incoherent.
 //!
 //! A fixed-order slice for the same reason [`probe::CANDIDATES`](super::probe::CANDIDATES) is
-//! one: adding 7z later must not be able to change how rar is found.
+//! one: adding a format later must not be able to change how another is found.
+//!
+//! A directory has no leading bytes and is decided before this module is reached; see
+//! [`Source::open`](super::Source::open).
 
 /// An archive format this build can read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArchiveFormat {
     Zip,
     Rar,
+    SevenZ,
 }
 
 impl ArchiveFormat {
@@ -23,6 +27,7 @@ impl ArchiveFormat {
         match self {
             Self::Zip => "zip",
             Self::Rar => "rar",
+            Self::SevenZ => "7z",
         }
     }
 }
@@ -55,6 +60,11 @@ pub static ARCHIVE_CANDIDATES: &[ArchiveCandidate] = &[
             &[b'R', b'a', b'r', b'!', 0x1A, 0x07, 0x01, 0x00],
             &[b'R', b'a', b'r', b'!', 0x1A, 0x07, 0x00],
         ],
+    },
+    ArchiveCandidate {
+        format: ArchiveFormat::SevenZ,
+        // One fixed prefix, unchanged since the format was published.
+        magic: &[&[b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C]],
     },
 ];
 
@@ -143,9 +153,16 @@ mod tests {
     }
 
     #[test]
+    fn a_7z_signature_is_7z() {
+        assert_eq!(
+            detect(b"7z\xbc\xaf\x27\x1crest"),
+            Some(ArchiveFormat::SevenZ)
+        );
+    }
+
+    #[test]
     fn anything_else_is_nothing() {
         assert_eq!(detect(b"\x89PNG\r\n\x1a\n"), None);
-        assert_eq!(detect(b"7z\xbc\xaf\x27\x1c"), None, "7z is not read yet");
         assert_eq!(detect(b""), None);
     }
 
@@ -154,6 +171,7 @@ mod tests {
     fn a_prefix_of_a_signature_is_not_a_match() {
         assert_eq!(detect(b"PK"), None);
         assert_eq!(detect(b"Rar!"), None);
+        assert_eq!(detect(b"7z\xbc\xaf"), None);
     }
 
     #[test]
@@ -163,6 +181,6 @@ mod tests {
 
     #[test]
     fn the_diagnostic_names_every_format() {
-        assert_eq!(readable_formats(), "zip, rar");
+        assert_eq!(readable_formats(), "zip, rar, 7z");
     }
 }
