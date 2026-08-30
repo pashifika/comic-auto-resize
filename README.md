@@ -11,7 +11,7 @@ and writes a new zip — all in memory, without unpacking to disk.
 | branch | contents |
 |---|---|
 | `master` | The shipped Go implementation, v1.1.2. Frozen; it is the reference the rewrite is measured against. |
-| `main` | The Rust rewrite. Currently a skeleton with CI and repository policy only. |
+| `main` | The Rust rewrite. Carries the JPEG page codec as a library; no working CLI yet. |
 | `dev/2.0.x` | Integration line for the rewrite. |
 
 `master` remains the repository default branch until the rewrite reaches feature parity.
