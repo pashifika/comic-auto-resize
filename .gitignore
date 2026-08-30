@@ -25,6 +25,13 @@ __pycache__/
 # evidence: they are someone's library, so they must never be committed.
 /samples/
 
+# Third-party tools fetched to build fixtures this project cannot write itself. `rar` is
+# RARLAB's proprietary archiver, and it is the only program that can create a RAR archive:
+# UnRAR's licence forbids using its source to re-create the compression algorithm, so no
+# open implementation exists or can. Machine-local, never committed, and never used by CI.
+# `tests/fixtures/make-rar-fixtures.sh` fetches it and says why.
+/tools/
+
 # The machine-global excludes file ignores `AGENTS.md` so that agent scratch files stay
 # out of unrelated repositories. Here it is a tracked symbolic link to `CLAUDE.md` and
 # is part of the repository, so that rule is cancelled.

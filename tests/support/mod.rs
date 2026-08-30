@@ -411,7 +411,7 @@ pub fn corrupt_scan(jpeg: &[u8], offset: usize) -> Vec<u8> {
 /// Every entry of a zip, in stored order, as `(name, bytes)`.
 pub fn read_archive(path: &Path) -> Vec<(String, Vec<u8>)> {
     let bytes = fs::read(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-    let mut source = comic_auto_resize::source::Source::zip(std::io::Cursor::new(bytes))
+    let mut source = comic_auto_resize::source::ZipSource::new(std::io::Cursor::new(bytes))
         .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
     let mut entries = Vec::new();
     while let Some(entry) = source.next_entry() {

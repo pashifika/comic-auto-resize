@@ -53,6 +53,16 @@ mozjpeg-sys = { version = "=2.2.3", default-features = false }
 # Already in the tree through `fast_image_resize`, so it adds no dependency and no new
 # licence: typed page errors the pipeline can branch on, without hand-written `Display`.
 thiserror = "=2.0.20"
+# rar reading, through RARLAB's own UnRAR compiled from vendored C++. Named at its
+# published version and redirected below; `[patch.crates-io]` carries why the fork exists.
+# `default-features = false` drops `linux-batch-extract-utf8`, which defines a cc flag only
+# on non-Apple non-Windows Unix — neither release target — and patches a batch-extract path
+# this crate never calls.
+#
+# `unrar-ng-sys` is deliberately not named here. `mozjpeg-sys` is, because the corruption
+# policy reads its `JWRN_*` constants; there is no equivalent here, and `unsafe_code =
+# "forbid"` means this crate could not call the FFI even if it wanted to.
+unrar-ng = { version = "=0.7.7", default-features = false }
 # Reading needs Deflate; writing uses Stored, because JPEG data does not compress. So one
 # backend, and defaults off to keep `aes-crypto`, `bzip2`, `deflate64`, `lzma`, `ppmd`,
 # `time`, `zstd`, and `xz` out of a binary that cannot invoke them. An entry in one of
@@ -76,3 +86,49 @@ zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate
 # This section and the `allow-git` entry in `deny.toml` are deleted together once both have.
 [patch.crates-io]
 mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "a3effde52b989b6fb93d7fbf854869fa7931e4af" }
+
+# rar, from a fork carrying three commits. Taken out because neither upstream can be relied on
+# to answer in time: `muja/unrar.rs`, the original, has had one commit in sixteen months
+# with twenty issues open, and `ttys3/unrar.rs`, the maintained line this forks, is one
+# person with five stars. Doing the paperwork — this block, the `allow-git` entry, the CI
+# run — before anything was broken is what let the first fix land the same day it was
+# needed.
+#
+# Drift: 3 commits on top of v0.7.7.
+#
+# What it carries:
+#
+# - `DataSink` and `OpenArchive::read_into`, letting the caller's sink abort a read part-way.
+#   Without it `read` accumulates a whole entry into a `Vec` with no way to stop, so
+#   `src/source/rar.rs` could not apply `MAX_ENTRY_BYTES` to the read itself the way
+#   `src/source/zip.rs` does — it could only check the size the archive claims, and a check
+#   that trusts the number it is validating is not a check. libunrar always supported the
+#   abort (`vendor/unrar/rdwrfn.cpp` exits on a callback returning -1 for `UCM_PROCESSDATA`);
+#   only the Rust wrapper's hardcoded 0 stood in the way.
+# - `Send` for the archive handle. `pipeline::run` opens the source before creating the sink
+#   — so a bad archive fails before an output file exists — and then moves it to the reader
+#   thread. Nothing claimed `Send` for a raw `NonNull`, so that move did not compile. This
+#   crate cannot add the impl itself: it declares `unsafe_code = "forbid"`.
+# - Two fixes to the above, found by adversarial review rather than by use. An entry name
+#   longer than 1023 characters came back cut, because `HeaderDataEx::FileNameW` is a fixed
+#   `[wchar_t; 1024]` — which made a page with a deep path vanish from the archive silently,
+#   the one outcome this project refuses. And the `Send` impl was unsound as justified: a
+#   thread sanitiser found races in libunrar's process-wide state, so it now rests on a lock
+#   inside the fork rather than on per-archive ownership.
+#
+# Not offered upstream yet, and that is a decision rather than an omission: contributing to
+# a third party's repository is the maintainer's call, not this Change's. The shape was
+# built to be offerable — a general sink that serves any caller needing to bound or stream,
+# not a `read_bounded(limit)` cut to this project's measurements — so the decision stays
+# open rather than foreclosed.
+#
+# Exit condition: the change stops being needed, which means either this project stops
+# reading rar or an upstream release carries an equivalent abort seam. This block and the
+# `allow-git` entry in `deny.toml` are deleted together.
+#
+# Only `unrar-ng` is patched, and that is measured rather than assumed: it declares
+# `unrar-ng-sys` as a `path` dependency inside the same repository, so the sys crate
+# resolves out of this git checkout too and `Cargo.lock` records both at this revision. A
+# second entry here would be redundant. The pin is by revision because `required-git-spec
+# = "rev"` makes a branch or tag a policy violation, not merely a bad habit.
+unrar-ng = { git = "https://github.com/pashifika/unrar.rs.git", rev = "ca9cb595a9a3fd45c9f2d6eafe76f8610693a5b3" }

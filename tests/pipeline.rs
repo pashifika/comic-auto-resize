@@ -18,7 +18,7 @@ use comic_auto_resize::page::{DecodeSettings, EncodeSettings, Filter, PageErrorK
 use comic_auto_resize::pipeline::{self, Capacities, RunError, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
 use comic_auto_resize::sink::default_output;
-use comic_auto_resize::source::{Source, SourceError};
+use comic_auto_resize::source::{SourceError, ZipSource};
 
 use support::{
     Framing, TempDir, corrupt_scan, framed_archive, jpeg_size, page_bytes, read_archive,
@@ -64,7 +64,7 @@ impl<R: Seek> Seek for Counting<R> {
 
 /// Runs the pipeline over an in-memory archive, writing to `output`.
 fn run(input: &[u8], output: &Path, jobs: usize) -> Result<u32, RunError> {
-    let source = Source::zip(std::io::Cursor::new(input.to_vec()))?;
+    let source = ZipSource::new(std::io::Cursor::new(input.to_vec()))?;
     pipeline::run(source, output, &settings(jobs)).map(|report| report.pages)
 }
 
@@ -212,7 +212,9 @@ fn an_index_addressable_reader_does_not_read_past_the_window() {
     let jobs = NonZeroUsize::new(1).expect("non-zero");
     let window = Capacities::for_jobs(jobs).credits as u64;
     let read = Arc::new(AtomicU64::new(0));
-    let source = Source::zip(Counting {
+    // `ZipSource` directly, which is the reason `pipeline::run` takes `Entries` rather than
+    // `Source`: the enum names `File`, and a `File` cannot be instrumented.
+    let source = ZipSource::new(Counting {
         inner: std::io::Cursor::new(input.clone()),
         read: Arc::clone(&read),
     })
@@ -382,9 +384,19 @@ fn the_binary_refuses_a_missing_input_and_a_non_archive() {
         .expect("runs the binary");
     assert!(!output.status.success());
     let message = String::from_utf8_lossy(&output.stderr);
+    // The spec requires the refusal to name the path *and* the formats this build reads,
+    // because "not a zip archive" stopped being the whole answer when rar arrived.
     assert!(
-        message.contains("not a zip archive"),
+        message.contains("not an archive this build reads"),
         "stderr must say why: {message}"
+    );
+    assert!(
+        message.contains("zip") && message.contains("rar"),
+        "stderr must name the formats this build reads: {message}"
+    );
+    assert!(
+        message.contains(&not_zip.display().to_string()),
+        "stderr must name the path: {message}"
     );
     assert!(!default_output(&not_zip).exists());
 }
