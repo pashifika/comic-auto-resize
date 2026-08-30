@@ -302,14 +302,16 @@ fn fill(reader: &mut impl Read, buffer: &mut [u8]) -> std::io::Result<usize> {
 ///   authoritative count is in the Zip64 end record. That chain is not followed: no book has
 ///   65,535 pages, and a second footer parser is the thing this function exists not to be.
 ///
-/// The search covers the last 65,577 bytes: the record, the longest comment the format allows
-/// before it, and the locator that may precede it, because a record whose preceding bytes
-/// cannot be read is a record whose Zip64 status cannot be established. `zip` searches the
-/// whole file, so an archive with a comment and trailing garbage together running past 65,555
-/// bytes is read by `zip` and not cross-checked here. That archive is not conformant, and the
-/// check exists to catch an archive that lost an entry by accident rather than one built to
-/// lose one — scanning a 300 MB file backwards for a signature would be its own guess about
-/// where to stop.
+/// The search covers the last 65,577 bytes: the locator that may precede the record, the
+/// record, and the longest comment the format allows after it — a record whose preceding bytes
+/// cannot be read is a record whose Zip64 status cannot be established, so the window has to
+/// hold both. Within it a record begins at `65,555 - comment - trailing`, so the count is
+/// established for every conformant archive, whose comment is at most 65,535 bytes with
+/// nothing after it, and given up on when comment and trailing garbage together exceed 65,535.
+/// `zip` searches the whole file, so such an archive is read by `zip` and not cross-checked
+/// here. It is not conformant, and the check exists to catch an archive that lost an entry by
+/// accident rather than one built to lose one — scanning a 300 MB file backwards for a
+/// signature would be its own guess about where to stop.
 fn recorded_entry_count(reader: &mut (impl Read + Seek)) -> std::io::Result<Option<u64>> {
     /// Signature, four `u16` fields, two `u32`, then the comment length: 22 bytes.
     const RECORD: usize = 22;
@@ -351,9 +353,9 @@ fn recorded_entry_count(reader: &mut (impl Read + Seek)) -> std::io::Result<Opti
         let zip64 = match start.checked_sub(LOCATOR) {
             Some(at) => tail[at..at + ZIP64_LOCATOR.len()] == ZIP64_LOCATOR,
             // The bytes before the record are outside the window, so the locator's absence
-            // cannot be established. The window has room for the locator ahead of the longest
-            // comment the format allows, so this is only reachable when a comment and trailing
-            // garbage together run past the window — which no conformant archive does.
+            // cannot be established. The window holds the locator ahead of the longest comment
+            // the format allows, so this needs comment plus trailing garbage over 65,535 —
+            // which no conformant archive has.
             None if base > 0 => return Ok(None),
             None => false,
         };

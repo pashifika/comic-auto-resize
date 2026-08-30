@@ -338,8 +338,10 @@ fn two_entries_stored_under_one_name_are_refused() {
             comment_bytes: usize::from(u16::MAX),
             ..Framing::default()
         },
+        // The shortest comment the window before this one failed on: it reached the record at
+        // `65,535 - comment`, so it lost the locator's bytes from 65,516 upwards.
         Framing {
-            comment_bytes: usize::from(u16::MAX) - 20,
+            comment_bytes: usize::from(u16::MAX) - 19,
             ..Framing::default()
         },
     ] {
