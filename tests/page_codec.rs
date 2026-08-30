@@ -115,6 +115,35 @@ fn lower_quality_produces_a_smaller_file() {
 }
 
 #[test]
+fn entropy_coding_optimisation_is_honoured() {
+    let page = decode("page.jpg", &fixture(), DecodeSettings::default()).expect("decodes");
+
+    // Both baseline, so the scan script cannot confound the comparison: the only
+    // difference between the two is whether the Huffman tables were optimised.
+    let baseline = EncodeSettings {
+        progressive: false,
+        ..EncodeSettings::default()
+    };
+    let optimised = encode("page.jpg", &page, baseline).expect("encodes optimised");
+    let plain = encode(
+        "page.jpg",
+        &page,
+        EncodeSettings {
+            optimize_coding: false,
+            ..baseline
+        },
+    )
+    .expect("encodes unoptimised");
+
+    assert!(
+        optimised.len() < plain.len(),
+        "optimised produced {} bytes, unoptimised produced {}",
+        optimised.len(),
+        plain.len()
+    );
+}
+
+#[test]
 fn progressive_and_baseline_are_both_reachable() {
     let page = decode("page.jpg", &fixture(), DecodeSettings::default()).expect("decodes");
 
