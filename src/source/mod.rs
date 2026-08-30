@@ -457,3 +457,79 @@ pub enum SourceError {
 // wrapper that prepends it — `CliError::Archive` is `{path}: {source}`. Carrying it here too
 // printed it twice. What each variant does name is the thing the caller could not have known,
 // which for an entry is the entry.
+
+#[cfg(test)]
+mod tests {
+    use super::unsafe_name;
+
+    /// The name reaches the *output* archive, so what matters is what an extractor does with
+    /// it — and the two spellings of a separator are both separators, because an archive
+    /// written on Windows uses one and an archive written elsewhere the other.
+    #[test]
+    fn a_page_name_that_stays_where_it_is_put_is_allowed() {
+        for name in [
+            "page1.jpg",
+            "pages/page1.jpg",
+            "pages\\page1.jpg",
+            "v1.2/page1.jpg",
+            // A colon that is not a drive designator names an NTFS alternate data stream,
+            // which stays inside the extraction root. A nuisance, not an escape.
+            "page.jpg:stream",
+            // A single dot is the current directory, not an escape.
+            "./page1.jpg",
+        ] {
+            assert_eq!(unsafe_name(name), None, "{name}");
+        }
+    }
+
+    /// A drive designator makes a Windows path drive-relative, which discards whatever root
+    /// it is pushed onto. Anchored at byte zero, the check missed every nested spelling —
+    /// which is the one an archive would carry, since the outer component looks harmless.
+    ///
+    /// Asserted here rather than only through a 7z fixture because the fixture cannot exist
+    /// on Windows: creating `safe/C:page.jpg` on NTFS makes an alternate data stream of
+    /// `safe\C`, not a file. The rule is platform-independent even though the file is not.
+    #[test]
+    fn a_drive_letter_in_any_component_is_refused() {
+        for name in [
+            "C:page.jpg",
+            "C:/page.jpg",
+            "safe/C:page.jpg",
+            "safe\\C:page.jpg",
+            "a/b/Z:evil.jpg",
+        ] {
+            assert_eq!(
+                unsafe_name(name),
+                Some("the name carries a drive letter"),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_escapes_or_is_absolute_is_refused() {
+        assert_eq!(unsafe_name(""), Some("the name is empty"));
+        assert_eq!(
+            unsafe_name("a\0b.jpg"),
+            Some("the name contains a NUL byte")
+        );
+        assert_eq!(unsafe_name("/abs.jpg"), Some("the name is absolute"));
+        // A UNC prefix, which is absolute on Windows however it reads here.
+        assert_eq!(
+            unsafe_name("\\\\host\\share.jpg"),
+            Some("the name is absolute")
+        );
+        for name in [
+            "../page.jpg",
+            "a/../../b.jpg",
+            ".. /page.jpg",
+            "a/.../b.jpg",
+        ] {
+            assert_eq!(
+                unsafe_name(name),
+                Some("the name escapes its own directory"),
+                "{name}"
+            );
+        }
+    }
+}

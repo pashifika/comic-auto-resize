@@ -201,6 +201,13 @@ fn a_traversing_stored_name_is_refused_rather_than_sanitised() {
 
 /// A drive letter in a *nested* component is a Windows drive-relative path, so pushing it
 /// onto an extraction root discards the root. A check anchored at byte zero let it through.
+///
+/// Unix only, and not because the rule is: creating `safe/C:page.jpg` on NTFS makes an
+/// alternate data stream of `safe\C` rather than a file, so the *fixture* cannot exist on the
+/// platform the refusal protects. `source::tests::a_drive_letter_in_any_component_is_refused`
+/// asserts the rule everywhere; this asserts that a real archive carrying such a name reaches
+/// it.
+#[cfg(unix)]
 #[test]
 fn a_drive_letter_in_a_nested_component_is_refused() {
     if seven_zip().is_none() {
