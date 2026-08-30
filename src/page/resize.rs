@@ -191,7 +191,50 @@ fn sinc(x: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use fast_image_resize::{FilterType, ResizeAlg};
+
     use super::{Filter, height_for_width, lanczos2, sinc};
+
+    #[test]
+    fn each_filter_maps_to_the_algorithm_the_design_names() {
+        assert_eq!(Filter::NearestNeighbor.resize_alg(), ResizeAlg::Nearest);
+        assert_eq!(
+            Filter::Bilinear.resize_alg(),
+            ResizeAlg::Convolution(FilterType::Bilinear)
+        );
+        // The bicubic the Go implementation means, not `Mitchell`.
+        assert_eq!(
+            Filter::Bicubic.resize_alg(),
+            ResizeAlg::Convolution(FilterType::CatmullRom)
+        );
+        assert_eq!(
+            Filter::MitchellNetravali.resize_alg(),
+            ResizeAlg::Convolution(FilterType::Mitchell)
+        );
+        assert_eq!(
+            Filter::Lanczos3.resize_alg(),
+            ResizeAlg::Convolution(FilterType::Lanczos3)
+        );
+    }
+
+    #[test]
+    fn lanczos2_reaches_the_resizer_as_a_custom_kernel_of_support_two() {
+        let ResizeAlg::Convolution(FilterType::Custom(kernel)) = Filter::Lanczos2.resize_alg()
+        else {
+            panic!("lanczos2 must reach the resizer as a custom convolution kernel");
+        };
+
+        // The spec forbids approximating it with `Lanczos3` or `Bilinear`, both of which
+        // would arrive here as a named variant rather than as `Custom`.
+        assert_eq!(kernel.name(), "Lanczos2");
+        // The radius is stored verbatim by `Filter::new`, so a one-ULP window is the
+        // strictest form this can take without tripping `clippy::float_cmp`.
+        assert!(
+            (kernel.support() - 2.0).abs() < f64::EPSILON,
+            "support was {}, not 2.0",
+            kernel.support()
+        );
+    }
 
     #[test]
     fn every_advertised_name_parses() {
