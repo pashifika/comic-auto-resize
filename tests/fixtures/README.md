@@ -5,7 +5,8 @@
 Generated in this repository, not taken from anywhere, so its provenance is unambiguous
 and no licence question arises.
 
-- 160 x 240, greyscale content in three RGB bands, produced by `banded(160, 240)` in
+- 160 x 240, greyscale content in three RGB bands, produced by
+  `banded(160, 240, Channels::Rgb)` in
   `tests/page_codec.rs`: hard black-on-white vertical edges over the top third, a
   horizontal gradient across the middle, and a flat mid-grey across the bottom. Those are
   the three things manga content stresses — line art, screentone, and empty page.
@@ -15,6 +16,8 @@ and no licence question arises.
   not merely reading back its own output: macOS `sips` and `file(1)` both report a valid
   progressive JPEG, 160x240, three components.
 
-To regenerate it, encode `banded(160, 240)` with `EncodeSettings::default()` and write the
-bytes here. The output is not expected to be byte-identical across mozjpeg releases, so
-replace the file wholesale rather than expecting a clean diff.
+To regenerate it, encode `banded(160, 240, Channels::Rgb)` with `EncodeSettings::default()`
+and write the bytes here. The output is not expected to be byte-identical across mozjpeg
+releases, so replace the file wholesale rather than expecting a clean diff. Quality 90 is
+also the range where the encoder's forced-baseline quantisation is byte-identical to
+`Compress::set_quality`, so this file is unchanged by that fix.

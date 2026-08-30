@@ -260,13 +260,49 @@ jobs:
       # `mozjpeg-sys` assembles its x86 SIMD kernels with nasm, and `repo-bootstrap`
       # established that this image does not ship it. Installed before the first cargo
       # invocation, because the fallback is a silent one.
+      #
+      # Pinned by content, to the standard every other third-party input here already
+      # meets: the package is fetched by exact version, its bytes are checked against the
+      # SHA-512 recorded below, and only then handed to Chocolatey from a local source.
+      # Chocolatey has no flag that pins a package's own digest -- `--checksum*` covers
+      # only files a package downloads while installing, and this package embeds the NASM
+      # installers -- so the digest is verified here rather than delegated.
+      #
+      # To bump: read the new version and its `d:PackageHash` from the community feed
+      # (`https://community.chocolatey.org/api/v2/FindPackagesById()?id='nasm'`; the hash
+      # is base64 SHA-512, so convert it to hex), and set NASM_VERSION to the version
+      # `nasm -v` prints -- Chocolatey renders NASM's own `3.02` as the three-part `3.2.0`.
       - name: Provision nasm
         shell: bash
         timeout-minutes: 10
+        env:
+          NASM_PACKAGE_VERSION: 3.2.0
+          NASM_VERSION: "3.02"
+          # sha512 of nasm.3.2.0.nupkg, as published by the community feed. Its embedded
+          # `nasm-3.02-installer-x64.exe` is byte-identical to NASM's own win64 release
+          # build for 3.02 (sha256 0ddb40310861eb29f4d649feb9466779982a2d251c0db2b9cf0d21cf591171f3),
+          # so pinning the package digest pins the upstream installer too.
+          NASM_NUPKG_SHA512: 78a722fac25a736929a1171bf6bb9a54fa3e373532b114ab364f7479e15663b50749a89d1c0b54367125eb2d73f7c616487a5745fae5ea06d41480ec8f95ca88
         run: |
           set -euo pipefail
 
-          choco install nasm --yes --no-progress
+          package_dir="$(cygpath --unix "${RUNNER_TEMP}")/nasm-package"
+          mkdir -p "${package_dir}"
+          nupkg="${package_dir}/nasm.${NASM_PACKAGE_VERSION}.nupkg"
+
+          curl --fail --silent --show-error --location --output "${nupkg}" \
+            "https://community.chocolatey.org/api/v2/package/nasm/${NASM_PACKAGE_VERSION}"
+          printf '%s  %s\n' "${NASM_NUPKG_SHA512}" "${nupkg}" | sha512sum --check --strict -
+
+          # `--force --allow-downgrade` so the verified package is the one that lands.
+          # Without them, a runner image that later preinstalls this same Chocolatey
+          # package makes `choco install` a no-op, and a newer preinstalled version makes
+          # it a refused downgrade: either way the digest check above would pass on bytes
+          # nothing then uses, and the version assertion below would accept an
+          # unverified binary that happens to self-report the pinned version.
+          choco install nasm --yes --no-progress --force --allow-downgrade \
+            --version "${NASM_PACKAGE_VERSION}" \
+            --source "$(cygpath --windows "${package_dir}")"
 
           # Chocolatey's package does not put nasm on PATH, so the directory is exported
           # for the later steps rather than assumed to already be there.
@@ -278,9 +314,17 @@ jobs:
             echo "::error::nasm is absent after installation; mozjpeg-sys would drop SIMD"
             exit 1
           fi
+
+          # The digest authenticates the package; this authenticates what PATH resolves
+          # to, so some other nasm earlier in PATH cannot quietly assemble the kernels.
+          installed="$(nasm -v | tr -d '\r' | sed -n 's/^NASM version \([^ ]*\).*$/\1/p')"
+          if [ "${installed}" != "${NASM_VERSION}" ]; then
+            echo "::error::expected NASM ${NASM_VERSION} on PATH but found '${installed:-unknown}'"
+            exit 1
+          fi
           nasm -v
 
-      - name: Build mozjpeg and confirm SIMD survived
+      - name: Build mozjpeg and confirm debug SIMD survived
         shell: bash
         timeout-minutes: 20
         run: |
@@ -293,6 +337,10 @@ jobs:
           # when its assembler is missing, which is easy to miss in an otherwise green
           # run. `WITH_SIMD` reaches the generated `jconfig.h` on the SIMD path alone, so
           # the outcome is asserted rather than the tool that produces it.
+          #
+          # Build-script output is per-profile, so this covers the compilation that the
+          # lint and test steps below link, and nothing else. The release profile is a
+          # separate compilation and is asserted separately, after it is built.
           configs=(target/debug/build/mozjpeg-sys-*/out/include/jconfig.h)
           if [ "${#configs[@]}" -eq 0 ]; then
             echo "::error::mozjpeg-sys produced no jconfig.h; its build script did not run"
@@ -317,10 +365,32 @@ jobs:
         timeout-minutes: 15
         run: cargo test --locked --all-features
 
-      - name: Build the release binary
+      # The debug assertion above says nothing about this compilation: `--release` builds
+      # `mozjpeg-sys` again, into its own build-script output directory, and that is the
+      # one the shipped artifact links. Asserted here, on the back of a build that already
+      # happens, so the guarantee costs no third compilation of the C library.
+      - name: Build the release binary and confirm release SIMD survived
         shell: bash
         timeout-minutes: 15
-        run: cargo build --locked --release
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          cargo build --locked --release
+
+          configs=(target/release/build/mozjpeg-sys-*/out/include/jconfig.h)
+          if [ "${#configs[@]}" -eq 0 ]; then
+            echo "::error::the release build produced no mozjpeg-sys jconfig.h; its build script did not run"
+            exit 1
+          fi
+
+          for config in "${configs[@]}"; do
+            if ! grep -q 'define WITH_SIMD 1' "${config}"; then
+              echo "::error::${config} has no WITH_SIMD; the shipped release links jsimd_none.c"
+              exit 1
+            fi
+            echo "mozjpeg-sys: WITH_SIMD confirmed in ${config}"
+          done
 
   macos:
     name: macos
@@ -374,7 +444,7 @@ jobs:
           set -euo pipefail
           cc --version
 
-      - name: Build mozjpeg and confirm SIMD survived
+      - name: Build mozjpeg and confirm debug SIMD survived
         timeout-minutes: 20
         run: |
           set -euo pipefail
@@ -383,7 +453,8 @@ jobs:
           cargo build --locked -p mozjpeg-sys
 
           # Same assertion as the windows job, for the same reason: the fallback to
-          # `jsimd_none.c` costs performance and announces itself only as a warning.
+          # `jsimd_none.c` costs performance and announces itself only as a warning. Also
+          # per-profile, so it covers only what lint and test link.
           configs=(target/debug/build/mozjpeg-sys-*/out/include/jconfig.h)
           if [ "${#configs[@]}" -eq 0 ]; then
             echo "::error::mozjpeg-sys produced no jconfig.h; its build script did not run"
@@ -406,9 +477,29 @@ jobs:
         timeout-minutes: 15
         run: cargo test --locked --all-features
 
-      - name: Build the release binary
+      # Same reason as the windows job: `--release` is a second compilation of
+      # `mozjpeg-sys` with its own build-script output, and it is the one that ships.
+      - name: Build the release binary and confirm release SIMD survived
         timeout-minutes: 15
-        run: cargo build --locked --release
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          cargo build --locked --release
+
+          configs=(target/release/build/mozjpeg-sys-*/out/include/jconfig.h)
+          if [ "${#configs[@]}" -eq 0 ]; then
+            echo "::error::the release build produced no mozjpeg-sys jconfig.h; its build script did not run"
+            exit 1
+          fi
+
+          for config in "${configs[@]}"; do
+            if ! grep -q 'define WITH_SIMD 1' "${config}"; then
+              echo "::error::${config} has no WITH_SIMD; the shipped release links jsimd_none.c"
+              exit 1
+            fi
+            echo "mozjpeg-sys: WITH_SIMD confirmed in ${config}"
+          done
 
   # The single required status context. Every ruleset names this job and no other, so a
   # change that adds a job extends the `needs` list below and touches no repository
