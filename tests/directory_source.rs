@@ -145,7 +145,15 @@ fn the_chosen_order_does_not_depend_on_the_hosts_locale() {
         ));
     }
 
+    // Which order, not merely that the four agree: a wrong-but-stable order would satisfy
+    // agreement alone. Upper case sorts before lower case because everything that is not a
+    // digit compares byte-wise, and `äpfel3` last because its first byte is above ASCII.
     let (first_locale, first) = &orders[0];
+    assert_eq!(
+        first,
+        &["Page2.jpg", "Page10.jpg", "page1.jpg", "äpfel3.jpg"],
+        "the order itself changed under {first_locale}"
+    );
     for (locale, order) in &orders[1..] {
         assert_eq!(
             order, first,
@@ -265,6 +273,75 @@ fn a_symbolic_link_that_escapes_the_input_is_refused() {
     let message = error_text(&root);
     assert!(message.contains("page2.jpg"), "{message}");
     assert!(message.contains("symbolic link"), "{message}");
+}
+
+/// The rule is broader than "a link that escapes", and the breadth is the point: not
+/// following a link means the walk cannot tell a link to a page from a link to a chapter of
+/// them, so a link *inside* the input is refused for the same reason one pointing outside is.
+/// A user with a `latest -> ch3` convenience link gets a named error rather than a book that
+/// is quietly missing a chapter.
+#[cfg(unix)]
+#[test]
+fn a_symbolic_link_that_does_not_escape_is_refused_too() {
+    let scratch = TempDir::new("dir-symlink-inside");
+    let root = scratch.join("vol1");
+    write_tree(&root, &[("ch1/page1.jpg", page(30))]);
+    std::os::unix::fs::symlink(root.join("ch1"), root.join("latest")).expect("links");
+
+    let message = error_text(&root);
+    assert!(message.contains("latest"), "{message}");
+    assert!(message.contains("symbolic link"), "{message}");
+}
+
+/// A fifo named like a page would block `File::open` until a writer appeared. `Source::open`
+/// already refuses one as an *input*; a child of a directory input reaches the same open and
+/// needs the same refusal, before it is opened rather than while it hangs.
+#[cfg(unix)]
+#[test]
+fn something_that_is_not_a_regular_file_is_refused_before_it_is_opened() {
+    let scratch = TempDir::new("dir-fifo");
+    let root = scratch.join("vol1");
+    write_tree(&root, &[("page1.jpg", page(30))]);
+
+    let fifo = root.join("page2.jpg");
+    let status = Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("runs mkfifo");
+    assert!(status.success(), "the fixture needs a fifo");
+
+    let message = error_text(&root);
+    assert!(message.contains("page2.jpg"), "{message}");
+    assert!(message.contains("not a regular file"), "{message}");
+}
+
+/// The listing runs at open and each page is read later, so a tree the tool does not own can
+/// change in between. The file type is re-checked immediately before the open, which narrows
+/// the window to a syscall rather than the length of the run — a page swapped for a link
+/// after listing is refused rather than read from outside the input.
+#[cfg(unix)]
+#[test]
+fn a_page_swapped_for_a_link_after_listing_is_refused_rather_than_read() {
+    let scratch = TempDir::new("dir-swap");
+    let outside = scratch.join("outside.jpg");
+    std::fs::write(&outside, page(40)).expect("writes");
+
+    let root = scratch.join("vol1");
+    write_tree(&root, &[("page1.jpg", page(30)), ("page2.jpg", page(31))]);
+
+    // Listed as two regular files, then the second becomes a link before it is read.
+    let mut source = Source::open(&root, Naming::Stored).expect("opens");
+    let first = source.next_entry().expect("a page").expect("reads");
+    assert_eq!(first.name, "page1.jpg");
+
+    std::fs::remove_file(root.join("page2.jpg")).expect("removes");
+    std::os::unix::fs::symlink(&outside, root.join("page2.jpg")).expect("links");
+
+    let error = source
+        .next_entry()
+        .expect("a second item")
+        .expect_err("the swapped page must be refused");
+    assert!(matches!(error, SourceError::SymbolicLink { .. }), "{error}");
 }
 
 // ---------------------------------------------------------------- output naming

@@ -132,6 +132,26 @@ impl DirectorySource {
         } = page;
         let declared = *declared;
 
+        // Re-checked here, not only in the walk. The listing runs at open and this runs a
+        // page later, so a tree the tool does not own can change in between: a page can
+        // become a symbolic link to something outside the input, and `File::open` follows
+        // one. `symlink_metadata` does not, so the swap has to land between this call and the
+        // open below rather than anywhere in the run — narrowed to a syscall, not closed.
+        // Closing it needs `O_NOFOLLOW`, which needs a platform crate on both targets; the
+        // residual is recorded in `archive-source` rather than left to be discovered.
+        let kind = std::fs::symlink_metadata(path)
+            .map_err(|source| SourceError::Entry {
+                name: name.clone(),
+                source,
+            })?
+            .file_type();
+        if kind.is_symlink() {
+            return Err(SourceError::SymbolicLink { name: name.clone() });
+        }
+        if !kind.is_file() {
+            return Err(SourceError::NotAPage { name: name.clone() });
+        }
+
         let mut file = File::open(path).map_err(|source| SourceError::Entry {
             name: name.clone(),
             source,
@@ -211,12 +231,27 @@ impl DirectorySource {
 /// `prefix` is the entry-name prefix for this level, already ending in `/` when it is not
 /// empty, so a name is built by concatenation rather than by path arithmetic.
 fn walk(directory: &Path, prefix: &str, pages: &mut Vec<Page>) -> Result<(), SourceError> {
+    // Every failure below names the entry it happened at rather than the input root. `main`
+    // prefixes the input path, so a bare `Input` error would print `~/books/vol1: Permission
+    // denied` for an unreadable `~/books/vol1/ch3/private` and name a directory that reads
+    // fine. `walk` holds the prefix, so the name is already in hand.
+    let here = || {
+        if prefix.is_empty() {
+            ".".to_owned()
+        } else {
+            prefix.trim_end_matches('/').to_owned()
+        }
+    };
     let mut children = Vec::new();
-    let listing = directory
-        .read_dir()
-        .map_err(|source| SourceError::Input { source })?;
+    let listing = directory.read_dir().map_err(|source| SourceError::Entry {
+        name: here(),
+        source,
+    })?;
     for child in listing {
-        let child = child.map_err(|source| SourceError::Input { source })?;
+        let child = child.map_err(|source| SourceError::Entry {
+            name: here(),
+            source,
+        })?;
         let raw = child.file_name();
         // Generalises Go's `.git` case: a dot-name is machinery rather than a page, and
         // descending into one would put `.DS_Store` and `.git` objects in the listing. Read
@@ -236,9 +271,10 @@ fn walk(directory: &Path, prefix: &str, pages: &mut Vec<Page>) -> Result<(), Sou
         };
         // `file_type` on a `DirEntry` does not follow a link, which is the whole point: a
         // link's target may sit outside the input entirely.
-        let kind = child
-            .file_type()
-            .map_err(|source| SourceError::Input { source })?;
+        let kind = child.file_type().map_err(|source| SourceError::Entry {
+            name: format!("{prefix}{name}"),
+            source,
+        })?;
         children.push((name, child.path(), kind));
     }
 
@@ -264,6 +300,14 @@ fn walk(directory: &Path, prefix: &str, pages: &mut Vec<Page>) -> Result<(), Sou
         let Some(declared) = probe::declared_format(&entry_name) else {
             continue;
         };
+        // Only a regular file is a page. `Source::open` refuses a fifo, a socket and a device
+        // as an *input* because opening a fifo blocks until a writer appears; a child of a
+        // directory input reaches the same `File::open` and needs the same refusal. Named
+        // rather than passed over: the extension claimed it was a page, so it is a page this
+        // run cannot read rather than a file this run has no interest in.
+        if !kind.is_file() {
+            return Err(SourceError::NotAPage { name: entry_name });
+        }
         if let Some(reason) = unsafe_name(&entry_name) {
             return Err(SourceError::UnsafeName {
                 name: entry_name,

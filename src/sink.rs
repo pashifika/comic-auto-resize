@@ -247,32 +247,29 @@ pub enum InputKind {
 /// `.`, `..` and `/` are. Resolved against the filesystem first, so `.` names the directory
 /// the user is standing in rather than nothing.
 pub fn default_output(input: &Path, kind: InputKind) -> Result<PathBuf, RunError> {
-    let mut name = match kind {
-        // Nothing to remove, because a directory has no extension.
-        InputKind::Directory => directory_name(input)?,
-        InputKind::File => input.file_stem().unwrap_or_default().to_os_string(),
+    let (base, mut name) = match kind {
+        InputKind::Directory => {
+            // Resolved once, not once per use: two `canonicalize` calls are two chances to
+            // disagree if the tree moves between them. Nothing to remove from the name
+            // either, because a directory has no extension.
+            let base = resolved(input)?;
+            let name = base
+                .file_name()
+                .map(std::ffi::OsString::from)
+                .ok_or_else(|| RunError::UnnamedInput {
+                    path: input.to_path_buf(),
+                })?;
+            (base, name)
+        }
+        InputKind::File => (
+            input.to_path_buf(),
+            input.file_stem().unwrap_or_default().to_os_string(),
+        ),
     };
     name.push("_resize.zip");
-
-    match kind {
-        // Beside the directory rather than in it: `with_file_name` replaces the last
-        // component, which for `/books/vol1` is `vol1` and gives `/books/vol1_resize.zip`.
-        InputKind::Directory => Ok(resolved(input)?.with_file_name(name)),
-        InputKind::File => Ok(input.with_file_name(name)),
-    }
-}
-
-/// The directory's own name, resolving the path when it has none of its own.
-fn directory_name(input: &Path) -> Result<std::ffi::OsString, RunError> {
-    if let Some(name) = input.file_name() {
-        return Ok(name.to_os_string());
-    }
-    resolved(input)?
-        .file_name()
-        .map(std::ffi::OsString::from)
-        .ok_or_else(|| RunError::UnnamedInput {
-            path: input.to_path_buf(),
-        })
+    // Beside the input rather than in it: `with_file_name` replaces the last component,
+    // which for `/books/vol1` is `vol1` and gives `/books/vol1_resize.zip`.
+    Ok(base.with_file_name(name))
 }
 
 /// `input` with `.`, `..` and any link resolved away, so it has a last component to work

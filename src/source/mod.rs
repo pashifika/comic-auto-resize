@@ -283,8 +283,21 @@ pub(crate) fn unsafe_name(name: &str) -> Option<&'static str> {
     }
     // A drive letter (`C:\…`) or a UNC prefix (`\\host\share`), which are absolute on
     // Windows however the leading characters read on a unix host.
-    let bytes = name.as_bytes();
-    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+    //
+    // Checked per component, not just at the start, and that is the whole point: Windows
+    // parses `safe/C:page.jpg` as a *drive-relative* path, so pushing it onto an extraction
+    // root discards the root. A check anchored at byte zero lets exactly that through, which
+    // is a name escaping the directory it was extracted into by a second spelling. The `..`
+    // check below has always been per component; this one now matches it.
+    //
+    // A colon elsewhere in a component is *not* refused. `page.jpg:stream` names an NTFS
+    // alternate data stream, which is a nuisance rather than an escape — it stays inside the
+    // extraction root — and refusing every colon would refuse names that are ordinary on the
+    // filesystem the archive came from.
+    if name.split(['/', '\\']).any(|component| {
+        let bytes = component.as_bytes();
+        bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
+    }) {
         return Some("the name carries a drive letter");
     }
     // A component that escapes, in every spelling that resolves to one. Windows strips
@@ -398,6 +411,19 @@ pub enum SourceError {
     /// kind to be handed.
     #[error("the 7z decoder stopped unexpectedly")]
     SevenZPanicked,
+    /// A 7z block declares more decoder working memory than this build will allocate. The
+    /// size is the archive's choice and the format lets it reach 4 GiB; the dependency's own
+    /// guard cannot fire and exposes no knob, so the ceiling is applied from the header
+    /// before any block is decoded.
+    #[error(
+        "the archive asks for a {declared}-byte decoder dictionary, more than the limit of {limit} bytes"
+    )]
+    Dictionary { declared: u64, limit: u64 },
+    /// A directory holds something with a page's extension that is not a regular file — a
+    /// fifo, a socket, a device. Refused rather than opened: opening a fifo blocks until a
+    /// writer appears, and `Source::open` already refuses the same three as an *input*.
+    #[error("{name}: refusing the entry because it is not a regular file")]
+    NotAPage { name: String },
     /// A symbolic link inside a directory input. Not followed — its target may sit outside
     /// the input entirely — and refused rather than passed over, because the walk cannot
     /// tell a link to a page from a link to a chapter of them without resolving it, and a

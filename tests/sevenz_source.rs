@@ -199,6 +199,103 @@ fn a_traversing_stored_name_is_refused_rather_than_sanitised() {
     );
 }
 
+/// A drive letter in a *nested* component is a Windows drive-relative path, so pushing it
+/// onto an extraction root discards the root. A check anchored at byte zero let it through.
+#[test]
+fn a_drive_letter_in_a_nested_component_is_refused() {
+    if seven_zip().is_none() {
+        return;
+    }
+    let directory = TempDir::new("sevenz-nested-drive");
+    let staging = directory.join("staging");
+    support::write_tree(&staging, &[("safe/C:page.jpg", page(30))]);
+
+    let archive = directory.join("nested-drive.7z");
+    write_seven_zip(&archive, &staging, &[("safe/C:page.jpg", page(30))], &[]);
+
+    // 7-Zip stores the `safe` directory as its own entry; the page is the one that matters.
+    assert!(
+        seven_zip_listing(&archive)
+            .iter()
+            .any(|name| name.replace('\\', "/") == "safe/C:page.jpg"),
+        "the fixture does not store the nested drive component this test depends on: {:?}",
+        seven_zip_listing(&archive)
+    );
+
+    let message = error_text(&archive);
+    assert!(message.contains("drive letter"), "{message}");
+}
+
+/// `--fix-idx` against 7z, the one format whose entry total is read off a field rather than a
+/// method: `reader.archive().files.len()`.
+#[test]
+fn renumbering_takes_its_width_from_the_7z_entry_table() {
+    let files = [
+        ("cover.jpg", page(30)),
+        ("ch1/page7.jpg", page(31)),
+        ("ch1/page8.jpg", page(32)),
+        ("ch2/page9.jpg", page(33)),
+    ];
+    with_archive("sevenz-renumber", &files, &[], |archive| {
+        let mut source = Source::open(archive, Naming::ByPosition).expect("opens");
+        let mut names = Vec::new();
+        while let Some(entry) = source.next_entry() {
+            names.push(entry.expect("reads").name);
+        }
+        // Five entries — four files and the `ch1`/`ch2` directory entries 7-Zip stores —
+        // so one digit, positions in read order, and `ch2` restarting at one.
+        assert_eq!(
+            names,
+            [
+                "ch1/page_1.jpg",
+                "ch1/page_2.jpg",
+                "ch2/page_1.jpg",
+                "cover.jpg",
+            ]
+        );
+    });
+}
+
+/// Every item the source produces, errors included, so a reader that keeps going after it has
+/// failed is visible rather than hidden behind an early return.
+fn read_every(path: &Path) -> Vec<Result<Entry, SourceError>> {
+    let mut source = Source::open(path, Naming::Stored).expect("opens");
+    let mut items = Vec::new();
+    while let Some(item) = source.next_entry() {
+        items.push(item);
+    }
+    items
+}
+
+/// The callback's `Ok(false)` ends one *block*, not the walk: `ArchiveReader::for_each_entries`
+/// discards the boolean its block decoder returns and starts the next block. So a reader that
+/// stops that way carries on producing after it has already failed — and on a hostile archive
+/// it decodes every remaining block into a sink first.
+///
+/// Two blocks, one entry each (`-ms=off`). Block 0 holds a mismatch, block 1 holds a good
+/// page. A reader that really stops offers one item; one that only ended a block offers the
+/// page as well, after the run was already over.
+#[test]
+fn an_error_stops_the_walk_across_blocks_not_only_within_one() {
+    let files = [
+        (
+            "a_bad.jpg",
+            b"this is not a JPEG, whatever the name says".to_vec(),
+        ),
+        ("b_page.jpg", page(31)),
+    ];
+    with_archive("sevenz-cross-block", &files, &["-ms=off"], |archive| {
+        let items = read_every(archive);
+        assert_eq!(
+            items.len(),
+            1,
+            "the walk produced {} items after failing: {items:?}",
+            items.len()
+        );
+        assert!(matches!(items[0], Err(SourceError::Mismatch { .. })));
+    });
+}
+
 /// Nothing is unpacked to disk: the archive is decoded through a reader, never extracted.
 #[test]
 fn reading_a_7z_writes_nothing_to_disk() {

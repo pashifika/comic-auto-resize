@@ -48,6 +48,25 @@
 //! Recorded rather than worked around: driving `BlockDecoder` per block to fix the order would
 //! stop visiting those entries at all, which turns a late refusal into a page silently missing
 //! from the book.
+//!
+//! # What this module bounds, and what it cannot
+//!
+//! Two allocations in a 7z read are sized by numbers the archive chooses, and only one of
+//! them is reachable from here.
+//!
+//! The LZMA2 dictionary is: the size is in the header the crate has already parsed when
+//! `ArchiveReader::new` returns, so [`MAX_DICTIONARY_BYTES`] is applied to it before a single
+//! block is decoded. The crate's own guard cannot help — `MAX_MEM_LIMIT_KB` is
+//! `usize::MAX / 1024` — and it exposes no knob, so the ceiling lives here.
+//!
+//! The header's own parse is not. An encoded header is decompressed into a `Vec` bounded by
+//! the archive's declared unpack size, and the entry table is then an infallible
+//! `vec![ArchiveEntry::default(); num_files]` — both inside `Archive::read`, before any code
+//! here runs, with no maximum-entry or maximum-header knob to set. A padded, highly
+//! compressible header is therefore small on disk and large in memory. Recorded rather than
+//! forked around: `AGENTS.md` records what maintaining a fork of a reader cost the Go
+//! implementation, and the fix belongs upstream. The residual is a hostile archive making
+//! this process allocate at parse time; an ordinary one is unaffected.
 
 use std::io::{self, Read};
 use std::thread::JoinHandle;
@@ -71,6 +90,55 @@ pub struct SevenZSource {
     decoder: Option<JoinHandle<()>>,
 }
 
+/// The largest LZMA or LZMA2 dictionary this build lets an archive ask for.
+///
+/// The size is the *archive's* choice, and the format lets it be 4 GiB: an LZMA2 property
+/// byte of 40 means `0xFFFF_FFFF`. `sevenz-rust2` has a guard for this and it cannot fire —
+/// `MAX_MEM_LIMIT_KB` is `usize::MAX / 1024` — and it exposes no knob to lower, so the ceiling
+/// is applied here from the header the crate already parsed, before a single block is decoded.
+///
+/// 256 MiB, and the figure is bounded from both sides rather than picked. Below it: a typical
+/// archive measured at 32 MiB, and an archive written with `-m0=LZMA2:d128m` at 96 MiB, which
+/// is what 7-Zip clamps that request to on a 72 MB input; the largest dictionary any `-mx`
+/// preset selects is 64 MiB. Above it: the 4 GiB the format allows, which is the allocation
+/// this exists to refuse. An archive written with a deliberately larger dictionary is refused
+/// by name rather than by an allocator.
+pub const MAX_DICTIONARY_BYTES: u64 = 256 << 20;
+
+/// The largest dictionary any block declares, when that exceeds [`MAX_DICTIONARY_BYTES`].
+///
+/// Read off the coder properties the header already carries, decoded the way the crate's own
+/// `get_lzma2_dic_size` and `get_lzma_dic_size` decode them. A property field this does not
+/// recognise is left to the crate, which is the only party that can say what it means.
+fn oversized_dictionary(archive: &sevenz_rust2::Archive) -> Option<u64> {
+    archive
+        .blocks
+        .iter()
+        .flat_map(|block| &block.coders)
+        .filter_map(|coder| {
+            let properties = coder.properties();
+            match coder.encoder_method_id() {
+                // One byte: `(2 | (bits & 1)) << (bits / 2 + 11)`, saturating at 4 GiB.
+                sevenz_rust2::EncoderMethod::ID_LZMA2 => {
+                    let bits = u32::from(*properties.first()?);
+                    match bits {
+                        41.. => None,
+                        40 => Some(u64::from(u32::MAX)),
+                        _ => Some(u64::from((2 | (bits & 1)) << (bits / 2 + 11))),
+                    }
+                }
+                // Five bytes: one property byte, then the size as a little-endian `u32`.
+                sevenz_rust2::EncoderMethod::ID_LZMA => {
+                    let field: [u8; 4] = properties.get(1..5)?.try_into().ok()?;
+                    Some(u64::from(u32::from_le_bytes(field)))
+                }
+                _ => None,
+            }
+        })
+        .max()
+        .filter(|&declared| declared > MAX_DICTIONARY_BYTES)
+}
+
 impl SevenZSource {
     /// Opens `file` as a 7z archive, reading its header.
     ///
@@ -80,7 +148,9 @@ impl SevenZSource {
     /// # Errors
     ///
     /// [`SourceError::SevenZ`] when the header cannot be read, which covers an archive whose
-    /// headers are encrypted and one written with a codec this build does not carry.
+    /// headers are encrypted and one written with a codec this build does not carry, and
+    /// [`SourceError::Dictionary`] when a block declares more working memory than
+    /// [`MAX_DICTIONARY_BYTES`].
     pub fn new(file: std::fs::File, naming: Naming) -> Result<Self, SourceError> {
         let mut reader = ArchiveReader::new(file, Password::empty())?;
         // Not a trade. `ArchiveReader::new` defaults to `available_parallelism()`, which
@@ -89,6 +159,13 @@ impl SevenZSource {
         // 284 ms and 682.3 MB at ten. Single-threaded is both faster and nineteen times
         // leaner, and it leaves the cores to the pipeline's own workers.
         reader.set_thread_count(1);
+
+        if let Some(declared) = oversized_dictionary(reader.archive()) {
+            return Err(SourceError::Dictionary {
+                declared,
+                limit: MAX_DICTIONARY_BYTES,
+            });
+        }
 
         let names = match naming {
             Naming::Stored => Names::stored(),
@@ -136,20 +213,51 @@ impl Drop for SevenZSource {
     }
 }
 
-/// Walks every entry, offering each page across `sender` until the receiver goes away.
+/// Walks every entry, offering each page across `sender` until the walk ends.
 ///
 /// Errors travel in band rather than out of the thread's return value, so the pipeline meets
 /// them in the same order it meets pages.
+///
+/// # How the walk is stopped, and why not with `false`
+///
+/// The callback's `Ok(false)` looks like the way to stop, and it is not one.
+/// `BlockDecoder::for_each_entries` honours it, but `ArchiveReader::for_each_entries`
+/// discards the `bool` its block decoder returns (`reader.rs:1653`,
+/// `forder_dec.for_each_entries(&mut each)?;`) and starts the next block. So `false` ends the
+/// current block and nothing more — and a multi-block archive is the ordinary case, since
+/// 7-Zip splits by type and size and `-ms=off` gives one block per entry.
+///
+/// Measured: a two-block archive whose first block holds a non-JPEG named `a_bad.jpg` and
+/// whose second holds a gibibyte of zeros packed to 230 KB refused in 0.55 s, against 0.00 s
+/// for the same first block alone. The refusal was decided from two bytes; the rest was the
+/// second block being decoded into a sink after the callback had said stop.
+///
+/// `Err` is the seam that works: both loops propagate it with `?`. So the callback returns a
+/// sentinel error and `stopped` records that the sentinel was ours, so the walk's own error
+/// is not reported twice or mistaken for the archive's.
 fn decode(
     mut reader: ArchiveReader<std::fs::File>,
     mut names: Names,
     sender: &Sender<Result<Entry, SourceError>>,
 ) {
     let mut next_index = 0;
+    let mut stopped = false;
 
     let walked = reader.for_each_entries(|entry, stream| {
         let mut drain = Drain::new(stream);
         let name = entry.name.clone();
+
+        // Every terminal path goes through this: it abandons the rest of the entry, because a
+        // path that ends the run has no next entry to keep the block coherent for, and then
+        // ends the whole walk rather than this block.
+        macro_rules! stop {
+            ($result:expr) => {{
+                drain.abandon();
+                offer(sender, $result);
+                stopped = true;
+                return Err(stop());
+            }};
+        }
 
         // The order of these checks decides which error a multiply-wrong entry gets, and it
         // is `zip.rs`'s order for `zip.rs`'s reasons:
@@ -161,17 +269,28 @@ fn decode(
         //   5. the leading bytes       — read on their own, so a mismatch costs two bytes
         //   6. the rest of the entry   — bounded on the way in
         //   7. the stored name         — refused only once it is a page worth naming
-        if entry.is_directory() || is_directory(&name) {
-            return Ok(drain.finish().is_ok());
+        //
+        // A skip is the one path that continues, so it is the one path that must drain — and
+        // a drain that fails is reported rather than swallowed. `.is_ok()` would turn a
+        // corrupt block into a clean end of archive: fewer pages, exit code zero.
+        if entry.is_directory() || is_directory(&name) || probe::declared_format(&name).is_none() {
+            return match drain.finish() {
+                Ok(()) => Ok(true),
+                Err(source) => {
+                    offer(sender, Err(SourceError::Entry { name, source }));
+                    stopped = true;
+                    Err(stop())
+                }
+            };
         }
-        let Some(declared) = probe::declared_format(&name) else {
-            return Ok(drain.finish().is_ok());
-        };
+        let declared = probe::declared_format(&name).expect("the filter above accepted it");
 
         // The header records the size away from the entry's data, so an entry claiming more
-        // than the limit costs nothing to refuse and is not read at all.
+        // than the limit is refused before any of it is decoded — which is what `abandon`
+        // inside `stop!` buys: without it `Drain::drop` would decompress the whole entry on
+        // the way out, and a 229 KB archive declaring a gibibyte cost 0.55 s of CPU.
         if entry.size > MAX_ENTRY_BYTES {
-            return Ok(offer(sender, Err(too_large(name))));
+            stop!(Err(too_large(name)));
         }
 
         let index = next_index;
@@ -179,7 +298,7 @@ fn decode(
         let mut head = [0; MAGIC_MAX];
         let head = match fill(drain.stream(), &mut head) {
             Ok(read) => &head[..read],
-            Err(source) => return Ok(offer(sender, Err(SourceError::Entry { name, source }))),
+            Err(source) => stop!(Err(SourceError::Entry { name, source })),
         };
 
         // The extension said this was a page. If the bytes disagree the archive is
@@ -187,33 +306,26 @@ fn decode(
         // shorten the book.
         match probe::probe(head) {
             Some(format) if format == declared => {}
-            _ => {
-                return Ok(offer(
-                    sender,
-                    Err(SourceError::Mismatch {
-                        name,
-                        declared: declared.name(),
-                    }),
-                ));
-            }
+            _ => stop!(Err(SourceError::Mismatch {
+                name,
+                declared: declared.name(),
+            })),
         }
 
         let bytes = match read_entry(&mut drain, entry.size, head) {
-            Ok(bytes) if bytes.len() as u64 > MAX_ENTRY_BYTES => {
-                return Ok(offer(sender, Err(too_large(name))));
-            }
+            Ok(bytes) if bytes.len() as u64 > MAX_ENTRY_BYTES => stop!(Err(too_large(name))),
             Ok(bytes) => bytes,
-            Err(source) => return Ok(offer(sender, Err(SourceError::Entry { name, source }))),
+            Err(source) => stop!(Err(SourceError::Entry { name, source })),
         };
 
         // The stored name goes into the *output* archive, so a traversing or absolute name
         // would be carried to whatever extracts it. Refused rather than sanitised.
         if let Some(reason) = unsafe_name(&name) {
-            return Ok(offer(sender, Err(SourceError::UnsafeName { name, reason })));
+            stop!(Err(SourceError::UnsafeName { name, reason }));
         }
 
         next_index += 1;
-        Ok(offer(
+        if offer(
             sender,
             Ok(Entry {
                 index,
@@ -221,14 +333,35 @@ fn decode(
                 format: declared,
                 bytes,
             }),
-        ))
+        ) {
+            Ok(true)
+        } else {
+            // The receiver is gone — the pipeline stopped, usually because an earlier page
+            // failed — so there is nobody left to read the rest of the archive for. Nothing
+            // to offer: the pipeline already has its own error.
+            stopped = true;
+            Err(stop())
+        }
     });
 
     // The archive's own structure, reached after some entries may already have been offered.
-    // Sent like any other error so the pipeline meets it in read order.
-    if let Err(error) = walked {
-        offer(sender, Err(error.into()));
+    // Sent like any other error so the pipeline meets it in read order — unless the walk
+    // ended because this module ended it, in which case the real error is already in flight.
+    match walked {
+        Ok(()) => {}
+        Err(_) if stopped => {}
+        Err(error) => {
+            offer(sender, Err(error.into()));
+        }
     }
+}
+
+/// The sentinel that ends the walk, because `Ok(false)` only ends one block.
+///
+/// Never reaches a user: `decode` recognises it by the `stopped` flag it is always set with,
+/// and the error the caller should see was offered across the channel first.
+fn stop() -> sevenz_rust2::Error {
+    sevenz_rust2::Error::Other(std::borrow::Cow::Borrowed("the reader ended the walk"))
 }
 
 fn too_large(name: String) -> SourceError {
@@ -238,15 +371,9 @@ fn too_large(name: String) -> SourceError {
     }
 }
 
-/// Hands `result` to the pipeline, reporting whether the walk should continue.
-///
-/// A failed send means the receiver is gone — the pipeline stopped, usually because an
-/// earlier page failed — and there is nobody left to read the rest of the archive for. An
-/// error stops the walk for the reason every other reader stops on one: a run that cannot
-/// produce one page does not produce a book.
+/// Hands `result` to the pipeline, reporting whether the receiver is still there.
 fn offer(sender: &Sender<Result<Entry, SourceError>>, result: Result<Entry, SourceError>) -> bool {
-    let carry_on = result.is_ok();
-    sender.send(result).is_ok() && carry_on
+    sender.send(result).is_ok()
 }
 
 /// Reads the rest of one entry after `head`, bounded independently of its declared size.
@@ -270,12 +397,18 @@ fn read_entry(drain: &mut Drain<'_>, recorded: u64, head: &[u8]) -> io::Result<V
     Ok(bytes)
 }
 
-/// Consumes whatever is left of an entry, on every path out of the callback.
+/// Keeps a solid block coherent across an entry the callback did not read to its end.
 ///
 /// A guard rather than a rule, because forgetting is not an option the type offers: a skip, an
-/// early return and a `?` all drain. Only a *skip that continues* strictly needs it — every
-/// error path ends the run, so the block's state afterwards is irrelevant — but making the
-/// correct thing automatic is what stops the next reader of this file getting it wrong.
+/// early return and a `?` all drain by default. Two named exits depart from that default and
+/// both are deliberate:
+///
+/// - [`Drain::finish`] drains and *reports*, so a corrupt block on the one path that
+///   continues is an error rather than a quiet end of archive.
+/// - [`Drain::abandon`] does not drain at all, for a path that ends the whole walk. There is
+///   no next entry to keep coherent, and draining would decode an entry that was refused
+///   precisely so it would not be decoded — measured at 0.55 s of CPU for a 229 KB archive
+///   declaring a gibibyte.
 struct Drain<'a> {
     stream: &'a mut dyn Read,
     drained: bool,
@@ -298,6 +431,11 @@ impl<'a> Drain<'a> {
         self.drained = true;
         io::copy(&mut self.stream, &mut io::sink()).map(|_| ())
     }
+
+    /// Leaves the rest of the entry undecoded, for a path that ends the walk.
+    fn abandon(&mut self) {
+        self.drained = true;
+    }
 }
 
 impl Drop for Drain<'_> {
@@ -305,5 +443,109 @@ impl Drop for Drain<'_> {
         if !self.drained {
             let _ = io::copy(&mut self.stream, &mut io::sink());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Drain, MAX_DICTIONARY_BYTES};
+    use std::io::{self, Read};
+
+    /// A reader that reports how much of it was consumed, and can be made to fail.
+    struct Counting {
+        remaining: usize,
+        read: usize,
+        fails_after: usize,
+    }
+
+    impl Read for Counting {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.read >= self.fails_after {
+                return Err(io::Error::other("the block is corrupt"));
+            }
+            let take = buffer.len().min(self.remaining).min(64);
+            self.remaining -= take;
+            self.read += take;
+            buffer[..take].fill(b'x');
+            Ok(take)
+        }
+    }
+
+    fn reader(bytes: usize) -> Counting {
+        Counting {
+            remaining: bytes,
+            read: 0,
+            fails_after: usize::MAX,
+        }
+    }
+
+    /// The default exit: whatever the callback left is consumed, so the next entry in a solid
+    /// block starts where the decoder thinks it does.
+    #[test]
+    fn a_dropped_guard_consumes_the_rest_of_the_entry() {
+        let mut stream = reader(1000);
+        {
+            let mut drain = Drain::new(&mut stream);
+            let mut head = [0; 4];
+            drain.stream().read_exact(&mut head).expect("reads a head");
+        }
+        assert_eq!(stream.read, 1000, "the guard left bytes in the block");
+    }
+
+    /// The named exit that continues: it drains, and it *reports* a drain that failed rather
+    /// than turning a corrupt block into a quiet end of archive.
+    #[test]
+    fn finish_drains_and_reports_a_failure() {
+        let mut stream = reader(1000);
+        Drain::new(&mut stream).finish().expect("drains");
+        assert_eq!(stream.read, 1000);
+
+        let mut broken = Counting {
+            remaining: 1000,
+            read: 0,
+            fails_after: 128,
+        };
+        Drain::new(&mut broken)
+            .finish()
+            .expect_err("a drain failure must be reported, not swallowed");
+    }
+
+    /// The named exit that ends the walk: nothing is consumed, because there is no next entry
+    /// to keep coherent and decoding an entry that was refused is the cost the refusal exists
+    /// to avoid.
+    #[test]
+    fn abandon_leaves_the_entry_undecoded() {
+        let mut stream = reader(1000);
+        {
+            let mut drain = Drain::new(&mut stream);
+            drain.abandon();
+        }
+        assert_eq!(
+            stream.read, 0,
+            "an abandoned entry was decoded on the way out"
+        );
+    }
+
+    /// The LZMA2 property byte the ceiling is compared against, decoded the way the crate
+    /// decodes it: `(2 | (bits & 1)) << (bits / 2 + 11)`, so an even byte is a power of two.
+    /// 30 is 128 MiB — the largest a plausible archive declares — and 40 is the 4 GiB maximum
+    /// the format allows, which is the allocation the ceiling exists to refuse.
+    #[test]
+    fn the_dictionary_ceiling_admits_the_plausible_and_refuses_the_possible() {
+        let dictionary = |bits: u32| -> u64 {
+            if bits == 40 {
+                u64::from(u32::MAX)
+            } else {
+                u64::from((2 | (bits & 1)) << (bits / 2 + 11))
+            }
+        };
+        assert_eq!(dictionary(30), 128 << 20);
+        assert_eq!(dictionary(32), 256 << 20);
+        assert_eq!(dictionary(40), u64::from(u32::MAX));
+
+        assert!(dictionary(30) <= MAX_DICTIONARY_BYTES);
+        assert!(dictionary(32) <= MAX_DICTIONARY_BYTES);
+        assert!(dictionary(34) > MAX_DICTIONARY_BYTES);
+        assert!(dictionary(40) > MAX_DICTIONARY_BYTES);
     }
 }

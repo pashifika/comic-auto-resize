@@ -212,14 +212,21 @@ impl Positions {
         if prefix.len() == stem.len() {
             return output_name(stored, format);
         }
-
         // Per directory *component of the entry name*, whatever the input's kind: an archive
         // stores `/` in an entry name as readily as a filesystem does, so `ch1/` and `ch2/`
         // are two runs of pages either way.
+        //
+        // The key folds `\` to `/`, and that is what makes the collision-freedom claim true
+        // of *paths* rather than only of strings. An archive written on Windows stores `\`,
+        // so `ch1/page5.jpg` and `ch1\page9.jpg` are two spellings of one directory: two
+        // buckets would give both position one, two distinct zip entry names, and one file
+        // once extracted on Windows — with the writer's duplicate-name refusal comparing
+        // exact strings and so unable to fire. One bucket, one sequence, no collision. The
+        // output name keeps the separator the input used; only the counter is shared.
         let directory = &prefix[..prefix.rfind(['/', '\\']).map_or(0, |at| at + 1)];
         let position = self
             .next
-            .entry(directory.to_owned())
+            .entry(directory.replace('\\', "/"))
             .and_modify(|next| *next += 1)
             .or_insert(1);
 
@@ -314,6 +321,10 @@ mod tests {
         assert_eq!(renamed(9, &["ch1/7.jpeg"]), ["ch1/1.jpg"]);
     }
 
+    /// Per *directory*, and a directory is the same directory however its separator is
+    /// spelled: `ch2/` and `ch2\` share one counter, so the two entries take positions one
+    /// and two rather than both taking one and colliding as a path on extraction. The output
+    /// keeps the separator each name arrived with; only the sequence is shared.
     #[test]
     fn each_directory_component_restarts_the_count_at_one_width() {
         assert_eq!(
@@ -330,7 +341,7 @@ mod tests {
                 "ch1/page_01.jpg",
                 "ch1/page_02.jpg",
                 "ch2/page_01.jpg",
-                "ch2\\page_01.jpg",
+                "ch2\\page_02.jpg",
             ]
         );
     }
