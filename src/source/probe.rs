@@ -93,9 +93,18 @@ pub static CANDIDATES: &[Candidate] = &[
     },
     Candidate {
         format: Format::Bmp,
-        // Ten bytes rather than two, and the conformance suite says why: `x/ba-bm.bmp` is an
-        // OS/2 bitmap *array*, which begins `BA` and contains a `BM`. A two-byte magic would
-        // hand it to the BMP decoder on the strength of nothing.
+        // Ten bytes rather than two, and what that buys is a **length floor**: `BM` then four
+        // bytes of file size then four reserved is the whole of `BITMAPFILEHEADER`'s
+        // discriminating part, so a file too short to hold one is refused here rather than by
+        // the decoder. The reference implementation declares the same ten
+        // (`BM????\x00\x00\x00\x00`).
+        //
+        // It is *not* what keeps `x/ba-bm.bmp` — an OS/2 bitmap array beginning `BA` and
+        // containing a `BM` — out: `Magic::matches` anchors `head` at offset 0, so two bytes
+        // would refuse that file just as ten do. An earlier draft of this comment claimed
+        // otherwise, and an independent review caught it; the claim is corrected rather than
+        // deleted, because a reader who removes `skipped` needs to know which property goes
+        // with it.
         magic: Magic {
             head: b"BM",
             skipped: 8,
@@ -596,15 +605,42 @@ mod tests {
         assert_eq!(probe(b"RIFF\x24\x00\x00\x00WAVEfmt "), None);
     }
 
-    /// Why BMP's magic is ten bytes rather than two. An OS/2 bitmap array begins `BA` and
-    /// contains a `BM` at offset 14, so a two-byte magic anchored anywhere loose would claim
-    /// it; the real file is asserted against the conformance corpus in `tests/image_pages.rs`.
+    /// A magic is anchored at offset 0, so a fixed sequence occurring *later* in the file is
+    /// not a match. An OS/2 bitmap array is the case that matters: it begins `BA` and holds a
+    /// `BM` at offset 14, so a reader that searched rather than anchored would claim it. The
+    /// real file is asserted against the conformance corpus in `tests/image_pages.rs`.
     #[test]
-    fn an_os2_bitmap_array_is_not_a_bmp_page() {
+    fn a_magic_is_anchored_at_the_start_and_not_searched_for() {
         let mut header = b"BA".to_vec();
         header.extend_from_slice(&[0x9E, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
         header.extend_from_slice(b"BM");
         assert_eq!(probe(&header), None);
+    }
+
+    /// What BMP's eight skipped positions actually buy, which is the property an earlier
+    /// comment misattributed to the OS/2 bitmap array: a **length floor**. `BITMAPFILEHEADER`
+    /// is fourteen bytes, so anything shorter than the pattern is not a BMP however it starts,
+    /// and it is refused at the probe rather than handed to the decoder. Drop `skipped` and
+    /// this is the test that fails.
+    #[test]
+    fn a_bmp_too_short_to_hold_its_file_header_is_refused_at_the_probe() {
+        let bmp = CANDIDATES
+            .iter()
+            .find(|candidate| candidate.format == Format::Bmp)
+            .expect("BMP is a candidate");
+        assert_eq!(bmp.magic.header_len(), 10);
+
+        let full = header_from(&bmp.magic, FILLER);
+        assert_eq!(probe(&full), Some(Format::Bmp));
+        // Every prefix short of the pattern, so the floor is the whole length rather than one
+        // lucky byte of it.
+        for length in 0..full.len() {
+            assert_eq!(
+                probe(&full[..length]),
+                None,
+                "a {length}-byte BM header matched"
+            );
+        }
     }
 
     #[test]
@@ -630,6 +666,12 @@ mod tests {
 
     /// The filter and the candidate list stay the same length, which is the clause an entry
     /// the filter passes over needs: such an entry is never reported at all.
+    ///
+    /// The second assertion ties the two tables that name a format's extension together.
+    /// `Format::extension` and `Candidate::extensions` list the same strings independently,
+    /// and nothing in the crate reads the former for a non-JPEG variant — both call sites go
+    /// through `ENCODED_FORMAT` — so a divergence would be silent and would surface only
+    /// through the public API.
     #[test]
     fn the_filter_admits_every_extension_any_candidate_claims() {
         for candidate in CANDIDATES {
@@ -640,6 +682,12 @@ mod tests {
                     "the filter does not admit .{extension}"
                 );
             }
+            assert!(
+                candidate.extensions.contains(&candidate.format.extension()),
+                "{:?}'s canonical extension .{} is not one the filter admits",
+                candidate.format,
+                candidate.format.extension()
+            );
         }
     }
 

@@ -357,9 +357,11 @@ fn process(
 
     // The header first, because the resize policy needs the source geometry to choose both
     // the target height and whether to resize at all, and a scaled decode cannot be
-    // configured before that is known. It is also where an oversized page is refused for
-    // every format, including the three whose decoder cannot scale.
-    let (source_width, source_height) = header(&name, &bytes, format)?;
+    // configured before that is known. The budget refusal itself is inside `decode`, at the
+    // point each decoder has parsed its header and before it allocates from it — for every
+    // format, including the three whose decoder cannot scale. The budget is passed here
+    // because reading a *png*'s header is itself an allocating operation.
+    let (source_width, source_height) = header(&name, &bytes, format, settings.decode.budget)?;
     let plan = policy::plan(source_width, source_height, settings.target_width);
 
     let decoded = decode(

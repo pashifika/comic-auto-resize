@@ -14,19 +14,41 @@
 //! The concrete decoders are used rather than `ImageReader`, and for a reason beyond taste:
 //! `ImageReader::into_decoder` returns an opaque `impl ImageDecoder`, and detecting an
 //! animation needs `PngDecoder::is_apng` and `WebPDecoder::has_animation`, which are on the
-//! concrete types. `image`'s own decode limits are left at `no_limits` — which is what
-//! `PngDecoder::new` sets — because this crate's [`Budget`] is the limit, and two limits with
-//! different numbers would make the refusing one a matter of which fired first.
+//! concrete types.
 //!
-//! Metadata does not survive here either: `DynamicImage::from_decoder` asks for pixels, so an
-//! ICC profile is read past and dropped, as it is on the JPEG path.
+//! # The png decoder is given a limit of its own, and that is not a second budget
+//!
+//! An earlier version left `image`'s limits at `no_limits` — which is what `PngDecoder::new`
+//! sets — on the grounds that [`Budget`] is the limit. An independent review found the hole
+//! that reasoning left: `png`'s `read_info` parses every chunk before the first `IDAT`, and
+//! `parse_iccp_raw` inflates an `iCCP` profile with `fdeflate::decompress_to_vec_bounded(buf,
+//! self.limits.bytes)` — which `no_limits` makes `usize::MAX`. So a png declaring `1x1` and
+//! carrying a compressed run of identical bytes inflates without bound *during header
+//! parsing*, before `dimensions()` is readable and therefore before any budget check. Measured
+//! at zlib level 9 the ratio reaches 1028:1, so a 65 KB chunk becomes 64 MiB and an entry at
+//! `MAX_ENTRY_BYTES` becomes tens of gigabytes. `Vec` growth ends in `handle_alloc_error`,
+//! which **aborts** — `catch_unwind` in the pipeline cannot intercept it.
+//!
+//! [`Budget`] cannot close that, because the inflated size is not a pixel count. So the png
+//! decoder is constructed with `max_alloc` set to the budget's *own* image-byte ceiling: one
+//! number applied in two places rather than two numbers that could disagree. It costs one
+//! narrowing worth stating — a page within a few megabytes of that ceiling *and* carrying an
+//! ICC profile is now refused, because `png` draws both from one pool — and that is a refusal
+//! by name rather than damaged output.
+//!
+//! bmp and webp need no equivalent: `image-webp` reads a profile only through `icc_profile()`,
+//! which `from_decoder` never calls, and bmp has no compressed ancillary chunk at all.
+//!
+//! Metadata still does not survive: `DynamicImage::from_decoder` asks for pixels, so a profile
+//! that *is* inflated is then dropped, as it is on the JPEG path. The limit exists because the
+//! inflation happens whether or not anyone wants the result.
 
 use std::io::Cursor;
 
 use image::codecs::bmp::BmpDecoder;
 use image::codecs::png::PngDecoder;
 use image::codecs::webp::WebPDecoder;
-use image::{DynamicImage, ImageDecoder, ImageError};
+use image::{ColorType, DynamicImage, ImageDecoder, ImageError, Limits};
 
 use crate::page::{Budget, Channels, Format, PageError, PageErrorKind, PageImage};
 
@@ -38,16 +60,19 @@ use super::Decoded;
 ///
 /// See [`super::decode`]; an APNG is refused as [`PageErrorKind::MultiFrame`].
 pub fn png(name: &str, buffer: &[u8], budget: Budget) -> Result<Decoded, PageError> {
-    read(name, Format::Png, open_png(name, buffer)?, budget)
+    read(name, Format::Png, open_png(name, buffer, budget)?, budget)
 }
 
 /// The geometry a png's header declares.
 ///
+/// Takes the budget because reading a png's header is where the decoder inflates an `iCCP`
+/// chunk; see the module documentation.
+///
 /// # Errors
 ///
 /// See [`super::header`].
-pub fn png_header(name: &str, buffer: &[u8]) -> Result<(u32, u32), PageError> {
-    Ok(open_png(name, buffer)?.dimensions())
+pub fn png_header(name: &str, buffer: &[u8], budget: Budget) -> Result<(u32, u32), PageError> {
+    Ok(open_png(name, buffer, budget)?.dimensions())
 }
 
 /// A bmp page.
@@ -88,10 +113,43 @@ pub fn webp_header(name: &str, buffer: &[u8]) -> Result<(u32, u32), PageError> {
     Ok(open_webp(name, buffer)?.dimensions())
 }
 
+/// The most bytes `image`'s png decoder may draw for its **own** allocations while reading
+/// `entry` bytes of png.
+///
+/// Not a second page budget, and the distinction is what makes this number safe. `png`'s
+/// `Limits` bounds the decoder's internal allocations only — the growth of a chunk's raw bytes
+/// (`decoder/stream.rs:783-792`), an inflated `iCCP` profile (`stream.rs:1726-1728`), a text
+/// chunk, and **one output scanline** (`decoder/mod.rs:390-391`) — and not the pixel buffer,
+/// which `image` allocates itself and [`Budget`] bounds.
+///
+/// Every chunk's raw bytes come out of the entry, so their total cannot exceed it; the pool is
+/// therefore the entry's own length plus room for the widest scanline a png can have —
+/// 65,535 × 4 channels × 2 bytes is 524,280 — and never more than the budget's page ceiling.
+/// Sizing it from the entry rather than from a constant is what keeps a 2 MB entry from being
+/// allowed 64 MB of decoder scratch: measured, an archive of eight pngs each declaring `1x1`
+/// and carrying a profile that inflates to 2 GiB peaked at 13.86 GB before this bound existed.
+const PNG_SCANLINE_CEILING: u64 = 1 << 20;
+
+fn png_pool(budget: Budget, entry: usize) -> u64 {
+    let entry = u64::try_from(entry).unwrap_or(u64::MAX);
+    entry
+        .saturating_add(PNG_SCANLINE_CEILING)
+        .min(budget.max_image_bytes())
+}
+
 /// A png decoder over `buffer`, refusing an APNG.
-fn open_png<'a>(name: &str, buffer: &'a [u8]) -> Result<PngDecoder<Cursor<&'a [u8]>>, PageError> {
-    let decoder =
-        PngDecoder::new(Cursor::new(buffer)).map_err(|error| failed(name, Format::Png, &error))?;
+///
+/// `with_limits` rather than `new`, and the module documentation says why: `new` is
+/// `no_limits`, which lets an `iCCP` chunk inflate without bound during header parsing.
+fn open_png<'a>(
+    name: &str,
+    buffer: &'a [u8],
+    budget: Budget,
+) -> Result<PngDecoder<Cursor<&'a [u8]>>, PageError> {
+    let mut limits = Limits::no_limits();
+    limits.max_alloc = Some(png_pool(budget, buffer.len()));
+    let decoder = PngDecoder::with_limits(Cursor::new(buffer), limits)
+        .map_err(|error| failed(name, Format::Png, &error))?;
     if decoder
         .is_apng()
         .map_err(|error| failed(name, Format::Png, &error))?
@@ -123,31 +181,91 @@ fn read<D: ImageDecoder>(
     decoder: D,
     budget: Budget,
 ) -> Result<Decoded, PageError> {
+    let named = |kind| PageError::new(name, kind);
+
     let (width, height) = decoder.dimensions();
     // From the header the decoder has already parsed, and before anything is allocated from
     // it — the same point in the sequence at which the JPEG path checks, reached deliberately
     // rather than as a by-product of choosing a scale.
+    budget.allow_source(width, height).map_err(named)?;
+
+    // What the colour type narrows to, decided from the header rather than after the decode.
+    // Two things follow from doing it here: a shape no rule covers is refused without paying
+    // for its pixels, and the budget can charge the *peak* rather than one buffer.
+    let narrowing = Narrowing::of(decoder.color_type()).ok_or_else(|| {
+        named(PageErrorKind::Pixels {
+            format,
+            shape: format!("{:?}", decoder.color_type()),
+        })
+    })?;
     budget
-        .allow_source(width, height)
-        .map_err(|kind| PageError::new(name, kind))?;
-    // The buffer the *decoder* will allocate, which is wider than the page that comes out of
-    // it whenever there is an alpha channel or a 16-bit sample — eight bytes a pixel for
-    // `Rgba16` against the page's three. Bounding this bounds the page too, because narrowing
-    // only ever drops bytes.
-    budget
-        .allow_decoded(decoder.total_bytes())
-        .map_err(|kind| PageError::new(name, kind))?;
+        .allow_decoded(narrowing.peak(decoder.total_bytes(), width, height))
+        .map_err(named)?;
 
     let image =
         DynamicImage::from_decoder(decoder).map_err(|error| failed(name, format, &error))?;
-    let narrowed = narrow(image)
-        .map_err(|shape| PageError::new(name, PageErrorKind::Pixels { format, shape }))?;
+    let narrowed = narrow(image).map_err(|shape| {
+        named(PageErrorKind::Pixels {
+            format,
+            shape: shape.to_owned(),
+        })
+    })?;
+    debug_assert_eq!(
+        narrowed.channels, narrowing.channels,
+        "the header-side and buffer-side narrowing tables disagree"
+    );
     let page = PageImage::new(width, height, narrowed.channels, narrowed.pixels)
-        .map_err(|error| PageError::new(name, error.into()))?;
+        .map_err(|error: crate::page::InvalidPixelBuffer| PageError::new(name, error.into()))?;
     Ok(Decoded {
         page,
         composited: narrowed.composited,
     })
+}
+
+/// What a decoder's colour type becomes, read off its header.
+///
+/// Separate from [`narrow`], which decides what to do with the *samples*: this decides only the
+/// channel count and whether a second buffer is built, which is what the budget needs before a
+/// pixel exists. `the_two_narrowing_tables_agree` asserts the pair cannot drift.
+struct Narrowing {
+    channels: Channels,
+    /// Whether [`narrow`] builds a new buffer while the decoder's is still alive.
+    ///
+    /// `L8` and `Rgb8` are already what the encoder takes, so their buffer is **moved** and
+    /// there is never a second allocation. Every other arm composites or narrows into a fresh
+    /// buffer with the source still held, so both are alive at once.
+    copies: bool,
+}
+
+impl Narrowing {
+    /// The narrowing `colour` takes, or `None` for a shape no rule covers.
+    fn of(colour: ColorType) -> Option<Self> {
+        let (channels, copies) = match colour {
+            ColorType::L8 => (Channels::Gray, false),
+            ColorType::Rgb8 => (Channels::Rgb, false),
+            ColorType::La8 | ColorType::L16 | ColorType::La16 => (Channels::Gray, true),
+            ColorType::Rgba8 | ColorType::Rgb16 | ColorType::Rgba16 => (Channels::Rgb, true),
+            // `Rgb32F`, `Rgba32F`, and anything `image` adds to a `#[non_exhaustive]` enum
+            // later. Refused by name rather than converted on a guess about which transfer
+            // function the samples carry.
+            _ => return None,
+        };
+        Some(Self { channels, copies })
+    }
+
+    /// The most bytes alive at once for a `width` × `height` page whose decoder asks for
+    /// `decoded`.
+    ///
+    /// `decoded` is the decoder's own figure — eight bytes a pixel for `Rgba16` against the
+    /// page's three — and the page's buffer is added only where the two coexist.
+    fn peak(&self, decoded: u64, width: u32, height: u32) -> u128 {
+        let page = if self.copies {
+            u128::from(width) * u128::from(height) * u128::from(self.channels.count())
+        } else {
+            0
+        };
+        u128::from(decoded) + page
+    }
 }
 
 /// What one of `image`'s buffers becomes on the way to a [`PageImage`].
@@ -313,7 +431,73 @@ fn multi_frame(name: &str, format: Format) -> PageError {
 
 #[cfg(test)]
 mod tests {
-    use super::{composited8, composited16, narrow_sample, over_white8, over_white16};
+    use image::{ColorType, DynamicImage};
+
+    use super::{
+        Narrowing, composited8, composited16, narrow, narrow_sample, over_white8, over_white16,
+    };
+
+    /// The two tables that describe a narrowing cannot drift.
+    ///
+    /// [`Narrowing::of`] reads a decoder's colour type before any pixel exists, so the budget
+    /// can charge the peak and a shape no rule covers can be refused without paying for its
+    /// pixels. [`narrow`] does the samples. They are separate matches over two different enums,
+    /// so this walks every `ColorType` `Narrowing::of` admits, builds the `DynamicImage` arm a
+    /// decoder of that type produces, and asserts the pair agrees on the channel count and on
+    /// whether a second buffer is built.
+    #[test]
+    fn the_two_narrowing_tables_agree() {
+        // 2x1, so a buffer's length distinguishes the channel count from the pixel count.
+        let (width, height) = (2, 1);
+        let arms = [
+            (ColorType::L8, DynamicImage::new_luma8(width, height)),
+            (ColorType::La8, DynamicImage::new_luma_a8(width, height)),
+            (ColorType::Rgb8, DynamicImage::new_rgb8(width, height)),
+            (ColorType::Rgba8, DynamicImage::new_rgba8(width, height)),
+            (ColorType::L16, DynamicImage::new_luma16(width, height)),
+            (ColorType::La16, DynamicImage::new_luma_a16(width, height)),
+            (ColorType::Rgb16, DynamicImage::new_rgb16(width, height)),
+            (ColorType::Rgba16, DynamicImage::new_rgba16(width, height)),
+        ];
+
+        for (colour, image) in arms {
+            let narrowing = Narrowing::of(colour)
+                .unwrap_or_else(|| panic!("{colour:?} is a shape the decoders produce"));
+            let narrowed = narrow(image).unwrap_or_else(|shape| panic!("{colour:?}: {shape}"));
+
+            assert_eq!(
+                narrowed.channels, narrowing.channels,
+                "{colour:?}: the header-side and buffer-side channel counts disagree"
+            );
+            // `peak` adds the page's buffer exactly when `narrow` built one. The moved arms are
+            // the two whose colour type is already what the encoder takes.
+            let moved = matches!(colour, ColorType::L8 | ColorType::Rgb8);
+            assert_eq!(
+                narrowing.copies, !moved,
+                "{colour:?}: `copies` disagrees with whether the buffer is moved"
+            );
+            assert_eq!(
+                narrowing.peak(u64::from(colour.bytes_per_pixel()) * 2, width, height),
+                u128::from(colour.bytes_per_pixel()) * 2
+                    + if moved {
+                        0
+                    } else {
+                        narrowed.pixels.len() as u128
+                    },
+                "{colour:?}: the charged peak is not the two buffers"
+            );
+        }
+
+        // And the shapes no rule covers are refused by both halves.
+        for colour in [ColorType::Rgb32F, ColorType::Rgba32F] {
+            assert!(
+                Narrowing::of(colour).is_none(),
+                "{colour:?} must be refused from the header"
+            );
+        }
+        assert!(narrow(DynamicImage::new_rgb32f(width, height)).is_err());
+        assert!(narrow(DynamicImage::new_rgba32f(width, height)).is_err());
+    }
 
     /// The case the composite exists to get right, and the one that would break silently: an
     /// alpha channel that is entirely opaque must leave every colour value where it was.

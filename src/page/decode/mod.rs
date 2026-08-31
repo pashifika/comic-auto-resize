@@ -93,9 +93,13 @@ pub fn decode(
 /// The geometry `buffer`'s header declares, without decoding it.
 ///
 /// The resize policy needs the source geometry before the decode is configured, and the
-/// budget needs it before anything is allocated from it. Reading the header twice costs
-/// header parsing, which is microseconds against a decode, and it keeps the policy above the
-/// codec instead of inside it.
+/// budget needs it before anything is allocated from it. Reading the header twice costs header
+/// parsing, which is microseconds against a decode, and it keeps the policy above the codec
+/// instead of inside it.
+///
+/// `budget` is not checked here — the refusal lives in [`decode`], where each decoder has
+/// parsed its header and before it allocates from it. It is taken because reading a *png*'s
+/// header is itself an allocating operation: see [`raster`]'s module documentation.
 ///
 /// # Errors
 ///
@@ -103,10 +107,15 @@ pub fn decode(
 /// begin with the start-of-image marker, and
 /// [`PageErrorKind::Decode`](super::PageErrorKind::Decode) when the decoder rejects the
 /// header.
-pub fn header(name: &str, buffer: &[u8], format: Format) -> Result<(u32, u32), PageError> {
+pub fn header(
+    name: &str,
+    buffer: &[u8],
+    format: Format,
+    budget: Budget,
+) -> Result<(u32, u32), PageError> {
     match format {
         Format::Jpeg => jpeg::header(name, buffer),
-        Format::Png => raster::png_header(name, buffer),
+        Format::Png => raster::png_header(name, buffer, budget),
         Format::Bmp => raster::bmp_header(name, buffer),
         Format::WebP => raster::webp_header(name, buffer),
     }

@@ -95,19 +95,33 @@ impl Budget {
         )
     }
 
-    /// Rejects a decoded buffer of `bytes`, before the decoder allocates it.
+    /// Rejects a decode whose peak is `bytes`, before any of it is allocated.
     ///
-    /// For a format whose decoder produces samples the encoder cannot take — an alpha
-    /// channel, or sixteen bits — the buffer the *decoder* asks for is wider than the page
-    /// that comes out of it, so the check has to be on the decoder's own figure rather than
-    /// on the page's channel count. Bounding it bounds the page too: narrowing only ever
-    /// drops bytes.
+    /// **The peak, not one buffer.** For a format whose decoder produces samples the encoder
+    /// cannot take — an alpha channel, or sixteen bits — the narrowing builds the page's buffer
+    /// while the decoder's is still alive, so both are charged; where the decoder's buffer is
+    /// already what the encoder takes it is *moved* rather than copied and only one is. An
+    /// earlier version of this checked the decoder's buffer alone and reasoned that narrowing
+    /// only drops bytes, which is true of the *result* and not of the moment both exist — an
+    /// independent review caught it, and the correction is here rather than in a comment
+    /// because the spec's clause is about every allocation an input sizes.
     ///
     /// # Errors
     ///
     /// [`PageErrorKind::TooLarge`], naming the quantity, the value, and the limit.
-    pub fn allow_decoded(&self, bytes: u64) -> Result<(), PageErrorKind> {
-        Self::check("decoded bytes", u128::from(bytes), self.max_image_bytes)
+    pub fn allow_decoded(&self, bytes: u128) -> Result<(), PageErrorKind> {
+        Self::check("decoded bytes", bytes, self.max_image_bytes)
+    }
+
+    /// The most bytes one image buffer may occupy.
+    ///
+    /// Exposed for one caller: `image`'s png decoder inflates an `iCCP` chunk during *header*
+    /// parsing, before its dimensions are readable, and the only way to bound that is to hand
+    /// the decoder a limit of its own. Handing it this one keeps a single number rather than
+    /// two that could disagree.
+    #[must_use]
+    pub const fn max_image_bytes(&self) -> u64 {
+        self.max_image_bytes
     }
 
     /// Widened to `u128`, as [`PageImage::new`] is and for the same reason: two `u32` axes

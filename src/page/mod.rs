@@ -408,8 +408,11 @@ pub enum PageErrorKind {
     /// A pixel shape no narrowing rule covers. An alpha channel is composited onto white and
     /// a deeper sample is narrowed to eight bits; anything else is refused rather than
     /// converted on a guess.
+    ///
+    /// `shape` is owned because it is the decoder's own name for the colour type, and that set
+    /// is `#[non_exhaustive]` upstream — a variant added there has no `&'static str` here.
     #[error("{} decoded to {shape}, which no narrowing rule covers", format.name())]
-    Pixels { format: Format, shape: &'static str },
+    Pixels { format: Format, shape: String },
 }
 
 impl From<io::Error> for PageErrorKind {

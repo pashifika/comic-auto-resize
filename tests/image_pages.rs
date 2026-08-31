@@ -24,9 +24,10 @@ use comic_auto_resize::policy::AUTO_WIDTH;
 use comic_auto_resize::source::{ReadOptions, SourceError, ZipSource, probe};
 
 use support::{
-    TempDir, animated_webp, apng_page, bmp_fixtures, bmp_page, jpeg_size, page, page_bytes,
-    png_gray_page, png_half_transparent_page, png_page, png_rgb16_page, png_rgba_page,
-    png_rgba16_page, read_archive, webp_page, write_archive,
+    TempDir, animated_webp, apng_page, bmp_fixtures, bmp_page, by_position, header_only, jpeg_size,
+    page, page_bytes, png_gray_page, png_half_transparent_page, png_page, png_rgb16_page,
+    png_rgba_page, png_rgba16_page, png_with_inflating_profile, read_archive, webp_page,
+    write_archive,
 };
 
 /// The binary under test, built by Cargo for this integration test at the same profile.
@@ -175,6 +176,54 @@ fn an_extension_claiming_one_format_over_another_formats_bytes_is_an_error() {
     assert!(!output.exists(), "a failed run leaves no archive");
 }
 
+/// A format whose decoder cannot scale is reduced by the **resampler** instead, and reaches the
+/// output at the target width all the same. The distinction is not cosmetic: for JPEG the
+/// reduction happens on the way in, so the pixel buffer follows the target; here it follows the
+/// source, and the decoded page is asserted at its own size to show the decode did not scale.
+#[test]
+fn a_format_with_no_scaled_decode_is_reduced_by_the_resampler() {
+    // Wider than the 1280 target, unlike the fixtures above, so the plan is a resize rather
+    // than a pass-through.
+    let wide = AUTO_WIDTH + 320;
+    let tall = wide * 3 / 2;
+
+    let directory = TempDir::new("image-pages-resize");
+    let output = directory.path().join("out.zip");
+    let input = archive(&[
+        ("page1.png", png_page(wide, tall)),
+        ("page2.bmp", bmp_page(wide, tall)),
+        ("page3.webp", webp_page(wide, tall)),
+    ]);
+
+    let report = run(&input, &output).expect("three wide pages");
+    assert_eq!(report.pages, 3);
+    for (name, bytes) in read_archive(&output) {
+        assert_eq!(
+            jpeg_size(&bytes).map(|(width, _)| width),
+            Some(AUTO_WIDTH),
+            "{name} did not reach the target width"
+        );
+    }
+
+    // And the decode itself produced the source's own dimensions: `scale_to` is ignored by
+    // these three, so every pixel of the reduction is the resampler's.
+    let decoded = decode(
+        "page1.png",
+        &png_page(wide, tall),
+        Format::Png,
+        DecodeSettings {
+            scale_to: Some((AUTO_WIDTH, AUTO_WIDTH * 3 / 2)),
+            ..DecodeSettings::default()
+        },
+    )
+    .expect("decodes");
+    assert_eq!(
+        (decoded.page.width(), decoded.page.height()),
+        (wide, tall),
+        "a scale request must not silently reduce a format that cannot scale"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Channels the encoder cannot carry
 // ---------------------------------------------------------------------------
@@ -298,7 +347,7 @@ fn a_multi_frame_input_is_refused_by_name() {
     );
 
     // And the header read refuses it too, so the run stops before any decode is attempted.
-    assert!(header("anim.png", &apng, Format::Png).is_err());
+    assert!(header("anim.png", &apng, Format::Png, Budget::default()).is_err());
 
     let webp = animated_webp(WIDTH, HEIGHT);
     let error = decode("anim.webp", &webp, Format::WebP, DecodeSettings::default())
@@ -340,47 +389,164 @@ fn a_refusal_names_the_format_and_carries_the_decoders_reason() {
     );
 }
 
-/// The oversize refusal comes from the *declared* dimensions, for every format — including
-/// the three whose decoder cannot produce a reduced image, where nothing else reads the
-/// header first and the check has to be asked for rather than falling out of choosing a
-/// scale. `source pixels` is the quantity only a header read establishes, so asserting on it
-/// is what proves the refusal preceded the decode.
+/// The hole an independent review found, and the regression test for its fix.
+///
+/// `png`'s `read_info` parses every chunk before the first `IDAT`, and `parse_iccp_raw` inflates
+/// an `iCCP` profile bounded only by the decoder's own `Limits`. `PngDecoder::new` is
+/// `no_limits`, so that bound was `usize::MAX`: a 1×1 png carrying a compressed run of identical
+/// bytes allocated without limit during *header* parsing — before `dimensions()` was readable and
+/// therefore before any budget could see it, and ending in `handle_alloc_error`, which aborts
+/// rather than unwinds.
+///
+/// Two things are asserted, and the second is why the first is not enough. `png` **discards**
+/// `parse_iccp_raw`'s error (`let _ = self.parse_iccp_raw()`), so a profile over the bound is
+/// silently dropped and the page still decodes — the fix is invisible from the outside on that
+/// path. What is visible is the pool the limit establishes: a chunk whose raw bytes exceed it is
+/// refused where the growth happens, which is not discarded. So a tiny pool refuses the fixture
+/// and the default pool decodes it, which is the limit being plumbed rather than declared.
+#[test]
+fn an_inflating_colour_profile_is_bounded_by_a_pool_the_decoder_is_given() {
+    // 64 MiB inflated, and cheap: Deflate's ceiling is 1032:1.
+    let bomb = png_with_inflating_profile(64 << 20);
+    assert!(
+        bomb.len() < 128 << 10,
+        "the fixture is supposed to be small: {} bytes",
+        bomb.len()
+    );
+
+    // A pool below the fixture's own chunk, so the refusal lands where the chunk grows.
+    let tight = DecodeSettings {
+        budget: Budget::new(1 << 30, 1 << 10),
+        ..DecodeSettings::default()
+    };
+    let error = header("bomb.png", &bomb, Format::Png, tight.budget)
+        .expect_err("a 64 KiB chunk is over a 1 KiB pool");
+    assert!(
+        matches!(error.kind, PageErrorKind::Decode { .. }),
+        "{:?}",
+        error.kind
+    );
+    assert!(error.to_string().contains("bomb.png"), "{error}");
+    assert!(decode("bomb.png", &bomb, Format::Png, tight).is_err());
+
+    // At the pool the binary uses, the same fixture decodes: the profile inflates no further
+    // than the pool, is discarded as every profile is, and the 1×1 page comes back.
+    let decoded = decode("bomb.png", &bomb, Format::Png, DecodeSettings::default())
+        .expect("the page decodes; only the profile is bounded");
+    assert_eq!((decoded.page.width(), decoded.page.height()), (1, 1));
+    assert!(!decoded.composited);
+
+    // And a profile small enough to inflate is still dropped rather than carried.
+    let modest = png_with_inflating_profile(16 << 10);
+    let decoded = decode("iccp.png", &modest, Format::Png, DecodeSettings::default())
+        .expect("a profile within the pool is inflated and dropped");
+    assert_eq!((decoded.page.width(), decoded.page.height()), (1, 1));
+}
+
+/// The oversize refusal comes from the *declared* dimensions, for every format — including the
+/// three whose decoder cannot produce a reduced image, where nothing else reads the header first
+/// and the check has to be asked for rather than falling out of choosing a scale.
+///
+/// **Against a header-only fixture**, which is what makes the ordering falsifiable rather than
+/// merely stated. On an internally consistent page, an implementation that decoded first and
+/// checked afterwards would refuse it too and name the same quantity, so the test would pass on
+/// the wrong code. These fixtures carry the geometry and no pixels: a decode-first
+/// implementation reports `Decode`, and only a header-first one can report `TooLarge`.
 #[test]
 fn the_refusal_is_on_the_declared_pixels_rather_than_on_the_decoded_buffer() {
-    let settings = DecodeSettings {
+    let tight = DecodeSettings {
         budget: Budget::new(1_000, 1 << 30),
         ..DecodeSettings::default()
     };
 
-    for (name, bytes, format) in [
-        ("page.jpg", page_bytes(WIDTH, HEIGHT), Format::Jpeg),
-        ("page.png", png_page(WIDTH, HEIGHT), Format::Png),
-        ("page.bmp", bmp_page(WIDTH, HEIGHT), Format::Bmp),
-        ("page.webp", webp_page(WIDTH, HEIGHT), Format::WebP),
+    for (name, format) in [
+        ("page.png", Format::Png),
+        ("page.bmp", Format::Bmp),
+        ("page.webp", Format::WebP),
     ] {
-        let error = decode(name, &bytes, format, settings)
+        let whole = match format {
+            Format::Png => png_page(WIDTH, HEIGHT),
+            Format::Bmp => bmp_page(WIDTH, HEIGHT),
+            _ => webp_page(WIDTH, HEIGHT),
+        };
+        let headers = header_only(&whole, format);
+        assert!(
+            headers.len() < whole.len() / 4,
+            "{name}'s header cut is not much smaller than the page: {} of {}",
+            headers.len(),
+            whole.len()
+        );
+
+        // The geometry is readable from the cut, and it is the page's own.
+        assert_eq!(
+            header(name, &headers, format, Budget::default())
+                .expect("the header reads without the pixels"),
+            (WIDTH, HEIGHT),
+            "{name}'s geometry is not readable from its header alone"
+        );
+
+        // The pixels are not there, so a decode of the same bytes fails — which is what makes
+        // the next assertion mean something.
+        let undecodable = decode(name, &headers, format, DecodeSettings::default())
+            .expect_err("a header without its pixels cannot be decoded");
+        assert!(
+            matches!(undecodable.kind, PageErrorKind::Decode { .. }),
+            "{name}: expected a decode failure without a budget in the way, got {:?}",
+            undecodable.kind
+        );
+
+        // And with the budget in the way, the refusal is the budget's rather than the
+        // decoder's — which it can only be if the check ran before the decode.
+        let error = decode(name, &headers, format, tight)
             .expect_err("60,000 pixels is over a 1,000 pixel limit");
         let PageErrorKind::TooLarge {
             quantity, actual, ..
         } = error.kind
         else {
-            panic!("expected a budget refusal for {name}, got {:?}", error.kind);
+            panic!(
+                "{name} was refused by the decoder rather than by the budget, so the check ran \
+                 after the decode: {:?}",
+                error.kind
+            );
         };
-        assert_eq!(
-            quantity, "source pixels",
-            "{name} was refused from the decoded buffer rather than from its header"
-        );
+        assert_eq!(quantity, "source pixels");
         assert_eq!(actual, u128::from(WIDTH * HEIGHT));
+        assert_eq!(error.name, name, "the refusal must name the page");
+        assert!(error.to_string().contains(name), "{error}");
     }
+
+    // JPEG keeps its own forged-header fixture in `tests/page_codec.rs`, where a 1.8 KB file
+    // declaring 65500x65500 makes the same point through libjpeg. Asserted here only that the
+    // scaled path reaches the same variant and names the page.
+    let error = decode("page.jpg", &page_bytes(WIDTH, HEIGHT), Format::Jpeg, tight)
+        .expect_err("60,000 pixels is over a 1,000 pixel limit");
+    assert!(matches!(
+        error.kind,
+        PageErrorKind::TooLarge {
+            quantity: "source pixels",
+            ..
+        }
+    ));
+    assert_eq!(error.name, "page.jpg");
 }
 
-/// The decoded buffer is bounded too, and for the formats that cannot scale it is the term
-/// that matters: an `Rgba16` page asks for eight bytes a pixel where the page it becomes
-/// needs three.
+/// The decoded buffer is bounded too, and for the formats that cannot scale it is the term that
+/// matters: an `Rgba16` page asks for **eight** bytes a pixel where the page it becomes needs
+/// three, and the two are alive at once while the narrowing runs. Both are charged, which is the
+/// correction an independent review produced — the earlier version charged the decoder's buffer
+/// alone and reasoned that narrowing only drops bytes, which is true of the result and not of
+/// the moment both exist.
 #[test]
-fn the_decoders_own_buffer_is_bounded_before_it_is_allocated() {
+fn the_decoders_own_buffer_and_the_page_it_becomes_are_both_charged() {
+    let decoded = u128::from(WIDTH * HEIGHT * 8);
+    let page = u128::from(WIDTH * HEIGHT * 3);
+    let peak = decoded + page;
+
+    // A ceiling between the decoder's buffer and the peak, so the refusal can only come from
+    // charging both. Realistic rather than tiny, because png's own scratch pool is the smaller
+    // of this and the entry's length, and a byte-sized ceiling would starve that instead.
     let settings = DecodeSettings {
-        budget: Budget::new(1 << 30, 1_000),
+        budget: Budget::new(1 << 30, u64::try_from(decoded + page / 2).expect("fits")),
         ..DecodeSettings::default()
     };
     let error = decode(
@@ -389,7 +555,7 @@ fn the_decoders_own_buffer_is_bounded_before_it_is_allocated() {
         Format::Png,
         settings,
     )
-    .expect_err("480,000 bytes is over a 1,000 byte limit");
+    .expect_err("the decoder's buffer alone fits; the peak does not");
 
     let PageErrorKind::TooLarge {
         quantity, actual, ..
@@ -398,8 +564,18 @@ fn the_decoders_own_buffer_is_bounded_before_it_is_allocated() {
         panic!("expected a budget refusal, got {:?}", error.kind);
     };
     assert_eq!(quantity, "decoded bytes");
-    // Eight bytes a pixel, which is the decoder's figure and not the page's three.
-    assert_eq!(actual, u128::from(WIDTH * HEIGHT * 8));
+    assert_eq!(actual, peak, "the charged figure is not the two buffers");
+
+    // And the arms whose buffer is *moved* rather than copied are charged once, so a page that
+    // fits in one buffer is not refused for a copy that never happens.
+    let moved = DecodeSettings {
+        budget: Budget::new(1 << 30, u64::try_from(page).expect("fits")),
+        ..DecodeSettings::default()
+    };
+    assert!(
+        decode("plain.png", &png_page(WIDTH, HEIGHT), Format::Png, moved).is_ok(),
+        "an Rgb8 page is charged once, because `narrow` moves its buffer"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +800,7 @@ fn the_invalid_bmps_that_read_do_so_at_the_right_geometry() {
     ] {
         let bytes = fs::read(root.join(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
         assert_eq!(
-            header(file, &bytes, Format::Bmp).expect("the header reads"),
+            header(file, &bytes, Format::Bmp, Budget::default()).expect("the header reads"),
             (127, 64),
             "{file}'s declared geometry moved"
         );
@@ -715,9 +891,14 @@ fn an_out_of_range_palette_index_decodes_as_black() {
     );
 }
 
-/// Why BMP's magic is ten bytes rather than two, against the real file. `x/ba-bm.bmp` is an
-/// OS/2 bitmap *array*: it begins `BA` and contains a `BM`, so a two-byte magic would hand it
-/// to the BMP decoder on the strength of nothing.
+/// The one file in the suite that is not a BMP, against the real bytes. `x/ba-bm.bmp` is an
+/// OS/2 bitmap *array*: it begins `BA` and holds a `BM` at offset 14, so a probe that searched
+/// for the magic rather than anchoring it at offset 0 would claim it.
+///
+/// This does **not** demonstrate why BMP's magic is ten bytes — `Magic::matches` anchors
+/// `head`, so two bytes refuse this file just as ten do. That claim was in an earlier draft and
+/// an independent review caught it; the length floor `skipped` really buys is asserted by
+/// `a_bmp_too_short_to_hold_its_file_header_is_refused_at_the_probe` in `src/source/probe.rs`.
 #[test]
 fn an_os2_bitmap_array_is_not_claimed_by_the_bmp_candidate() {
     let Ok(root) = bmp_fixtures() else {
@@ -736,4 +917,57 @@ fn an_os2_bitmap_array_is_not_claimed_by_the_bmp_candidate() {
         None,
         "no candidate may claim an OS/2 bitmap array"
     );
+}
+
+/// The collision the widened filter makes reachable, pinned rather than discovered.
+///
+/// `cover.jpg` and `cover.png` both reach the output as `cover.jpg`, because the output
+/// extension is the encoder's. Before this change `cover.png` was passed over by the extension
+/// filter, so an archive holding both produced a one-page book and exited 0 — the silent loss
+/// this change exists to close. Refusing is the rule this project applies to every name it
+/// cannot carry faithfully.
+///
+/// `--fix-idx` escapes it **only for a numbered stem**, and that asymmetry is asserted rather
+/// than assumed: `Positions::of` renumbers a stem whose trailing run is digits and returns
+/// `output_name` unchanged for one whose is not, so `page1.jpg`/`page1.png` separate and
+/// `cover.jpg`/`cover.png` still collide.
+#[test]
+fn two_formats_sharing_a_stem_collide_in_the_output_and_the_run_is_refused() {
+    let directory = TempDir::new("image-pages-collision");
+    let stored = archive(&[
+        ("cover.jpg", page_bytes(WIDTH, HEIGHT)),
+        ("cover.png", png_page(WIDTH, HEIGHT)),
+    ]);
+
+    let output = directory.path().join("stored.zip");
+    let error = run(&stored, &output).expect_err("two stems map onto one output name");
+    let RunError::NameCollision { name } = error else {
+        panic!("expected a name collision, got {error:?}");
+    };
+    assert_eq!(name, "cover.jpg");
+    assert!(!output.exists(), "a failed run leaves no archive");
+
+    // An unnumbered stem collides under `--fix-idx` too, because the positional rule does not
+    // run on a stem with no trailing digit run.
+    let output = directory.path().join("unnumbered.zip");
+    let source = ZipSource::new(std::io::Cursor::new(stored), &by_position()).expect("reads");
+    assert!(matches!(
+        pipeline::run(source, &output, &settings()),
+        Err(RunError::NameCollision { .. })
+    ));
+
+    // A numbered stem does separate, and both pages reach the output.
+    let numbered = archive(&[
+        ("page1.jpg", page_bytes(WIDTH, HEIGHT)),
+        ("page1.png", png_page(WIDTH, HEIGHT)),
+    ]);
+    let output = directory.path().join("numbered.zip");
+    let source = ZipSource::new(std::io::Cursor::new(numbered), &by_position()).expect("reads");
+    let report = pipeline::run(source, &output, &settings()).expect("positions separate them");
+    assert_eq!(report.pages, 2);
+    let names: Vec<String> = read_archive(&output)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(names, ["page_1.jpg", "page_2.jpg"]);
 }

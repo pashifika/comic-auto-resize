@@ -19,8 +19,8 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use comic_auto_resize::page::{Channels, EncodeSettings, PageImage, encode};
-use flate2::write::DeflateEncoder;
+use comic_auto_resize::page::{Channels, EncodeSettings, Format, PageImage, encode};
+use flate2::write::{DeflateEncoder, ZlibEncoder};
 use flate2::{Compression, Crc};
 use image::{DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 use zip::write::SimpleFileOptions;
@@ -182,6 +182,68 @@ pub fn animated_webp(width: u32, height: u32) -> Vec<u8> {
     webp.extend_from_slice(&len32(&body).to_le_bytes());
     webp.extend_from_slice(&body);
     webp
+}
+
+/// `bytes` cut down to the part a header read needs, so the geometry is still readable and the
+/// pixels are not there at all.
+///
+/// This is what makes the budget's ordering falsifiable. Against an internally consistent
+/// fixture, an implementation that decoded first and checked afterwards would refuse the page
+/// too, and for the same stated reason — so the test would pass on the wrong code. Against
+/// these, a decode-first implementation reports a decode failure and only a header-first one
+/// reports the budget.
+///
+/// Per format, the cut is at the last byte a decoder needs to report `dimensions()`:
+///
+/// - **png**: through the first `IDAT`'s length and type plus four bytes of its data.
+///   `Decoder::read_info` stops at `IDAT` — it does not inflate it — so the geometry comes off
+///   `IHDR` and inflating the stub fails.
+/// - **bmp**: the 14-byte `BITMAPFILEHEADER` and the 40-byte `BITMAPINFOHEADER`. A 24-bit bmp
+///   carries no palette, so `read_metadata` needs nothing after them.
+/// - **webp**: the `RIFF`/`WEBP` header, the `VP8L` chunk header, and the five payload bytes
+///   that carry the signature and the 14-bit dimensions.
+pub fn header_only(bytes: &[u8], format: Format) -> Vec<u8> {
+    let at = match format {
+        Format::Png => png_chunk_offset(bytes, *b"IDAT").expect("an encoded png has an IDAT") + 12,
+        Format::Bmp => 54,
+        Format::WebP => 25,
+        Format::Jpeg => panic!("the JPEG path has its own forged-header fixture"),
+    };
+    bytes[..at].to_vec()
+}
+
+/// A png whose `iCCP` chunk inflates to `inflated` bytes from a payload of a few hundred.
+///
+/// The trigger an independent review found: `png`'s `read_info` parses every chunk before the
+/// first `IDAT`, and `parse_iccp_raw` inflates the profile bounded only by the decoder's own
+/// `Limits`. Under `PngDecoder::new` — which is `no_limits` — that bound is `usize::MAX`, so
+/// this fixture allocates `inflated` bytes during *header* parsing, before the dimensions are
+/// readable and therefore before any budget could see them. `Vec` growth ends in
+/// `handle_alloc_error`, which aborts rather than unwinds, so the pipeline's `catch_unwind`
+/// cannot intercept it.
+///
+/// The image itself is 1x1, so nothing about its declared size is remarkable; the whole of the
+/// attack is in the ancillary chunk. Deflate's ceiling is 1032:1, so `inflated` bytes cost
+/// about `inflated / 1000` in the fixture.
+pub fn png_with_inflating_profile(inflated: usize) -> Vec<u8> {
+    let png = png_page(1, 1);
+    let idat = png_chunk_offset(&png, *b"IDAT").expect("an encoded png has an IDAT");
+
+    // A zlib stream — `parse_iccp_raw` expects one — of a run of identical bytes, which is
+    // what compresses at close to Deflate's ceiling.
+    let mut zlib = ZlibEncoder::new(Vec::new(), Compression::best());
+    zlib.write_all(&vec![0u8; inflated])
+        .expect("writing to a Vec cannot fail");
+    let compressed = zlib.finish().expect("flushing to a Vec cannot fail");
+
+    // `iCCP` is a NUL-terminated profile name, one compression-method byte, then the stream.
+    let mut iccp = b"c\0\0".to_vec();
+    iccp.extend_from_slice(&compressed);
+
+    let mut spliced = png[..idat].to_vec();
+    spliced.extend_from_slice(&png_chunk(*b"iCCP", &iccp));
+    spliced.extend_from_slice(&png[idat..]);
+    spliced
 }
 
 /// The offset of the first `kind` chunk's length field, walking chunk lengths rather than
