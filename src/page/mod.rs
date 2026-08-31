@@ -1,9 +1,9 @@
 //! Decode, resize, and encode one comic page.
 //!
-//! JPEG is the only format here. It is what manga archives contain, and mozjpeg — used
-//! for both directions, because scaled decode and IDCT selection need libjpeg's decoder
-//! API — is the whole reason the rewrite can shrink an archive without visibly hurting
-//! line art. png, bmp, and webp arrive later.
+//! Four decoders, one encoder. mozjpeg is used for both directions — scaled decode and IDCT
+//! selection need libjpeg's decoder API, and the encoder is the whole reason the rewrite can
+//! shrink an archive without visibly hurting line art — and png, bmp and webp decode through
+//! `image`. The output is always JPEG; see [`ENCODED_FORMAT`].
 //!
 //! Every entry point takes the name of the page it is working on. libjpeg reports
 //! failures by unwinding, and a page that fails must be attributable without the caller
@@ -23,7 +23,7 @@ mod encode;
 mod resize;
 
 pub use budget::Budget;
-pub use decode::{DecodeSettings, decode, header, scale_numerator};
+pub use decode::{DecodeSettings, Decoded, decode, header, scale_numerator};
 pub use encode::{EncodeSettings, encode};
 pub use resize::{Filter, Resampler, UnknownFilter, height_for_width};
 
@@ -36,6 +36,48 @@ use thiserror::Error;
 
 /// JPEG's start-of-image marker, which every JPEG stream begins with.
 pub const SOI_MARKER: [u8; 2] = [0xFF, 0xD8];
+
+/// An image format this build can decode.
+///
+/// Here rather than beside the probe that selects it, because it is the set of formats the
+/// *decoders* cover; `source::probe` owns which bytes and which extension choose one. Every
+/// format leaves as [`ENCODED_FORMAT`]: one encoder, many decoders.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Format {
+    Jpeg,
+    Png,
+    Bmp,
+    WebP,
+}
+
+/// The format every page is encoded to, whatever it arrived as.
+///
+/// The output extension is therefore the encoder's property and not the entry's, which is
+/// why `source::output_name` takes no format at all.
+pub const ENCODED_FORMAT: Format = Format::Jpeg;
+
+impl Format {
+    /// This format's canonical extension, without the dot.
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Jpeg => "jpg",
+            Self::Png => "png",
+            Self::Bmp => "bmp",
+            Self::WebP => "webp",
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Jpeg => "JPEG",
+            Self::Png => "PNG",
+            Self::Bmp => "BMP",
+            Self::WebP => "WebP",
+        }
+    }
+}
 
 /// How many 8-bit samples one pixel of a page carries.
 ///
@@ -324,8 +366,11 @@ pub enum PageErrorKind {
     /// Rejected before libjpeg was invoked at all.
     #[error("not a JPEG: expected the FF D8 start-of-image marker, found {0}")]
     NotJpeg(String),
-    #[error("JPEG decode failed: {0}")]
-    Decode(String),
+    /// The decoder rejected the stream. `format` is the format its bytes selected, so a
+    /// refusal names which decoder refused it — and for a sub-format this build cannot read,
+    /// `reason` is the decoder's own message, which names the feature.
+    #[error("{} decode failed: {reason}", format.name())]
+    Decode { format: Format, reason: String },
     #[error("resize failed: {0}")]
     Resize(String),
     #[error("JPEG encode failed: {0}")]
@@ -355,13 +400,30 @@ pub enum PageErrorKind {
     /// cannot take the run's error reporting down with it.
     #[error("processing panicked")]
     Panicked,
+    /// An animation or any multi-frame image, refused rather than reduced to its first
+    /// frame: taking one frame of an animation as the page is the silent alteration this
+    /// project refuses everywhere else.
+    #[error("{} holds multiple frames, which is an animation rather than a page", format.name())]
+    MultiFrame { format: Format },
+    /// A pixel shape no narrowing rule covers. An alpha channel is composited onto white and
+    /// a deeper sample is narrowed to eight bits; anything else is refused rather than
+    /// converted on a guess.
+    ///
+    /// `shape` is owned because it is the decoder's own name for the colour type, and that set
+    /// is `#[non_exhaustive]` upstream — a variant added there has no `&'static str` here.
+    #[error("{} decoded to {shape}, which no narrowing rule covers", format.name())]
+    Pixels { format: Format, shape: String },
 }
 
 impl From<io::Error> for PageErrorKind {
-    /// Both native libraries report a refusal as an `io::Error`, and every such refusal
-    /// reaching this crate came out of a decode.
+    /// mozjpeg reports a refusal as an `io::Error`, and every such refusal reaching this
+    /// crate came out of the JPEG decoder. `image` reports its own as an `ImageError`, which
+    /// the raster path maps explicitly.
     fn from(error: io::Error) -> Self {
-        Self::Decode(error.to_string())
+        Self::Decode {
+            format: Format::Jpeg,
+            reason: error.to_string(),
+        }
     }
 }
 

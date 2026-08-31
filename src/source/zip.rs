@@ -235,9 +235,9 @@ impl<R: Read + Seek> ZipSource<R> {
             Ok(read) => &head[..read],
             // The first read of the decrypted stream, and the one a false-accepted ZipCrypto
             // password fails for a *Deflate* entry: the plaintext is garbage, so inflating it
-            // errors before two bytes exist. Deflate is `zip`'s own default, so routing this
-            // arm past `read_failure` would have hidden the clause from the ordinary case and
-            // shown it only on a Stored one.
+            // errors before `MAGIC_MAX` bytes exist. Deflate is `zip`'s own default, so
+            // routing this arm past `read_failure` would have hidden the clause from the
+            // ordinary case and shown it only on a Stored one.
             Err(source) => return Yielded::Failed(read_failure(name, false_accept, source)),
         };
 
@@ -306,7 +306,7 @@ impl<R: Read + Seek> ZipSource<R> {
 
         Yielded::Entry(Entry {
             index,
-            name: self.names.of(name, declared),
+            name: self.names.of(name),
             format: declared,
             bytes,
         })

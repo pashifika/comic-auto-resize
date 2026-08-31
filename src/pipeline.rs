@@ -92,7 +92,7 @@ use crossbeam_channel::bounded;
 use thiserror::Error;
 
 use crate::page::{
-    DecodeSettings, EncodeSettings, Filter, PageError, Resampler, decode, encode, header,
+    DecodeSettings, EncodeSettings, Filter, Format, PageError, Resampler, decode, encode, header,
 };
 use crate::policy::{self, Plan};
 use crate::sink::{Page, PageKey, Sink};
@@ -144,6 +144,25 @@ pub struct Settings {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Report {
     pub pages: u32,
+    /// How many pages carried an alpha channel that was composited onto white.
+    ///
+    /// **The first page outcome that is neither fine nor fatal**, and the reason this field
+    /// exists rather than a warning: every page-level anomaly until now fell on one side or
+    /// the other — a page libjpeg repaired by fabricating coefficients *ends the run*, because
+    /// such a page is not the page — so there was no warn-and-carry channel at all. Compositing
+    /// is a third kind: the tool processed the page **and altered how it looks**, where
+    /// refusing it would refuse a page a viewer displays correctly and saying nothing would be
+    /// the silent change this project refuses everywhere else.
+    ///
+    /// A count for the run rather than a line per page, because a 218-page archive would
+    /// otherwise emit 218 warnings around the one line the run already prints. Zero means the
+    /// caller says nothing about compositing, so a run that composited nothing produces the
+    /// output it produced before this field existed.
+    ///
+    /// Counting is **not** a way to continue past a failure: a page that cannot be processed
+    /// still ends the run, and only a page the tool processed and took a decision about is
+    /// counted here.
+    pub composited: u32,
 }
 
 /// Processes every page of `source` into a new archive at `output`.
@@ -178,7 +197,7 @@ pub fn run<S: Entries + Send>(
     }
 
     let (work_tx, work_rx) = bounded::<Job>(capacities.work);
-    let (done_tx, done_rx) = bounded::<Result<Page, PageError>>(capacities.done);
+    let (done_tx, done_rx) = bounded::<Result<Finished, PageError>>(capacities.done);
 
     // Created before any thread starts, so an existing output is refused without reading a
     // single entry.
@@ -220,22 +239,28 @@ pub fn run<S: Entries + Send>(
         drop(done_tx);
 
         // The writer runs here rather than on a worker: it is the one stage that must never
-        // wait on another stage's thread while holding something that stage needs.
+        // wait on another stage's thread while holding something that stage needs. It is also
+        // where the composited pages are counted, because it is the one stage that sees every
+        // page exactly once and in one thread.
+        let mut composited = 0;
         let mut failure = None;
         while let Ok(finished) = done_rx.recv() {
             match finished {
-                Ok(page) => match sink.accept(page) {
-                    Ok(written) => {
-                        for _ in 0..written {
-                            // The reader may already be gone; that is not a failure.
-                            let _ = credit_tx.send(());
+                Ok(finished) => {
+                    composited += u32::from(finished.composited);
+                    match sink.accept(finished.page) {
+                        Ok(written) => {
+                            for _ in 0..written {
+                                // The reader may already be gone; that is not a failure.
+                                let _ = credit_tx.send(());
+                            }
+                        }
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
                         }
                     }
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
-                    }
-                },
+                }
                 Err(error) => {
                     failure = Some(RunError::Page(error));
                     break;
@@ -256,13 +281,14 @@ pub fn run<S: Entries + Send>(
         // usually just the disconnect the failure caused.
         match (failure, read) {
             (Some(error), _) | (None, Err(error)) => Err(error),
-            (None, Ok(())) => Ok(()),
+            (None, Ok(())) => Ok(composited),
         }
     });
 
     match outcome {
-        Ok(()) => Ok(Report {
+        Ok(composited) => Ok(Report {
             pages: sink.finish()?,
+            composited,
         }),
         // The sink's `Drop` removes the partial; there is nothing else to undo.
         Err(error) => Err(error),
@@ -273,7 +299,20 @@ pub fn run<S: Entries + Send>(
 struct Job {
     key: PageKey,
     name: String,
+    /// The format the entry's *bytes* selected, which is what decides the decoder. The
+    /// reader established it and refused a disagreement with the extension, so nothing here
+    /// probes again.
+    format: Format,
     bytes: Vec<u8>,
+}
+
+/// One finished page and what the run has to remember about it.
+///
+/// The flag rides here rather than on [`Page`] because the sink writes bytes and has no use
+/// for the page's provenance; only the tally does.
+struct Finished {
+    page: Page,
+    composited: bool,
 }
 
 /// Reads the archive once, taking a credit before each entry.
@@ -294,6 +333,7 @@ fn read_entries<S: Entries>(
         let job = Job {
             key: (entry.index, 0),
             name: entry.name,
+            format: entry.format,
             bytes: entry.bytes,
         };
         if work.send(job).is_err() {
@@ -303,18 +343,31 @@ fn read_entries<S: Entries>(
 }
 
 /// Decode, plan, resize, encode — the whole of one page.
-fn process(job: Job, resampler: &mut Resampler, settings: &Settings) -> Result<Page, PageError> {
-    let Job { key, name, bytes } = job;
+fn process(
+    job: Job,
+    resampler: &mut Resampler,
+    settings: &Settings,
+) -> Result<Finished, PageError> {
+    let Job {
+        key,
+        name,
+        format,
+        bytes,
+    } = job;
 
     // The header first, because the resize policy needs the source geometry to choose both
     // the target height and whether to resize at all, and a scaled decode cannot be
-    // configured before that is known.
-    let (source_width, source_height) = header(&name, &bytes)?;
+    // configured before that is known. The budget refusal itself is inside `decode`, at the
+    // point each decoder has parsed its header and before it allocates from it — for every
+    // format, including the three whose decoder cannot scale. The budget is passed here
+    // because reading a *png*'s header is itself an allocating operation.
+    let (source_width, source_height) = header(&name, &bytes, format, settings.decode.budget)?;
     let plan = policy::plan(source_width, source_height, settings.target_width);
 
     let decoded = decode(
         &name,
         &bytes,
+        format,
         DecodeSettings {
             scale_to: plan.scale_to(source_width, source_height),
             ..settings.decode
@@ -322,12 +375,15 @@ fn process(job: Job, resampler: &mut Resampler, settings: &Settings) -> Result<P
     )?;
     // Pass-through skips the resize and nothing else.
     let page = match plan {
-        Plan::Resize { width } => resampler.resize(&name, &decoded, width, settings.filter)?,
-        Plan::PassThrough => decoded,
+        Plan::Resize { width } => resampler.resize(&name, &decoded.page, width, settings.filter)?,
+        Plan::PassThrough => decoded.page,
     };
     let bytes = encode(&name, &page, settings.encode)?;
 
-    Ok(Page { key, name, bytes })
+    Ok(Finished {
+        page: Page { key, name, bytes },
+        composited: decoded.composited,
+    })
 }
 
 /// Why a run stopped.

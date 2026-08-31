@@ -168,12 +168,19 @@ impl Sink {
     }
 
     fn write(&mut self, page: &Page) -> Result<(), RunError> {
-        // Rewriting every extension to the encoder's can map two stored names onto one:
-        // `p.jpeg` and `p.jpg` both become `p.jpg`. `ZipWriter` rejects the second with
-        // "Duplicate filename", which never mentions the rename that caused it, so the
-        // collision is caught here where both halves are known. The set costs no asymptotic
-        // memory the writer was not already paying: it holds every name for the central
-        // directory regardless.
+        // Rewriting every extension to the encoder's can map two stored names onto one, and
+        // widening the extension filter to png, bmp and webp widened this too: `p.jpeg` and
+        // `p.jpg` collide, and so now do `cover.jpg` and `cover.png`. The second was silently
+        // *skipped* before those formats were decoded, so an archive holding both used to
+        // produce a short book and exit 0; refusing is the same rule this project applies to
+        // every other name it cannot carry faithfully. `--fix-idx` is the way through for a
+        // *numbered* stem, because the positional rule replaces its trailing digit run —
+        // `cover.jpg` and `cover.png` have none, so they collide under it too.
+        //
+        // `ZipWriter` rejects the second with "Duplicate filename", which never mentions the
+        // rename that caused it, so the collision is caught here where both halves are known.
+        // The set costs no asymptotic memory the writer was not already paying: it holds every
+        // name for the central directory regardless.
         if !self.names.insert(page.name.clone()) {
             return Err(RunError::NameCollision {
                 name: page.name.clone(),

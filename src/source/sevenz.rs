@@ -347,7 +347,7 @@ fn decode(
         //   2. the trailing separator  — a directory that failed to set its flag
         //   3. the extension filter    — not a page, and cheap to decide from the name
         //   4. the recorded size       — refusable before any data is read
-        //   5. the leading bytes       — read on their own, so a mismatch costs two bytes
+        //   5. the leading bytes       — read on their own, so a mismatch costs `MAGIC_MAX`
         //   6. the rest of the entry   — bounded on the way in
         //   7. the stored name         — refused only once it is a page worth naming
         //
@@ -415,7 +415,7 @@ fn decode(
             sender,
             Ok(Entry {
                 index,
-                name: names.of(&name, declared),
+                name: names.of(&name),
                 format: declared,
                 bytes,
             }),

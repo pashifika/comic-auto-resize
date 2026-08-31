@@ -15,13 +15,14 @@
 #![allow(dead_code)]
 
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use comic_auto_resize::page::{Channels, EncodeSettings, PageImage, encode};
-use flate2::write::DeflateEncoder;
+use comic_auto_resize::page::{Channels, EncodeSettings, Format, PageImage, encode};
+use flate2::write::{DeflateEncoder, ZlibEncoder};
 use flate2::{Compression, Crc};
+use image::{DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -79,6 +80,345 @@ pub fn page_bytes(width: u32, height: u32) -> Vec<u8> {
         EncodeSettings::default(),
     )
     .unwrap_or_else(|error| panic!("encoding a {width}x{height} fixture page failed: {error}"))
+}
+
+/// The same page as [`page`], encoded as png.
+///
+/// Generated at test time rather than committed, for the reason the archives are: `image`'s
+/// png encoder is under the same feature as its decoder, so this costs no test-only
+/// dependency and no blob. The bytes are the encoder's, so a dependency bump that changes
+/// them changes both sides at once — which is why the assertions are on geometry and channel
+/// count rather than on bytes.
+pub fn png_page(width: u32, height: u32) -> Vec<u8> {
+    let page = page(width, height);
+    encoded(
+        &DynamicImage::ImageRgb8(
+            RgbImage::from_raw(width, height, page.pixels().to_vec())
+                .expect("the buffer matches the dimensions"),
+        ),
+        ImageFormat::Png,
+    )
+}
+
+/// The same page encoded as bmp.
+pub fn bmp_page(width: u32, height: u32) -> Vec<u8> {
+    let page = page(width, height);
+    encoded(
+        &DynamicImage::ImageRgb8(
+            RgbImage::from_raw(width, height, page.pixels().to_vec())
+                .expect("the buffer matches the dimensions"),
+        ),
+        ImageFormat::Bmp,
+    )
+}
+
+/// The page as an RGB16 png: sixteen bits and no alpha, so the narrowing is observable on
+/// its own rather than alongside a composite.
+pub fn png_rgb16_page(width: u32, height: u32) -> Vec<u8> {
+    let page = page(width, height);
+    // `v * 257` is the exact 8-to-16-bit widening, so every sample's high byte is the
+    // generator's own value and the narrowing is checkable against it.
+    let samples: Vec<u16> = page
+        .pixels()
+        .iter()
+        .map(|&sample| u16::from(sample) * 257)
+        .collect();
+    encoded(
+        &DynamicImage::ImageRgb16(
+            ImageBuffer::<Rgb<u16>, Vec<u16>>::from_raw(width, height, samples)
+                .expect("the buffer matches the dimensions"),
+        ),
+        ImageFormat::Png,
+    )
+}
+
+/// The page as a png that *declares* itself an animation.
+///
+/// An `acTL` chunk spliced in before the first `IDAT`, which is what `PngDecoder::is_apng`
+/// reports. The declaration is the case under test: a container that says "animation" has to
+/// be refused rather than have its first frame taken as the page, so the `fdAT` frames a
+/// complete APNG would carry are neither needed nor written.
+pub fn apng_page(width: u32, height: u32) -> Vec<u8> {
+    let png = png_page(width, height);
+    let at = png_chunk_offset(&png, *b"IDAT").expect("an encoded png has an IDAT chunk");
+    let mut spliced = png[..at].to_vec();
+    // Two frames, looping forever.
+    spliced.extend_from_slice(&png_chunk(*b"acTL", &[0, 0, 0, 2, 0, 0, 0, 0]));
+    spliced.extend_from_slice(&png[at..]);
+    spliced
+}
+
+/// A webp container that declares itself an animation.
+///
+/// Hand-assembled, because `image`'s webp encoder writes single-frame VP8L only. What
+/// `image_webp` requires before it reports an animation: a `VP8X` header with the animation
+/// flag set, an `ANIM` chunk, and an `ANMF` chunk of at least 24 bytes. The frame's pixels
+/// are not among them — the refusal comes before any frame is decoded, which is the point.
+pub fn animated_webp(width: u32, height: u32) -> Vec<u8> {
+    let mut body = b"WEBP".to_vec();
+
+    // Flags: bit 1 is the animation flag. Then three reserved bytes and the canvas, each
+    // axis stored one less than its real value.
+    let mut vp8x = vec![0b0000_0010, 0, 0, 0];
+    vp8x.extend_from_slice(&three(width - 1));
+    vp8x.extend_from_slice(&three(height - 1));
+    body.extend_from_slice(&riff_chunk(*b"VP8X", &vp8x));
+
+    // A white background hint, then a loop count of zero: loop forever.
+    body.extend_from_slice(&riff_chunk(*b"ANIM", &[0xFF, 0xFF, 0xFF, 0xFF, 0, 0]));
+
+    // One frame header — offsets, dimensions, duration, flags — padded to the 24 bytes the
+    // reader requires before it will count the frame.
+    let mut anmf = Vec::new();
+    anmf.extend_from_slice(&three(0));
+    anmf.extend_from_slice(&three(0));
+    anmf.extend_from_slice(&three(width - 1));
+    anmf.extend_from_slice(&three(height - 1));
+    anmf.extend_from_slice(&three(100));
+    anmf.resize(24, 0);
+    body.extend_from_slice(&riff_chunk(*b"ANMF", &anmf));
+
+    let mut webp = b"RIFF".to_vec();
+    webp.extend_from_slice(&len32(&body).to_le_bytes());
+    webp.extend_from_slice(&body);
+    webp
+}
+
+/// `bytes` cut down to the part a header read needs, so the geometry is still readable and the
+/// pixels are not there at all.
+///
+/// This is what makes the budget's ordering falsifiable. Against an internally consistent
+/// fixture, an implementation that decoded first and checked afterwards would refuse the page
+/// too, and for the same stated reason — so the test would pass on the wrong code. Against
+/// these, a decode-first implementation reports a decode failure and only a header-first one
+/// reports the budget.
+///
+/// Per format, the cut is at the last byte a decoder needs to report `dimensions()`:
+///
+/// - **png**: through the first `IDAT`'s length and type plus four bytes of its data.
+///   `Decoder::read_info` stops at `IDAT` — it does not inflate it — so the geometry comes off
+///   `IHDR` and inflating the stub fails.
+/// - **bmp**: the 14-byte `BITMAPFILEHEADER` and the 40-byte `BITMAPINFOHEADER`. A 24-bit bmp
+///   carries no palette, so `read_metadata` needs nothing after them.
+/// - **webp**: the `RIFF`/`WEBP` header, the `VP8L` chunk header, and the five payload bytes
+///   that carry the signature and the 14-bit dimensions.
+pub fn header_only(bytes: &[u8], format: Format) -> Vec<u8> {
+    let at = match format {
+        Format::Png => png_chunk_offset(bytes, *b"IDAT").expect("an encoded png has an IDAT") + 12,
+        Format::Bmp => 54,
+        Format::WebP => 25,
+        Format::Jpeg => panic!("the JPEG path has its own forged-header fixture"),
+    };
+    bytes[..at].to_vec()
+}
+
+/// A png whose `iCCP` chunk inflates to `inflated` bytes from a payload of a few hundred.
+///
+/// The trigger an independent review found: `png`'s `read_info` parses every chunk before the
+/// first `IDAT`, and `parse_iccp_raw` inflates the profile bounded only by the decoder's own
+/// `Limits`. Under `PngDecoder::new` — which is `no_limits` — that bound is `usize::MAX`, so
+/// this fixture allocates `inflated` bytes during *header* parsing, before the dimensions are
+/// readable and therefore before any budget could see them. `Vec` growth ends in
+/// `handle_alloc_error`, which aborts rather than unwinds, so the pipeline's `catch_unwind`
+/// cannot intercept it.
+///
+/// The image itself is 1x1, so nothing about its declared size is remarkable; the whole of the
+/// attack is in the ancillary chunk. Deflate's ceiling is 1032:1, so `inflated` bytes cost
+/// about `inflated / 1000` in the fixture.
+pub fn png_with_inflating_profile(inflated: usize) -> Vec<u8> {
+    let png = png_page(1, 1);
+    let idat = png_chunk_offset(&png, *b"IDAT").expect("an encoded png has an IDAT");
+
+    // A zlib stream — `parse_iccp_raw` expects one — of a run of identical bytes, which is
+    // what compresses at close to Deflate's ceiling.
+    let mut zlib = ZlibEncoder::new(Vec::new(), Compression::best());
+    zlib.write_all(&vec![0u8; inflated])
+        .expect("writing to a Vec cannot fail");
+    let compressed = zlib.finish().expect("flushing to a Vec cannot fail");
+
+    // `iCCP` is a NUL-terminated profile name, one compression-method byte, then the stream.
+    let mut iccp = b"c\0\0".to_vec();
+    iccp.extend_from_slice(&compressed);
+
+    let mut spliced = png[..idat].to_vec();
+    spliced.extend_from_slice(&png_chunk(*b"iCCP", &iccp));
+    spliced.extend_from_slice(&png[idat..]);
+    spliced
+}
+
+/// A png carrying a `tEXt` chunk of `comment` bytes before its first `IDAT`.
+///
+/// Legal, and the case a first draft of the decoder's memory pool refused: `png`'s `Limits` is a
+/// decrementing pool that charges a chunk *twice* — once for the capacity growth of the buffer
+/// holding it, which doubles and so costs up to `2L`, and again for the chunk's own length when
+/// it is `tEXt`, `zTXt` or `iTXt`. A pool sized at one entry plus a scanline therefore refused a
+/// 3.2 MB page over a 2 MiB comment, and the run exited non-zero with no archive.
+pub fn png_with_text_chunk(width: u32, height: u32, comment: usize) -> Vec<u8> {
+    let png = png_page(width, height);
+    let idat = png_chunk_offset(&png, *b"IDAT").expect("an encoded png has an IDAT");
+
+    // A NUL-separated keyword and text, which is what `tEXt` holds.
+    let mut text = b"Comment\0".to_vec();
+    text.resize(text.len() + comment, b'x');
+
+    let mut spliced = png[..idat].to_vec();
+    spliced.extend_from_slice(&png_chunk(*b"tEXt", &text));
+    spliced.extend_from_slice(&png[idat..]);
+    spliced
+}
+
+/// The offset of the first `kind` chunk's length field, walking chunk lengths rather than
+/// searching for the type: a chunk's *data* may hold the four bytes being looked for.
+fn png_chunk_offset(png: &[u8], kind: [u8; 4]) -> Option<usize> {
+    let mut at = 8;
+    while at + 8 <= png.len() {
+        if png[at + 4..at + 8] == kind {
+            return Some(at);
+        }
+        let length = u32::from_be_bytes(png[at..at + 4].try_into().ok()?);
+        at += 12 + usize::try_from(length).ok()?;
+    }
+    None
+}
+
+/// A png chunk: length, type, data, then a CRC over the type and the data.
+fn png_chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = len32(data).to_be_bytes().to_vec();
+    chunk.extend_from_slice(&kind);
+    chunk.extend_from_slice(data);
+    let mut checked = kind.to_vec();
+    checked.extend_from_slice(data);
+    chunk.extend_from_slice(&crc32(&checked).to_be_bytes());
+    chunk
+}
+
+/// A RIFF chunk: four-byte type, little-endian size, payload padded to an even length.
+fn riff_chunk(kind: [u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = kind.to_vec();
+    chunk.extend_from_slice(&len32(data).to_le_bytes());
+    chunk.extend_from_slice(data);
+    if data.len() % 2 == 1 {
+        chunk.push(0);
+    }
+    chunk
+}
+
+/// A 24-bit little-endian value, as webp's headers store a dimension.
+fn three(value: u32) -> [u8; 3] {
+    let bytes = value.to_le_bytes();
+    [bytes[0], bytes[1], bytes[2]]
+}
+
+/// The same page encoded as a lossless webp.
+///
+/// `image`'s webp encoder is VP8L-only, which is all this needs: the fixture has to be a
+/// webp container the decoder reads, not a demonstration of VP8 rate control.
+pub fn webp_page(width: u32, height: u32) -> Vec<u8> {
+    let page = page(width, height);
+    encoded(
+        &DynamicImage::ImageRgb8(
+            RgbImage::from_raw(width, height, page.pixels().to_vec())
+                .expect("the buffer matches the dimensions"),
+        ),
+        ImageFormat::WebP,
+    )
+}
+
+/// The same page as a grayscale png, so the one-component path is exercised through a
+/// decoder that is not libjpeg.
+pub fn png_gray_page(width: u32, height: u32) -> Vec<u8> {
+    let page = page(width, height);
+    let grey: Vec<u8> = page.pixels().iter().step_by(3).copied().collect();
+    encoded(
+        &DynamicImage::ImageLuma8(
+            GrayImage::from_raw(width, height, grey).expect("one channel of three"),
+        ),
+        ImageFormat::Png,
+    )
+}
+
+/// The page as an RGBA8 png whose alpha channel is `alpha` everywhere.
+///
+/// `0xFF` is the case the composite must leave alone — the one that would break silently —
+/// and anything lower is a page whose appearance the rule changes.
+pub fn png_rgba_page(width: u32, height: u32, alpha: u8) -> Vec<u8> {
+    encoded(
+        &DynamicImage::ImageRgba8(with_alpha(width, height, alpha)),
+        ImageFormat::Png,
+    )
+}
+
+/// The page as an RGBA8 png whose left half is transparent and right half opaque.
+///
+/// One fixture rather than two, because the property is that the two halves come out
+/// *differently*: the transparent side becomes paper and the opaque side is untouched.
+pub fn png_half_transparent_page(width: u32, height: u32) -> Vec<u8> {
+    let mut image = with_alpha(width, height, u8::MAX);
+    for (x, _, pixel) in image.enumerate_pixels_mut() {
+        if x < width / 2 {
+            pixel.0[3] = 0;
+        }
+    }
+    encoded(&DynamicImage::ImageRgba8(image), ImageFormat::Png)
+}
+
+/// The page as an RGBA16 png, so both channels the encoder cannot carry arrive at once.
+pub fn png_rgba16_page(width: u32, height: u32, alpha: u16) -> Vec<u8> {
+    let page = page(width, height);
+    let mut samples = Vec::with_capacity((width * height * 4) as usize);
+    for pixel in page.pixels().chunks_exact(3) {
+        // `v * 257` is the exact 8-to-16-bit widening, so the fixture's high bytes are the
+        // generator's own values and the narrowing is checkable against them.
+        samples.extend(pixel.iter().map(|&sample| u16::from(sample) * 257));
+        samples.push(alpha);
+    }
+    encoded(
+        &DynamicImage::ImageRgba16(
+            ImageBuffer::<Rgba<u16>, Vec<u16>>::from_raw(width, height, samples)
+                .expect("four channels of three"),
+        ),
+        ImageFormat::Png,
+    )
+}
+
+/// The page with a uniform alpha channel appended.
+fn with_alpha(width: u32, height: u32, alpha: u8) -> RgbaImage {
+    let page = page(width, height);
+    let mut samples = Vec::with_capacity((width * height * 4) as usize);
+    for pixel in page.pixels().chunks_exact(3) {
+        samples.extend_from_slice(pixel);
+        samples.push(alpha);
+    }
+    RgbaImage::from_raw(width, height, samples).expect("four channels of three")
+}
+
+/// `image` encoding `image` into `format`, in memory.
+fn encoded(image: &DynamicImage, format: ImageFormat) -> Vec<u8> {
+    let mut bytes = Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, format)
+        .unwrap_or_else(|error| panic!("encoding a {format:?} fixture failed: {error}"));
+    bytes.into_inner()
+}
+
+/// The BMP conformance corpus, or `None` with the script that writes it.
+///
+/// The convention the rar and 7z suites already follow: a test that silently does not run is
+/// worse than one that says why. The corpus arrives by fetch rather than by commit because
+/// its generator is GPL-3.0 and is run rather than conveyed.
+pub fn bmp_fixtures() -> Result<PathBuf, String> {
+    let root = std::env::var_os("CAR_BMP_FIXTURES").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/bmp-fixtures"),
+        PathBuf::from,
+    );
+    if root.join("g").is_dir() {
+        return Ok(root);
+    }
+    Err(format!(
+        "the BMP conformance corpus is not at {}; run tests/fixtures/make-bmp-fixtures.sh, \
+         or set CAR_BMP_FIXTURES",
+        root.display()
+    ))
 }
 
 /// Writes a Stored zip holding `entries` in exactly the order given.

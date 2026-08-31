@@ -4,6 +4,10 @@
 //! be shrunk skip most of its own IDCT work, and IDCT method selection. No pure-Rust
 //! decoder offers either, so the decoder that is already linked for its encoder is used
 //! for both directions.
+//!
+//! The one format whose decode can be *scaled*, and the only one here for that reason. The
+//! other three go through [`super::raster`], which has no equivalent — so for them the pixel
+//! buffer follows the source's dimensions rather than the target's.
 
 use std::os::raw::c_int;
 use std::panic;
@@ -15,10 +19,11 @@ use mozjpeg_sys::{
     JWRN_NOT_SEQUENTIAL, JWRN_TOO_MUCH_DATA,
 };
 
-use super::{
-    Budget, Channels, DctMethod, PageError, PageErrorKind, PageImage, SOI_MARKER, require_soi,
-    unwind_reason,
+use crate::page::{
+    Channels, Format, PageError, PageErrorKind, PageImage, SOI_MARKER, require_soi, unwind_reason,
 };
+
+use super::DecodeSettings;
 
 /// JPEG's end-of-image marker.
 const EOI_MARKER: [u8; 2] = [0xFF, 0xD9];
@@ -77,21 +82,6 @@ const BENIGN_CODES: [c_int; 4] = [
 /// every one contained `JWRN_JPEG_EOF`.
 const TRUNCATION_CODES: [c_int; 2] = [JWRN_HIT_MARKER, JWRN_JPEG_EOF];
 
-/// What the decoder is allowed to do to a page on the way in.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct DecodeSettings {
-    pub dct_method: DctMethod,
-    /// Size the decode may scale down towards, as `(width, height)`.
-    ///
-    /// `None` decodes at full size. Scaling here is free relative to decoding and then
-    /// resampling, but it is coarse — eighths of the original — so the resampler still
-    /// does the final step.
-    pub scale_to: Option<(u32, u32)>,
-    /// What the page is allowed to cost. Checked after the header is read and before
-    /// libjpeg allocates for it.
-    pub budget: Budget,
-}
-
 /// Decodes `buffer` into 8-bit pixels, keeping the source's channel count.
 ///
 /// A grayscale JPEG comes back as [`Channels::Gray`] and everything else as
@@ -116,9 +106,7 @@ pub fn decode(name: &str, buffer: &[u8], settings: DecodeSettings) -> Result<Pag
         channels,
         pixels,
     } = panic::catch_unwind(|| decode_pixels(buffer, settings))
-        .map_err(|payload| {
-            PageError::new(name, PageErrorKind::Decode(unwind_reason(payload.as_ref())))
-        })?
+        .map_err(|payload| PageError::new(name, decode_failed(unwind_reason(payload.as_ref()))))?
         .map_err(|kind| PageError::new(name, kind))?;
 
     PageImage::new(width, height, channels, pixels)
@@ -148,10 +136,19 @@ pub fn header(name: &str, buffer: &[u8]) -> Result<(u32, u32), PageError> {
             dimension(decompress.height()),
         ))
     })
-    .map_err(|payload| {
-        PageError::new(name, PageErrorKind::Decode(unwind_reason(payload.as_ref())))
-    })?
+    .map_err(|payload| PageError::new(name, decode_failed(unwind_reason(payload.as_ref()))))?
     .map_err(|kind| PageError::new(name, kind))
+}
+
+/// A libjpeg complaint as a `PageErrorKind`.
+///
+/// One place, because the variant now names the format it came from and three other decoders
+/// use the same variant.
+fn decode_failed(reason: String) -> PageErrorKind {
+    PageErrorKind::Decode {
+        format: Format::Jpeg,
+        reason,
+    }
 }
 
 /// One decoded page: the buffer, its own dimensions, and the ones the header declared.

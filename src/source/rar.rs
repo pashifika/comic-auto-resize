@@ -279,7 +279,7 @@ impl RarSource {
             self.next_index += 1;
             return Some(Ok(Entry {
                 index,
-                name: self.names.of(&name, declared),
+                name: self.names.of(&name),
                 format: declared,
                 bytes,
             }));

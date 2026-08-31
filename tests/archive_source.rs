@@ -8,10 +8,9 @@ mod support;
 
 use std::io::{Cursor, Write};
 
-use comic_auto_resize::page::{Channels, PageImage};
-use comic_auto_resize::page::{EncodeSettings, encode};
+use comic_auto_resize::page::{Channels, EncodeSettings, Format, PageImage, encode};
 use comic_auto_resize::source::{
-    CANDIDATES, Format, MAGIC_MAX, MAX_ENTRY_BYTES, ReadOptions, SourceError, ZipSource, probe,
+    CANDIDATES, MAGIC_MAX, MAX_ENTRY_BYTES, ReadOptions, SourceError, ZipSource, probe,
 };
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -111,11 +110,25 @@ fn the_same_archive_probes_identically_twice() {
 #[test]
 fn a_candidates_compared_bytes_are_the_bytes_it_declares() {
     // The `utils/images/plugs/bmp.go` defect: `Matched` compared the webp header while
-    // `HeaderLen` returned the bmp header's length, so the candidate could never match.
-    // Here one field is both, so the mismatch cannot be expressed.
+    // `HeaderLen` returned the bmp header's length, so the candidate could never match. Here
+    // the length is derived from the fields the comparison reads, so the mismatch cannot be
+    // expressed — and with four candidates, no two may claim one header either.
     for candidate in CANDIDATES {
-        assert!(candidate.magic.len() <= MAGIC_MAX);
-        assert_eq!(probe(candidate.magic), Some(candidate.format));
+        let magic = &candidate.magic;
+        assert!(magic.header_len() <= MAGIC_MAX);
+
+        // From the candidate's own declaration, with a filler no candidate declares in the
+        // positions it says are skipped.
+        let mut header = magic.head.to_vec();
+        header.resize(header.len() + magic.skipped, 0xA5);
+        header.extend_from_slice(magic.tail);
+
+        assert_eq!(probe(&header), Some(candidate.format));
+        let claimed = CANDIDATES
+            .iter()
+            .filter(|other| other.magic.matches(&header))
+            .count();
+        assert_eq!(claimed, 1, "{:?} shares a header", candidate.format);
     }
 }
 

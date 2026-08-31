@@ -95,6 +95,36 @@ impl Budget {
         )
     }
 
+    /// Rejects a decode whose peak is `bytes`, before any of it is allocated.
+    ///
+    /// **The peak, not one buffer.** For a format whose decoder produces samples the encoder
+    /// cannot take — an alpha channel, or sixteen bits — the narrowing builds the page's buffer
+    /// while the decoder's is still alive, so both are charged; where the decoder's buffer is
+    /// already what the encoder takes it is *moved* rather than copied and only one is. An
+    /// earlier version of this checked the decoder's buffer alone and reasoned that narrowing
+    /// only drops bytes, which is true of the *result* and not of the moment both exist — an
+    /// independent review caught it, and the correction is here rather than in a comment
+    /// because the spec's clause is about every allocation an input sizes.
+    ///
+    /// # Errors
+    ///
+    /// [`PageErrorKind::TooLarge`], naming the quantity, the value, and the limit.
+    pub fn allow_decoded(&self, bytes: u128) -> Result<(), PageErrorKind> {
+        Self::check("decoded bytes", bytes, self.max_image_bytes)
+    }
+
+    /// The most bytes one image buffer may occupy.
+    ///
+    /// Exposed for one caller: `image`'s png decoder inflates an `iCCP` chunk during *header*
+    /// parsing, before its dimensions are readable, and the only way to bound that is to hand
+    /// the decoder a pool of its own. This is the **cap** on that pool rather than its size —
+    /// `page::decode`'s raster module sizes it from the entry's own length and clamps it here,
+    /// so the clamp never binds in the binary and a test can lower it to exercise the pool.
+    #[must_use]
+    pub const fn max_image_bytes(&self) -> u64 {
+        self.max_image_bytes
+    }
+
     /// Widened to `u128`, as [`PageImage::new`] is and for the same reason: two `u32` axes
     /// times three channels tops out just under `3 * u64::MAX`, a release build has overflow
     /// checks off, and a wrapped product would compare below the limit and pass. Not
