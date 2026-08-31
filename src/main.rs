@@ -78,8 +78,10 @@ struct Cli {
     /// in order. The list is consulted only where the container declares none — a zip's
     /// UTF-8 flag and its Info-ZIP Unicode Path field both outrank it — and one encoding is
     /// chosen for the whole input, so no two pages of one book are decoded differently. Takes
-    /// `ja`, `zh`, `ko` or any WHATWG label such as `shift_jis` or `gb18030`. Pass an empty
-    /// value to choose none and leave such names as the format's historical default.
+    /// `ja`, `zh`, `ko` or any WHATWG label an ASCII-compatible encoding answers to, such as
+    /// `shift_jis` or `gb18030`; a label naming one that is not — `utf-16le`, `iso-2022-jp` —
+    /// is refused, because a name decoded through it would lose its own extension. Pass an
+    /// empty value to choose none and leave such names as the format's historical default.
     #[arg(long, default_value = DEFAULT_LABELS, value_parser = charset, value_name = "LIST")]
     charset: Charset,
 
@@ -184,7 +186,7 @@ fn worker_count() -> NonZeroUsize {
 ///
 /// Named rather than inlined because `clap`'s derive wants a function path, and the resolution
 /// belongs to the reader's rule rather than to the parser: `main` supplies only the default.
-fn charset(labels: &str) -> Result<Charset, comic_auto_resize::source::UnknownLabel> {
+fn charset(labels: &str) -> Result<Charset, comic_auto_resize::source::BadLabel> {
     Charset::resolve(labels)
 }
 

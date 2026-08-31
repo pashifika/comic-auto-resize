@@ -71,9 +71,9 @@ pub struct ZipSource<R> {
     /// Every entry's name, decoded once when the archive was opened, in table order. See the
     /// module doc for why it cannot be derived one entry at a time.
     decoded: Vec<String>,
-    /// Each entry's encryption, learned in the same survey: the flag and the AE-x extra field
-    /// are both reachable only from a located entry.
-    encryption: Vec<Encryption>,
+    /// What the survey learned beside each name: whether the stored bytes were reachable, and
+    /// the encryption the entry declares. All three are reachable only from a located entry.
+    surveyed: Vec<Surveyed>,
     /// The password an encrypted entry is read with, or `None` to refuse one.
     password: Option<Vec<u8>>,
 }
@@ -103,7 +103,7 @@ impl<R: Read + Seek> ZipSource<R> {
             // The entry table is read by now, so the entry total costs nothing here.
             Naming::ByPosition => Names::by_position(archive.len()),
         };
-        let (stated, encryption) = survey(&mut archive);
+        let (stated, surveyed) = survey(&mut archive);
         let decoded = options.charset.decode_all(&stated)?;
         Ok(Self {
             archive,
@@ -111,7 +111,7 @@ impl<R: Read + Seek> ZipSource<R> {
             next_index: 0,
             names,
             decoded,
-            encryption,
+            surveyed,
             password: options.password.as_ref().map(|pw| pw.as_bytes().to_vec()),
         })
     }
@@ -140,18 +140,20 @@ impl<R: Read + Seek> ZipSource<R> {
     /// Why the entry at `position` must not be read, or `None` if it may be.
     ///
     /// Both refusals come before the entry is located, because locating an encrypted entry is
-    /// what produces the dependency's own diagnosis — `InvalidPassword` for an AES entry with
-    /// no password, which is the wrong answer twice over: no password would have helped, and
-    /// the form is what the user needs told.
+    /// what produces the dependency's own diagnosis instead — `Password required to decrypt
+    /// file` for an encrypted entry with none supplied, whatever form it uses, and
+    /// `InvalidPassword` for an AE-x entry whose encryption flag is clear. Neither names the
+    /// form, which for AES is the whole of what the user needs told: no password would have
+    /// helped.
     fn refuse_encryption(&self, position: usize, name: &str) -> Option<SourceError> {
-        let encryption = self.encryption[position];
-        if let Some(form) = encryption.unsupported_form() {
+        let surveyed = self.surveyed[position];
+        if let Some(form) = surveyed.unsupported_form() {
             return Some(SourceError::EncryptionUnsupported {
                 name: name.to_owned(),
                 form,
             });
         }
-        if encryption.encrypted && self.password.is_none() {
+        if surveyed.encrypted && self.password.is_none() {
             return Some(SourceError::Encrypted {
                 name: name.to_owned(),
             });
@@ -185,11 +187,11 @@ impl<R: Read + Seek> ZipSource<R> {
         if let Some(error) = self.refuse_encryption(position, name) {
             return Yielded::Failed(error);
         }
-        let encryption = self.encryption[position];
+        let surveyed = self.surveyed[position];
         // A wrong ZipCrypto password is accepted one time in 256, and then the page is
-        // garbage rather than the password refused. Recorded here so the two failures that
-        // shape takes can say so.
-        let false_accept = encryption.encrypted && self.password.is_some();
+        // garbage rather than the password refused. Recorded here so every failure that shape
+        // takes can say so.
+        let false_accept = surveyed.encrypted && self.password.is_some();
 
         let index = self.next_index;
         let options = ZipReadOptions::new().password(self.password.as_deref());
@@ -198,6 +200,18 @@ impl<R: Read + Seek> ZipSource<R> {
             // Named, which the sequential reader could not do: it met a malformed entry
             // before its name, where the entry table carries the name of every entry
             // whether or not the entry itself can be read.
+            //
+            // The one case where that name is not the decoded one says so. An entry the survey
+            // could not locate has no reachable stored bytes, so its name is the container's
+            // own decode — and in an archive read under a chosen encoding, every *other* entry
+            // is reported as the characters that encoding names. An unremarked CP437 name
+            // among them sends the reader looking for a page that is not there under any name.
+            Err(error) if !surveyed.reachable => {
+                return Yielded::Failed(SourceError::Unreachable {
+                    name: name.to_owned(),
+                    source: error.into(),
+                });
+            }
             Err(error) => {
                 return Yielded::Failed(SourceError::Entry {
                     name: name.to_owned(),
@@ -219,12 +233,12 @@ impl<R: Read + Seek> ZipSource<R> {
         let mut head = [0; MAGIC_MAX];
         let head = match fill(&mut file, &mut head) {
             Ok(read) => &head[..read],
-            Err(source) => {
-                return Yielded::Failed(SourceError::Entry {
-                    name: name.to_owned(),
-                    source,
-                });
-            }
+            // The first read of the decrypted stream, and the one a false-accepted ZipCrypto
+            // password fails for a *Deflate* entry: the plaintext is garbage, so inflating it
+            // errors before two bytes exist. Deflate is `zip`'s own default, so routing this
+            // arm past `read_failure` would have hidden the clause from the ordinary case and
+            // shown it only on a Stored one.
+            Err(source) => return Yielded::Failed(read_failure(name, false_accept, source)),
         };
 
         // The extension said this was a page. If the bytes disagree the archive is
@@ -263,17 +277,7 @@ impl<R: Read + Seek> ZipSource<R> {
             .saturating_sub(bytes.len() as u64)
             .saturating_add(1);
         if let Err(source) = file.take(remaining).read_to_end(&mut bytes) {
-            return Yielded::Failed(if false_accept {
-                SourceError::BadPassword {
-                    name: name.to_owned(),
-                    reason: source.to_string(),
-                }
-            } else {
-                SourceError::Entry {
-                    name: name.to_owned(),
-                    source,
-                }
-            });
+            return Yielded::Failed(read_failure(name, false_accept, source));
         }
         if bytes.len() as u64 > MAX_ENTRY_BYTES {
             return Yielded::Failed(SourceError::TooLarge {
@@ -309,6 +313,25 @@ impl<R: Read + Seek> ZipSource<R> {
     }
 }
 
+/// The failure to report for a read that went wrong once the entry was located.
+///
+/// One function for every such site, because the distinction is one property of the *entry*
+/// rather than of the site: on an encrypted entry read with a password, any failure of the
+/// plaintext is as likely to be a wrong password false-accepted by `ZipCrypto`'s one-byte check
+/// as it is to be a damaged archive, and the two are indistinguishable from here.
+fn read_failure(name: &str, false_accept: bool, source: std::io::Error) -> SourceError {
+    if false_accept {
+        return SourceError::BadPassword {
+            name: name.to_owned(),
+            reason: source.to_string(),
+        };
+    }
+    SourceError::Entry {
+        name: name.to_owned(),
+        source,
+    }
+}
+
 /// What one pass over an entry produced.
 enum Yielded {
     Entry(Entry),
@@ -319,7 +342,11 @@ enum Yielded {
 
 /// What the survey learned about one entry beside its name.
 #[derive(Clone, Copy)]
-struct Encryption {
+struct Surveyed {
+    /// Whether the entry's stored name bytes were reachable at all. `false` means the record
+    /// points at no local header, so the name is the container's own decode and every check
+    /// below it is a guess — including this struct's other two fields.
+    reachable: bool,
     /// General-purpose bit 0. Set means the data is ciphertext.
     encrypted: bool,
     /// The strength an AE-x extra field declared, which is the form this build does not
@@ -327,13 +354,19 @@ struct Encryption {
     aes: Option<AesMode>,
 }
 
-impl Encryption {
-    /// The encryption form this build cannot decrypt, if this entry uses one.
+impl Surveyed {
+    /// The encryption form this build cannot decrypt, if this entry declares one.
     ///
     /// Established from the extra field rather than from the compression method, because
     /// `AexEncryption::parse` rewrites `compression_method` to the *underlying* method — so an
     /// AES entry opens like any other and is indistinguishable from a `ZipCrypto` one by the
     /// dependency's own error alone.
+    ///
+    /// Read off the field alone and not gated on bit 0, which is why the refusal says
+    /// *declares*: `zip` parses a `0x9901` field whatever the flag says, so an entry can carry
+    /// one with bit 0 clear. Such an entry is malformed rather than plaintext — the dependency
+    /// refuses it too, as `InvalidPassword` — and naming the form it declares is the more
+    /// useful of the two answers.
     fn unsupported_form(self) -> Option<&'static str> {
         match self.aes? {
             AesMode::Aes128 => Some("AES-128"),
@@ -353,26 +386,36 @@ impl Encryption {
 /// directory", and why a decoder that assumed the latter would re-decode an already correct
 /// name through `Shift_JIS`.
 ///
+/// **The flag is believed only where it is true.** `zip` builds `file_name` for a bit-11 entry
+/// with `from_utf8_lossy` (`read.rs:526-530`) and validates nothing, so a tool that sets the bit
+/// over legacy bytes yields a name full of U+FFFD — the lossy decode this module refuses for an
+/// undecided name, arriving by the one path that would skip the refusal. A `0x7075` name cannot
+/// reach that state, because the dependency builds it with `String::from_utf8(…)?` and
+/// propagates the error, so checking validity here only ever reclassifies a flag that lied. Such
+/// an entry is undecided, which also means `--charset` can rescue it.
+///
 /// An entry whose local header cannot be parsed contributes the archive's own decode and is
 /// left to fail when it is read, which is where it fails today. The survey refuses nothing:
 /// a malformed *entry* is not a malformed archive.
-fn survey<R: Read + Seek>(archive: &mut ZipArchive<R>) -> (Vec<Stated>, Vec<Encryption>) {
+fn survey<R: Read + Seek>(archive: &mut ZipArchive<R>) -> (Vec<Stated>, Vec<Surveyed>) {
     let mut stated = Vec::with_capacity(archive.len());
-    let mut encryption = Vec::with_capacity(archive.len());
+    let mut surveyed = Vec::with_capacity(archive.len());
     for position in 0..archive.len() {
         let guess = archive
             .name_for_index(position)
             .map_or_else(String::new, str::to_owned);
         let Ok(file) = archive.by_index_raw(position) else {
             stated.push(Stated::Decided(guess));
-            encryption.push(Encryption {
+            surveyed.push(Surveyed {
+                reachable: false,
                 encrypted: false,
                 aes: None,
             });
             continue;
         };
         let metadata = file.get_metadata();
-        stated.push(if metadata.is_utf8 {
+        let declared = metadata.is_utf8 && std::str::from_utf8(&metadata.file_name_raw).is_ok();
+        stated.push(if declared {
             Stated::Decided(guess)
         } else {
             Stated::Undecided {
@@ -380,12 +423,13 @@ fn survey<R: Read + Seek>(archive: &mut ZipArchive<R>) -> (Vec<Stated>, Vec<Encr
                 bytes: metadata.file_name_raw.to_vec(),
             }
         });
-        encryption.push(Encryption {
+        surveyed.push(Surveyed {
+            reachable: true,
             encrypted: metadata.encrypted,
             aes: metadata.aes_mode.map(|(mode, ..)| mode),
         });
     }
-    (stated, encryption)
+    (stated, surveyed)
 }
 
 /// How many entries the archive's end record says it holds, or `None` when that cannot be

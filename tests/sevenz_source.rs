@@ -473,7 +473,7 @@ fn a_skipped_entry_in_a_solid_block_does_not_corrupt_the_next() {
 /// is `UnsupportedCompressionMethod("AES256_SHA256")` from the middle of a block decode, after
 /// the output file already exists.
 #[test]
-fn an_encrypted_archive_is_refused_by_form() {
+fn an_encrypted_archive_is_refused_by_form_and_names_the_blocks_entry() {
     let files = [("page1.jpg", page(30))];
     with_archive("sevenz-encrypted", &files, &["-pSecret1"], |archive| {
         for password in [None, Some("Secret1".to_owned())] {
@@ -481,13 +481,40 @@ fn an_encrypted_archive_is_refused_by_form() {
                 password,
                 ..Default::default()
             };
-            let error = Source::open(archive, &options).expect_err("refused at open");
-            match error {
-                SourceError::EncryptionUnsupported { form, .. } => assert_eq!(form, "AES-256"),
+            match Source::open(archive, &options).expect_err("refused at open") {
+                SourceError::EncryptionUnsupported { name, form } => {
+                    assert_eq!(form, "AES-256");
+                    // The entry in the encrypted block, not `files[0]`: the two differ in the
+                    // ordinary case, because `7z a -p` on a directory stores the directory
+                    // entry first and a directory has no stream to encrypt.
+                    assert_eq!(name, "page1.jpg");
+                }
                 other => panic!("expected an AES refusal by form, got {other}"),
             }
         }
     });
+}
+
+/// An archive whose *headers* are encrypted gives the same answer, though it fails one layer
+/// earlier: `ArchiveReader::new` builds the header's own coder chain and reaches
+/// `UnsupportedCompressionMethod("AES256_SHA256")` before any block is seen. Re-raised, so both
+/// shapes of 7z encryption are one refusal rather than two vocabularies.
+#[test]
+fn a_header_encrypted_archive_is_refused_by_the_same_form() {
+    let files = [("page1.jpg", page(30))];
+    with_archive(
+        "sevenz-header-encrypted",
+        &files,
+        &["-pSecret1", "-mhe=on"],
+        |archive| match Source::open(archive, &ReadOptions::default()).expect_err("refused at open")
+        {
+            SourceError::EncryptionUnsupported { name, form } => {
+                assert_eq!(form, "AES-256");
+                assert!(name.contains("header"), "{name}");
+            }
+            other => panic!("expected an AES refusal by form, got {other}"),
+        },
+    );
 }
 
 // ---------------------------------------------------------------- the signature probe

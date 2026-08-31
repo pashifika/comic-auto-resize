@@ -79,9 +79,9 @@ impl Charset {
     ///
     /// # Errors
     ///
-    /// [`UnknownLabel`] naming the label, so the refusal says which value was wrong rather
+    /// [`BadLabel`] naming the label and why, so the refusal says which value was wrong rather
     /// than that the list was.
-    pub fn resolve(labels: &str) -> Result<Self, UnknownLabel> {
+    pub fn resolve(labels: &str) -> Result<Self, BadLabel> {
         let mut encodings = Vec::new();
         for label in labels.split(',').map(str::trim).filter(|l| !l.is_empty()) {
             let resolved = LANGUAGE_TAGS
@@ -92,10 +92,26 @@ impl Charset {
             // resolves to an encoding that fails on every non-empty input, so it could never
             // be chosen and accepting it would only defer the refusal to a run.
             let Some(encoding) = Encoding::for_label_no_replacement(resolved.as_bytes()) else {
-                return Err(UnknownLabel {
+                return Err(BadLabel {
                     label: label.to_owned(),
+                    reason: "no encoding matches this label",
                 });
             };
+            // ASCII-compatible only, and this one is load-bearing rather than tidy. `utf-16le`,
+            // `utf-16be` and `iso-2022-jp` resolve above and do not map `00..=7F` to
+            // `U+0000..=U+007F`: under UTF-16 a byte pair is one code unit, so the `2E` of
+            // `.jpg` is swallowed and the decoded name has no extension at all. The extension
+            // filter reads the decoded name, and an entry with no candidate extension is
+            // *skipped* — so accepting one of these labels drops pages from a mixed archive and
+            // still exits zero, which is the failure this module exists to remove rather than
+            // to relocate.
+            if !encoding.is_ascii_compatible() {
+                return Err(BadLabel {
+                    label: label.to_owned(),
+                    reason: "this encoding does not decode ASCII to itself, so an entry's own \
+                             extension would not survive being decoded through it",
+                });
+            }
             if !encodings.contains(&encoding) {
                 encodings.push(encoding);
             }
@@ -183,11 +199,16 @@ impl Stated {
     }
 }
 
-/// A `--charset` value no encoding matches.
+/// A `--charset` value this reader will not take.
+///
+/// Names the label and why. "Unknown" would not do for the second reason: an encoding refused
+/// because it cannot carry an ASCII extension through a decode is one the user may well have
+/// spelled correctly.
 #[derive(Debug, Error)]
-#[error("unknown encoding label `{label}`")]
-pub struct UnknownLabel {
+#[error("`{label}`: {reason}")]
+pub struct BadLabel {
     pub label: String,
+    pub reason: &'static str,
 }
 
 /// No listed encoding decodes every name the container left undecided.
@@ -258,8 +279,8 @@ mod tests {
         );
     }
 
-    /// The full label set is accepted, because restricting it would buy nothing: the crate
-    /// cannot be subsetted.
+    /// Every WHATWG label an ASCII-compatible encoding answers to is accepted, because
+    /// restricting *those* would buy nothing: the crate cannot be subsetted.
     #[test]
     fn a_whatwg_label_resolves_too() {
         for label in ["shift_jis", "sjis", "windows-31j", "gbk", "big5", "utf-8"] {
@@ -268,14 +289,47 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_label_is_refused_by_name() {
+    fn an_unresolvable_label_is_refused_by_name() {
         let error = Charset::resolve("ja,nonsense,zh").expect_err("refused");
         assert_eq!(error.label, "nonsense");
+        assert_eq!(error.reason, "no encoding matches this label");
         // `replacement` resolves under `for_label` and can never decode anything, so it is
         // refused at parse time rather than at the first archive.
         assert_eq!(
             Charset::resolve("replacement").expect_err("refused").label,
             "replacement"
+        );
+    }
+
+    /// An encoding that does not decode ASCII to itself is refused, and the reason is not
+    /// tidiness: the extension filter reads the *decoded* name, so under UTF-16 the `2E` of
+    /// `.jpg` is swallowed into a code unit, the name has no extension, and the entry is
+    /// silently skipped. A dropped page that exits zero is the failure this module removes,
+    /// not one it may relocate.
+    #[test]
+    fn an_encoding_that_cannot_carry_an_extension_is_refused() {
+        for label in [
+            "utf-16le",
+            "utf-16be",
+            "utf-16",
+            "iso-2022-jp",
+            "csiso2022jp",
+        ] {
+            let error = Charset::resolve(label)
+                .map(|charset| charset.names())
+                .expect_err("must be refused");
+            assert_eq!(error.label, label);
+            assert!(error.reason.contains("extension"), "{}", error.reason);
+        }
+
+        // And the converse, so the guard is known to be the reason rather than an accident:
+        // an ASCII name survives every encoding the default list resolves to, byte for byte.
+        let charset = Charset::resolve(DEFAULT_LABELS).expect("resolves");
+        assert_eq!(
+            charset
+                .decode_all(&undecided(&[b"pages/page01.jpg"]))
+                .expect("decodes"),
+            ["pages/page01.jpg"]
         );
     }
 
@@ -296,7 +350,6 @@ mod tests {
             .decode_all(&undecided(&[SJIS_COVER]))
             .expect("decodes");
         assert_eq!(decoded, ["表紙.jpg"]);
-        assert!(!decoded[0].contains('\\'));
     }
 
     /// The list is tried in order, and the order is what decides between two encodings that
@@ -443,14 +496,70 @@ mod tests {
         assert_eq!(charset.decode_all(&stated).expect("decodes"), [mojibake]);
     }
 
+    /// Every encoding [`Charset::resolve`] can return, so a sweep over them is a sweep over
+    /// what a `--charset` value can select.
+    ///
+    /// Enumerated because `encoding_rs` 0.8.35 publishes no list — it publishes forty statics
+    /// and a private label table — so this is that set minus the four `is_ascii_compatible`
+    /// excludes, which `resolve` refuses. A dependency bump that added an encoding would leave
+    /// it unswept, which is what the count assertion below is for.
+    const ACCEPTED: [&str; 36] = [
+        "big5",
+        "euc-jp",
+        "euc-kr",
+        "gb18030",
+        "gbk",
+        "ibm866",
+        "iso-8859-2",
+        "iso-8859-3",
+        "iso-8859-4",
+        "iso-8859-5",
+        "iso-8859-6",
+        "iso-8859-7",
+        "iso-8859-8",
+        "iso-8859-8-i",
+        "iso-8859-10",
+        "iso-8859-13",
+        "iso-8859-14",
+        "iso-8859-15",
+        "iso-8859-16",
+        "koi8-r",
+        "koi8-u",
+        "macintosh",
+        "shift_jis",
+        "utf-8",
+        "windows-874",
+        "windows-1250",
+        "windows-1251",
+        "windows-1252",
+        "windows-1253",
+        "windows-1254",
+        "windows-1255",
+        "windows-1256",
+        "windows-1257",
+        "windows-1258",
+        "x-mac-cyrillic",
+        "x-user-defined",
+    ];
+
     /// A chosen encoding cannot *introduce* a path separator, and this is the check rather
     /// than the claim.
     ///
     /// It matters because `unsafe_name` runs after decoding: if some encoding could turn
     /// harmless bytes into `..` or a `/`, a wrongly chosen one would be a way to smuggle a
-    /// traversal past a check performed on the raw bytes. Swept over every byte pair for every
-    /// encoding a label in the default list resolves to, plus UTF-16, where a byte pair is one
-    /// code unit and the temptation to assume otherwise is strongest.
+    /// traversal past a check performed on the raw bytes.
+    ///
+    /// Swept over every byte pair for every encoding [`ACCEPTED`] names, and counted rather
+    /// than merely looked for, so an encoding that turned one hazard byte into two hazard
+    /// characters would fail here too.
+    ///
+    /// **What this measures and what it does not.** Two bytes cover every single-byte encoding
+    /// exhaustively and every two-byte form of the multi-byte ones. It does not reach GB18030's
+    /// four-byte form, which is reasoned rather than swept: that form is linear pointer
+    /// arithmetic over code points from U+0080 upwards, so it cannot emit an ASCII scalar at
+    /// all. `iso-2022-jp`, the one accepted-set encoding whose decoded length is not a function
+    /// of its byte length, is not in the set: `resolve` refuses it for the ASCII-compatibility
+    /// reason above.
     ///
     /// The consequence is that decoding only ever *removes* a hazard — `Shift_JIS` consumes `5C`
     /// as the trail byte of `表` — so the after-decoding order is what makes a correct name
@@ -459,20 +568,12 @@ mod tests {
     fn no_encoding_introduces_a_separator_that_was_not_a_byte_of_its_own() {
         const HAZARDS: [char; 4] = ['/', '\\', ':', '\0'];
 
-        // Spelled as WHATWG labels rather than through `Charset::resolve`, because the sweep
-        // is about the encodings the default list reaches, not about the aliases that reach
-        // them.
-        for label in [
-            "shift_jis",
-            "gb18030",
-            "euc-kr",
-            "utf-16le",
-            "utf-16be",
-            "big5",
-            "euc-jp",
-        ] {
-            let encoding = encoding_rs::Encoding::for_label_no_replacement(label.as_bytes())
-                .unwrap_or_else(|| panic!("{label} resolves"));
+        for label in ACCEPTED {
+            let charset = Charset::resolve(label)
+                .unwrap_or_else(|error| panic!("{label} must be accepted: {error}"));
+            let [encoding] = charset.encodings[..] else {
+                panic!("{label} resolves to one encoding")
+            };
             for first in 0..=u8::MAX {
                 for second in 0..=u8::MAX {
                     let raw = [first, second];
@@ -481,11 +582,14 @@ mod tests {
                     else {
                         continue;
                     };
-                    for hazard in decoded.chars().filter(|c| HAZARDS.contains(c)) {
+                    for hazard in HAZARDS {
+                        let emitted = decoded.chars().filter(|&c| c == hazard).count();
+                        let present = usize::from(raw[0] == hazard as u8)
+                            + usize::from(raw[1] == hazard as u8);
                         assert!(
-                            raw.contains(&(hazard as u8)),
-                            "{} turned {raw:02x?} into {decoded:?}, which carries a separator \
-                             neither byte was",
+                            emitted <= present,
+                            "{} turned {raw:02x?} into {decoded:?}, which carries {emitted} \
+                             `{hazard:?}` where the bytes held {present}",
                             encoding.name()
                         );
                     }

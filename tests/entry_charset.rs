@@ -89,12 +89,12 @@ fn a_shift_jis_name_reaches_the_output_as_its_own_characters() {
     );
 
     // The previous behaviour, which the empty list restores exactly. Kept as an assertion
-    // rather than as a claim: it is what makes the line above a fix.
-    let mojibake = names(&archive, &ReadOptions::default()).expect("reads");
-    assert_eq!(mojibake, ["ò\\Äå.jpg", "ò┼001.jpg"]);
-    assert!(
-        mojibake[0].contains('\\'),
-        "the defect is a path separator, not mojibake: {mojibake:?}"
+    // rather than as a claim: it is what makes the line above a fix, and the `\` in the middle
+    // of the first name is what makes it a page turning into a subdirectory rather than
+    // mojibake.
+    assert_eq!(
+        names(&archive, &ReadOptions::default()).expect("reads"),
+        ["ò\\Äå.jpg", "ò┼001.jpg"]
     );
 }
 
@@ -210,7 +210,9 @@ fn a_flagged_utf8_name_is_not_decoded_again() {
     );
     let archive = encoded_archive(&[Encoded::new(name.as_bytes(), page()).utf8()]);
 
-    for labels in ["ja,zh", "zh,ja", "zh", ""] {
+    // The empty list is not among these: with nothing undecided it takes the same path as any
+    // other list and could not tell a mis-classified entry from a correct one.
+    for labels in ["ja,zh", "zh,ja", "zh"] {
         assert_eq!(
             names(&archive, &options(labels)).expect("reads"),
             [name],
@@ -230,13 +232,37 @@ fn a_flagged_utf8_name_is_not_decoded_again() {
 fn a_stated_unicode_name_wins_over_the_stored_bytes() {
     let archive = encoded_archive(&[Encoded::new(SJIS_COVER, page()).unicode_path("表紙絵.jpg")]);
 
-    for labels in ["ja,zh", ""] {
-        assert_eq!(
-            names(&archive, &options(labels)).expect("reads"),
-            ["表紙絵.jpg"],
-            "--charset {labels}"
-        );
-    }
+    assert_eq!(
+        names(&archive, &options("ja,zh")).expect("reads"),
+        ["表紙絵.jpg"]
+    );
+}
+
+/// A flag that declares UTF-8 over bytes that are not UTF-8 is not a declaration.
+///
+/// `zip` builds its decoded name for a bit-11 entry with `from_utf8_lossy` and validates
+/// nothing, so believing the flag here would put U+FFFD into an output entry name — the lossy
+/// decode this reader refuses everywhere else, arriving by the one path that skipped the
+/// refusal. Such an entry is undecided instead, which also means `--charset` can rescue it: an
+/// archiver that sets the bit unconditionally over legacy names is otherwise unreachable by the
+/// flag added to fix exactly that archive.
+#[test]
+fn a_utf8_flag_over_bytes_that_are_not_utf8_is_not_believed() {
+    let archive = encoded_archive(&[Encoded::new(SJIS_COVER, page()).utf8()]);
+
+    assert_eq!(
+        names(&archive, &options("ja")).expect("reads"),
+        ["表紙.jpg"],
+        "a lying flag must not put the name beyond the reach of --charset"
+    );
+
+    // And with no encoding chosen the name is the container's own lossy decode, which is the
+    // previous behaviour — U+FFFD and all. Asserted so the improvement above is attributable.
+    let lossy = names(&archive, &options("")).expect("reads");
+    assert!(
+        lossy[0].contains('\u{fffd}'),
+        "expected the dependency's lossy decode, got {lossy:?}"
+    );
 }
 
 /// A declared name and an undeclared one in one archive: the declared one is believed and does
@@ -409,21 +435,68 @@ fn a_zipcrypto_entry_with_the_right_password_is_read() {
 /// it is: `ZipCrypto` authenticates against one byte, so one wrong password in 256 is accepted
 /// and what surfaces afterwards is a page that will not decode.
 #[test]
-fn a_wrong_password_names_itself_as_a_possible_cause() {
+fn a_wrong_password_is_refused_by_the_check_byte_most_of_the_time() {
     let scratch = TempDir::new("charset-badpassword");
     let input = scratch.join("in.zip");
     support::write_encrypted_archive(&input, &[("page01.jpg", page_bytes(320, 440))], "right");
+    let archive = std::fs::read(&input).expect("reads");
 
     let options = ReadOptions {
         password: Some("wrong".to_owned()),
         ..Default::default()
     };
-    let error = names(&std::fs::read(&input).expect("reads"), &options).expect_err("refused");
-    let message = error.to_string();
-    assert!(
-        message.contains("password"),
-        "the refusal must name the password: {message}"
-    );
+    // The dependency's own answer, and the accurate one: this password was *refused*, not
+    // false-accepted, so the 1-in-256 clause would be the wrong diagnosis here.
+    match names(&archive, &options).expect_err("refused") {
+        SourceError::Entry { name, source } => {
+            assert_eq!(name, "page01.jpg");
+            let message = source.to_string().to_lowercase();
+            assert!(message.contains("password"), "{message}");
+        }
+        other => panic!("expected the check byte to refuse it, got {other}"),
+    }
+}
+
+/// And the one time in 256 the check byte accepts a wrong password, the page that follows will
+/// not decode — and the error says the password may be the cause.
+///
+/// `ZipCrypto` authenticates against a single byte, so a false accept is not rare enough to
+/// leave untested: searching candidate passwords finds one in about 256 tries, and the search
+/// is deterministic for a fixed fixture, so this test is not flaky — it either finds one for
+/// this archive on every platform or on none.
+#[test]
+fn a_false_accepted_password_says_the_password_may_be_wrong() {
+    let scratch = TempDir::new("charset-falseaccept");
+    let input = scratch.join("in.zip");
+    support::write_encrypted_archive(&input, &[("page01.jpg", page_bytes(320, 440))], "right");
+    let archive = std::fs::read(&input).expect("reads");
+
+    let mut tried = 0;
+    let accepted = (0..4096).find_map(|candidate| {
+        let options = ReadOptions {
+            password: Some(format!("wrong{candidate}")),
+            ..Default::default()
+        };
+        tried += 1;
+        match names(&archive, &options) {
+            // A false accept cannot yield a page: the plaintext is garbage, so it fails either
+            // the format probe or the checksum.
+            Ok(names) => panic!("a wrong password produced pages: {names:?}"),
+            Err(SourceError::BadPassword { name, reason }) => Some((name, reason)),
+            Err(_) => None,
+        }
+    });
+
+    let (name, reason) = accepted.unwrap_or_else(|| {
+        panic!("no candidate cleared the one-byte check in {tried} tries, which is implausible")
+    });
+    assert_eq!(name, "page01.jpg");
+    assert!(!reason.is_empty(), "the refusal must say what failed");
+
+    // The message the variant exists for, in full.
+    let message = SourceError::BadPassword { name, reason }.to_string();
+    assert!(message.contains("256"), "{message}");
+    assert!(message.contains("password may be wrong"), "{message}");
 }
 
 /// The two new flags reach the output, which is the `command-line` requirement every accepted
@@ -470,16 +543,25 @@ fn the_charset_flag_changes_the_output_and_an_unknown_label_is_refused() {
     );
     std::fs::remove_file(&output).expect("removes the output");
 
-    // An unknown label is refused by the parser, so no output is created at all.
-    let refused = Command::new(BINARY)
-        .args(["--charset", "ja,nonsense"])
-        .arg(&input)
-        .output()
-        .expect("runs the binary");
-    assert!(!refused.status.success());
-    let message = String::from_utf8_lossy(&refused.stderr);
-    assert!(message.contains("nonsense"), "{message}");
-    assert!(!output.exists(), "the input was opened despite a bad label");
+    // Both refusals happen in the parser, so no output is created at all — and each says which
+    // of the two reasons it is.
+    for (labels, expected) in [
+        ("ja,nonsense", "no encoding matches"),
+        ("utf-16le", "extension"),
+    ] {
+        let refused = Command::new(BINARY)
+            .args(["--charset", labels])
+            .arg(&input)
+            .output()
+            .expect("runs the binary");
+        assert!(!refused.status.success(), "--charset {labels} was accepted");
+        let message = String::from_utf8_lossy(&refused.stderr);
+        assert!(message.contains(expected), "--charset {labels}: {message}");
+        assert!(
+            !output.exists(),
+            "--charset {labels} opened the input despite a bad label"
+        );
+    }
 }
 
 /// `--pwd` requires a value, and its help names what this build can decrypt.

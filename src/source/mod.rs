@@ -33,7 +33,7 @@ mod sevenz;
 mod signature;
 mod zip;
 
-pub use charset::{Charset, DEFAULT_LABELS, Stated, Undecodable, UnknownLabel};
+pub use charset::{BadLabel, Charset, DEFAULT_LABELS, Stated, Undecodable};
 pub use directory::DirectorySource;
 pub use probe::{
     CANDIDATES, Candidate, Format, MAGIC_MAX, Names, Naming, declared_format, output_name, probe,
@@ -401,7 +401,12 @@ pub enum SourceError {
     /// The container encrypted this entry in a form this build does not carry. Named by form,
     /// because "wrong password" is what the dependency says here and it is the wrong
     /// diagnosis: no password would have worked.
-    #[error("{name}: the entry is encrypted with {form}, which this build cannot decrypt")]
+    ///
+    /// *Declares* rather than *is*, because the two are separable: a zip entry can carry an
+    /// AE-x extra field with its encryption flag clear, which is malformed rather than
+    /// plaintext, and naming the form it declares is more use than asserting a state its own
+    /// header denies.
+    #[error("{name}: the entry declares {form} encryption, which this build cannot decrypt")]
     EncryptionUnsupported { name: String, form: &'static str },
     /// An encrypted entry that would not read after a password was supplied.
     ///
@@ -416,6 +421,20 @@ pub enum SourceError {
     BadPassword { name: String, reason: String },
     #[error("{name}: cannot read the entry: {source}")]
     Entry {
+        name: String,
+        source: std::io::Error,
+    },
+    /// An entry the container lists but cannot yield at all: its record points at no entry
+    /// header, so neither its data nor its stored name bytes are reachable.
+    ///
+    /// Separate from [`SourceError::Entry`] only for what it has to say about the name. Every
+    /// other entry in the same archive is named by the encoding the reader chose; this one can
+    /// only be named by the container's own decode, so the message says which it is rather
+    /// than sending the reader to look for a page that exists under no such name.
+    #[error(
+        "{name}: cannot read the entry: {source}. That name is the container's own decoding of the stored bytes, which could not be read either"
+    )]
+    Unreachable {
         name: String,
         source: std::io::Error,
     },

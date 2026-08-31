@@ -323,6 +323,12 @@ fn an_entry_that_inflates_past_the_limit_is_refused() {
 
 /// A malformed entry is named, which the sequential reader could not do: it met the damage
 /// before the name, where the entry table carries every name up front.
+///
+/// It is also the one entry whose name is *not* the decoded one, because a record pointing at
+/// no local header yields no stored name bytes either — so the refusal says which decode the
+/// name came from. In an archive read under a chosen encoding, every other entry is reported as
+/// the characters that encoding names, and an unremarked CP437 name among them would send the
+/// reader looking for a page that exists under no such name.
 #[test]
 fn an_entry_the_table_lists_but_cannot_locate_is_named() {
     let entries = [("page01.jpg", page(8, 8)), ("page02.jpg", page(8, 8))];
@@ -336,8 +342,13 @@ fn an_entry_the_table_lists_but_cannot_locate_is_named() {
 
     let error = read_all(&bytes).expect_err("the second entry cannot be located");
     assert!(
-        matches!(&error, SourceError::Entry { name, .. } if name == "page02.jpg"),
-        "expected an entry failure naming the entry, got {error}"
+        matches!(&error, SourceError::Unreachable { name, .. } if name == "page02.jpg"),
+        "expected an unreachable-entry failure naming the entry, got {error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("container's own decoding"),
+        "the refusal must say the name is not the decoded one: {message}"
     );
 }
 
