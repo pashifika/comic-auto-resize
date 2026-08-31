@@ -98,6 +98,35 @@ Worth knowing what the fixtures stand in for: `samples/` holds two zips and two 
 at all, so unlike rar — where two real archives caught a dropped page no synthetic fixture
 would have — every 7z claim in this repository rests on an archive `7zz` wrote.
 
+### BMP fixtures, if you are touching the image decoders
+
+Not needed to build, and not needed for the verification sequence below: the tests that depend
+on these skip when they are absent, and CI never builds them.
+
+BMP is not one format but a family — `BITMAPCOREHEADER` through `BITMAPV5HEADER`, seven
+compression schemes, 1 to 64 bits per pixel, top-down and bottom-up, palettes that may be
+absent or offset. Hand-rolling fixtures for that would be writing a second BMP implementation
+to test the first with, so this fetches Jason Summers' BMP Suite and runs its own generator:
+
+```sh
+tests/fixtures/make-bmp-fixtures.sh
+```
+
+It needs `git`, `make` and a C compiler, all of which `mozjpeg-sys` already requires. Output
+lands in `tools/bmp-fixtures/` — 89 files across `g/` (must read), `q/` (this project decides,
+per file), `b/` (must refuse without crashing) and `x/` (must not be mistaken for BMP) — and
+`tools/` is gitignored.
+
+Two things about it are load-bearing rather than incidental. The generator is **GPL-3.0**, and
+this project's allow-list carries no GPL term, so the script *runs* it and redistributes
+nothing — the same distinction that lets `make-rar-fixtures.sh` use RARLAB's proprietary
+archiver. And the generated images are public domain by the author's explicit statement
+*except* for two that embed an ICC profile, so the script deletes those two and then proves the
+exclusion is complete by grepping the corpus for the profile signature rather than trusting the
+list.
+
+Set `CAR_BMP_FIXTURES` to write them somewhere other than `tools/bmp-fixtures/`.
+
 ## Building
 
 ```sh
