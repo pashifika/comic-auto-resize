@@ -319,6 +319,12 @@ pub struct Encoded<'a> {
     /// since a stale CRC makes `zip` refuse the whole archive.
     pub unicode_path: Option<&'a str>,
     pub encryption: Encryption,
+    /// The compression method the headers declare, in place of Stored.
+    ///
+    /// The data is written uncompressed whatever this says, and that is the point: the methods
+    /// worth naming here are the ones this build cannot decode, so the entry is refused before
+    /// anything tries.
+    pub method: Option<u16>,
 }
 
 impl<'a> Encoded<'a> {
@@ -330,6 +336,7 @@ impl<'a> Encoded<'a> {
             utf8: false,
             unicode_path: None,
             encryption: Encryption::None,
+            method: None,
         }
     }
 
@@ -346,6 +353,12 @@ impl<'a> Encoded<'a> {
 
     pub fn encrypted(mut self, encryption: Encryption) -> Self {
         self.encryption = encryption;
+        self
+    }
+
+    /// The same entry declaring a compression method in place of Stored.
+    pub fn compressed_as(mut self, method: u16) -> Self {
+        self.method = Some(method);
         self
     }
 
@@ -367,10 +380,9 @@ impl<'a> Encoded<'a> {
 
     fn method(&self) -> u16 {
         if self.encryption == Encryption::Aes256 {
-            99
-        } else {
-            0
+            return 99;
         }
+        self.method.unwrap_or(0)
     }
 
     /// The central record's extra field, which is the one `zip` parses for an entry.
