@@ -36,7 +36,7 @@ mod zip;
 pub use charset::{BadLabel, Charset, DEFAULT_LABELS, Stated, Undecodable};
 pub use directory::DirectorySource;
 pub use probe::{
-    CANDIDATES, Candidate, Format, MAGIC_MAX, Names, Naming, declared_format, output_name, probe,
+    CANDIDATES, Candidate, MAGIC_MAX, Magic, Names, Naming, declared_format, output_name, probe,
 };
 pub use rar::RarSource;
 pub use sevenz::{MAX_DICTIONARY_BYTES, SevenZSource};
@@ -51,6 +51,8 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 use thiserror::Error;
+
+use crate::page::Format;
 
 /// The most bytes one entry may occupy in memory.
 ///

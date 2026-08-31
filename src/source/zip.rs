@@ -306,7 +306,7 @@ impl<R: Read + Seek> ZipSource<R> {
 
         Yielded::Entry(Entry {
             index,
-            name: self.names.of(name, declared),
+            name: self.names.of(name),
             format: declared,
             bytes,
         })

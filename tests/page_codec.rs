@@ -9,9 +9,21 @@ use std::iter;
 use std::path::PathBuf;
 
 use comic_auto_resize::page::{
-    Budget, Channels, DctMethod, DecodeSettings, EncodeSettings, Filter, PageErrorKind, PageImage,
-    Resampler, decode, encode, height_for_width, scale_numerator,
+    Budget, Channels, DctMethod, DecodeSettings, EncodeSettings, Filter, Format, PageError,
+    PageErrorKind, PageImage, Resampler, encode, height_for_width, scale_numerator,
 };
+
+/// Every decode in this file is a JPEG, so the format is supplied here once rather than at
+/// forty call sites — and the composited flag is asserted false while we are passing through,
+/// because JPEG has no alpha channel for the rule to apply to.
+fn decode(name: &str, buffer: &[u8], settings: DecodeSettings) -> Result<PageImage, PageError> {
+    let decoded = comic_auto_resize::page::decode(name, buffer, Format::Jpeg, settings)?;
+    assert!(
+        !decoded.composited,
+        "a JPEG has no alpha channel to composite"
+    );
+    Ok(decoded.page)
+}
 
 /// Dimensions of `tests/fixtures/page.jpg`. See the note beside it.
 const FIXTURE_WIDTH: u32 = 160;
@@ -659,10 +671,16 @@ fn a_jpeg_truncated_inside_its_headers_is_reported() {
     let error = decode("page.jpg", &jpeg[..40], DecodeSettings::default())
         .expect_err("a truncated header cannot be decoded");
 
-    assert!(matches!(error.kind, PageErrorKind::Decode(_)));
+    assert!(matches!(
+        error.kind,
+        PageErrorKind::Decode {
+            format: Format::Jpeg,
+            ..
+        }
+    ));
     assert!(
-        error.to_string().contains("page.jpg"),
-        "the message must name the input: {error}"
+        error.to_string().contains("page.jpg") && error.to_string().contains("JPEG"),
+        "the message must name the input and the decoder that refused it: {error}"
     );
 }
 

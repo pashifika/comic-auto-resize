@@ -95,6 +95,21 @@ impl Budget {
         )
     }
 
+    /// Rejects a decoded buffer of `bytes`, before the decoder allocates it.
+    ///
+    /// For a format whose decoder produces samples the encoder cannot take — an alpha
+    /// channel, or sixteen bits — the buffer the *decoder* asks for is wider than the page
+    /// that comes out of it, so the check has to be on the decoder's own figure rather than
+    /// on the page's channel count. Bounding it bounds the page too: narrowing only ever
+    /// drops bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`PageErrorKind::TooLarge`], naming the quantity, the value, and the limit.
+    pub fn allow_decoded(&self, bytes: u64) -> Result<(), PageErrorKind> {
+        Self::check("decoded bytes", u128::from(bytes), self.max_image_bytes)
+    }
+
     /// Widened to `u128`, as [`PageImage::new`] is and for the same reason: two `u32` axes
     /// times three channels tops out just under `3 * u64::MAX`, a release build has overflow
     /// checks off, and a wrapped product would compare below the limit and pass. Not

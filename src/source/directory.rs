@@ -69,7 +69,9 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use super::probe::{self, Format, MAGIC_MAX, Names, Naming};
+use crate::page::Format;
+
+use super::probe::{self, MAGIC_MAX, Names, Naming};
 use super::{Entry, HINT_CEILING, MAX_ENTRY_BYTES, ReadOptions, SourceError, fill, unsafe_name};
 
 /// A directory listed once, then read in the order the listing chose.
@@ -234,7 +236,7 @@ impl DirectorySource {
         self.next_index += 1;
         Ok(Entry {
             index,
-            name: self.names.of(name, declared),
+            name: self.names.of(name),
             format: declared,
             bytes,
         })

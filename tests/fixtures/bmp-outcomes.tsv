@@ -1,0 +1,117 @@
+# What `image` 0.25.10 does with every file of the BMP conformance suite, through this
+# crate's own decode path.
+#
+# Committed so a dependency bump that moves one file's behaviour is visible rather than
+# absorbed. `tests/image_pages.rs` reads this and fails naming any row that moved.
+#
+# The suite's directories are its author's judgement about BMP, not about this tool:
+#   g/  a BMP reader must read these        27 read, 0 refused
+#   q/  unusual, obsolete, arguably invalid 31 read, 10 refused
+#   b/  clearly invalid; must not crash     5 read, 15 refused
+#   x/  not BMP                             0 read, 1 refused
+#
+# Four of the five `b/` files that read are accepted because their invalidity is in metadata
+# the decoder does not consult: each decodes at the correct 127x64 geometry, which
+# `tests/image_pages.rs` asserts.
+#
+# `b/pal8badindex.bmp` is the exception, measured rather than assumed. Its invalidity is in
+# the pixel data, and `image` zero-fills its palette to 256 entries, so 4,793 of its 8,128
+# pixels — 59% of the page — decode as black. It is accepted on cost, not on the argument
+# above: detecting it needs the declared palette size and a pass over the index plane, which
+# `image`'s API cannot supply and which amounts to a second BMP reader. No real comic archive
+# holds such a file. The behaviour is pinned exactly by
+# `an_out_of_range_palette_index_decodes_as_black`, so a change upstream reopens the
+# decision rather than passing unnoticed.
+#
+# Produced by tests/fixtures/make-bmp-fixtures.sh (BMP Suite 2.8, the two ICC-bearing files
+# removed). Fields: path<TAB>reads|refused
+
+b/badbitcount.bmp	refused
+b/badbitssize.bmp	reads
+b/baddens1.bmp	reads
+b/baddens2.bmp	reads
+b/badfilesize.bmp	reads
+b/badheadersize.bmp	refused
+b/badpalettesize.bmp	refused
+b/badplanes.bmp	refused
+b/badrle.bmp	refused
+b/badrle4.bmp	refused
+b/badrle4bis.bmp	refused
+b/badrle4ter.bmp	refused
+b/badrlebis.bmp	refused
+b/badrleter.bmp	refused
+b/badwidth.bmp	refused
+b/pal8badindex.bmp	reads
+b/reallybig.bmp	refused
+b/rgb16-880.bmp	refused
+b/rletopdown.bmp	refused
+b/shortfile.bmp	refused
+g/pal1.bmp	reads
+g/pal1bg.bmp	reads
+g/pal1wb.bmp	reads
+g/pal4.bmp	reads
+g/pal4gs.bmp	reads
+g/pal4rle.bmp	reads
+g/pal8-0.bmp	reads
+g/pal8.bmp	reads
+g/pal8gs.bmp	reads
+g/pal8nonsquare.bmp	reads
+g/pal8os2.bmp	reads
+g/pal8rle.bmp	reads
+g/pal8topdown.bmp	reads
+g/pal8v4.bmp	reads
+g/pal8v5.bmp	reads
+g/pal8w124.bmp	reads
+g/pal8w125.bmp	reads
+g/pal8w126.bmp	reads
+g/rgb16-565.bmp	reads
+g/rgb16-565pal.bmp	reads
+g/rgb16.bmp	reads
+g/rgb16bfdef.bmp	reads
+g/rgb24.bmp	reads
+g/rgb24pal.bmp	reads
+g/rgb32.bmp	reads
+g/rgb32bf.bmp	reads
+g/rgb32bfdef.bmp	reads
+q/pal1huffmsb.bmp	refused
+q/pal1p1.bmp	reads
+q/pal2.bmp	reads
+q/pal2color.bmp	reads
+q/pal4rlecut.bmp	reads
+q/pal4rletrns.bmp	reads
+q/pal8offs.bmp	reads
+q/pal8os2-hs.bmp	reads
+q/pal8os2-sz.bmp	reads
+q/pal8os2sp.bmp	reads
+q/pal8os2v2-16.bmp	refused
+q/pal8os2v2-40sz.bmp	reads
+q/pal8os2v2-sz.bmp	refused
+q/pal8os2v2.bmp	refused
+q/pal8oversizepal.bmp	refused
+q/pal8rlecut.bmp	reads
+q/pal8rletrns.bmp	reads
+q/rgb16-231.bmp	reads
+q/rgb16-3103.bmp	reads
+q/rgb16faketrns.bmp	reads
+q/rgb24jpeg.bmp	refused
+q/rgb24largepal.bmp	reads
+q/rgb24lprof.bmp	reads
+q/rgb24png.bmp	refused
+q/rgb24rle24.bmp	refused
+q/rgb32-111110.bmp	reads
+q/rgb32-7187.bmp	reads
+q/rgb32-xbgr.bmp	reads
+q/rgb32fakealpha.bmp	reads
+q/rgb32h52.bmp	reads
+q/rgba16-1924.bmp	reads
+q/rgba16-4444.bmp	reads
+q/rgba16-5551.bmp	reads
+q/rgba32-1.bmp	reads
+q/rgba32-1010102.bmp	reads
+q/rgba32-2.bmp	reads
+q/rgba32-61754.bmp	reads
+q/rgba32-81284.bmp	reads
+q/rgba32abf.bmp	refused
+q/rgba32h56.bmp	reads
+q/rgba64.bmp	refused
+x/ba-bm.bmp	refused

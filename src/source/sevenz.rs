@@ -415,7 +415,7 @@ fn decode(
             sender,
             Ok(Entry {
                 index,
-                name: names.of(&name, declared),
+                name: names.of(&name),
                 format: declared,
                 bytes,
             }),

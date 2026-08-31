@@ -59,7 +59,29 @@ workspace-default-features = "allow"
 external-default-features = "allow"
 allow = []
 deny = []
-skip = []
+# The first entry here, and it is charged to one feature rather than to a dependency:
+# `image`'s `png` feature. Measured on this graph, `bmp` alone and `webp` alone are both
+# clean; enabling `png` is what makes `multiple-versions` fire.
+#
+#   miniz_oxide 0.8.9  └── png 0.18.1 └── image 0.25.10
+#   miniz_oxide 0.9.1  └── flate2 1.1.10 ├── (this crate, pinned)
+#                                        ├── png 0.18.1
+#                                        └── zip 8.6.0
+#
+# `png` 0.18.1 pulls both majors itself: `miniz_oxide "^0.8"` with `simd`, *and*
+# `flate2 "^1.0.35"`, which resolves to the 1.1.10 pinned in `Cargo.toml` and thence to
+# `miniz_oxide` 0.9.1.
+#
+# Alignment was attempted first, as the policy requires, and is unavailable from this side:
+# `cargo search png` reports 0.18.1 as the newest release, and `image` 0.25.10 declares
+# `png ^0.18.0`, so a hypothetical 0.19 would not be accepted either. Downgrading this
+# project's `flate2` pin moves the wrong side of the conflict and gives up a pin chosen for
+# its own reasons.
+#
+# Exit condition: `png` aligning its two inflate paths onto one `miniz_oxide` major, which is
+# upstream's to do. This entry is deleted when a release of `png` that `image` accepts does
+# that.
+skip = [{ crate = "miniz_oxide", reason = "png 0.18.1 depends on miniz_oxide 0.8 and on flate2, which reaches 0.9.1; no release aligns them" }]
 skip-tree = []
 
 [sources]

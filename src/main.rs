@@ -22,7 +22,7 @@ use std::thread;
 
 use clap::Parser;
 use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter};
-use comic_auto_resize::pipeline::{self, Settings};
+use comic_auto_resize::pipeline::{self, Report, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
 use comic_auto_resize::sink::{InputKind, default_output};
 use comic_auto_resize::source::{Charset, DEFAULT_LABELS, Naming, ReadOptions, Source};
@@ -95,8 +95,20 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
-        Ok((pages, output)) => {
-            println!("{pages} page(s) written to {}", output.display());
+        Ok((report, output)) => {
+            // One line for the run, and the compositing note only when something was
+            // composited: a run that composited nothing prints exactly what it printed before
+            // the rule existed. A line per page would bury the page count on a real archive.
+            let composited = if report.composited > 0 {
+                format!(" ({} page(s) composited onto white)", report.composited)
+            } else {
+                String::new()
+            };
+            println!(
+                "{} page(s) written to {}{composited}",
+                report.pages,
+                output.display()
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -107,7 +119,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: &Cli) -> Result<(u32, PathBuf), CliError> {
+fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
     // Option values were range-checked by the parser, before this point and before the
     // input is opened. The remaining checks are on the input itself.
     let settings = Settings {
@@ -168,7 +180,7 @@ fn run(cli: &Cli) -> Result<(u32, PathBuf), CliError> {
         },
         other => CliError::Run(other),
     })?;
-    Ok((report.pages, output))
+    Ok((report, output))
 }
 
 /// How many pages are processed at once.

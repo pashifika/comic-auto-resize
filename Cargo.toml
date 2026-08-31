@@ -56,6 +56,32 @@ fast_image_resize = "=6.1.0"
 # `deflate-flate2-zlib-rs` if the reader ever measures as the bottleneck. The test support
 # module also uses its `Crc`, which is the checksum `zip` verifies entries against.
 flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+# png, bmp and webp decoding — one crate for three decoders rather than `png`, `image-webp`
+# and a hand-written BMP reader, which would save three crates and cost a BMP implementation.
+# BMP is a family of seven compression schemes and five header generations; measured, `image`
+# reads 27 of the conformance suite's 27 valid files and refuses the rest by name.
+#
+# Defaults refused for three of the four reasons the dependency policy recognises, and the
+# fourth is recorded as not applying:
+#
+# - **A recorded decision contradicted.** The defaults enable `rayon`, which the
+#   `crossbeam-channel` comment above already rejected — "whose global pool is what makes a
+#   blocking send from inside a task a deadlock risk. Nothing here runs on a shared pool."
+#   This is not unused capability; enabling it would put back what that comment ruled out.
+# - **Capability the binary cannot use.** The defaults reach `rav1e`, `ravif`,
+#   `avif-serialize`, `exr`, `gif`, `qoi` and `tiff` for formats nothing here asks for.
+# - **Supply-chain surface, measured.** +77 crates against +9 for these three, and the
+#   defaults add a second duplicate version — `syn` 1 and 3 through `rav1e` — on top of the
+#   `miniz_oxide` one `png` causes by itself.
+# - **Licence is not a reason here**, and that is stated rather than left out: `cargo deny`
+#   reports `licenses ok` on the defaults, so a reader who finds features disabled beside a
+#   green licence check does not read this comment as stale.
+#
+# Per-feature cost on this graph, so one of the three can be dropped without a new survey:
+# `bmp` +4 crates, `png` +7, `webp` +6, all three +9. `png` alone is what trips
+# `multiple-versions` — see the `skip` entry in `deny.toml`. Figures and the binary-size
+# delta: `rasen/changes/image-decoders/evidence/dependency.md`.
+image = { version = "=0.25.10", default-features = false, features = ["bmp", "png", "webp"] }
 mozjpeg = "=0.10.13"
 # Not a new crate: `mozjpeg` already builds it. Direct only for libjpeg's `JWRN_*`
 # message-code constants, which the corruption policy classifies by — the alternative is
