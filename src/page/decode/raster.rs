@@ -29,12 +29,20 @@
 //! `MAX_ENTRY_BYTES` becomes tens of gigabytes. `Vec` growth ends in `handle_alloc_error`,
 //! which **aborts** — `catch_unwind` in the pipeline cannot intercept it.
 //!
-//! [`Budget`] cannot close that, because the inflated size is not a pixel count. So the png
-//! decoder is constructed with `max_alloc` set to the budget's *own* image-byte ceiling: one
-//! number applied in two places rather than two numbers that could disagree. It costs one
-//! narrowing worth stating — a page within a few megabytes of that ceiling *and* carrying an
-//! ICC profile is now refused, because `png` draws both from one pool — and that is a refusal
-//! by name rather than damaged output.
+//! [`Budget`] cannot close that, because the inflated size is not a pixel count. So the decoder
+//! is constructed with a pool of its own, sized by [`png_pool`] from the **entry's** length
+//! rather than from a constant — the budget's page ceiling is only a cap on it and never binds
+//! outside a test that lowers it. Measured on the release binary, that took the attack above
+//! from 13.86 GB of peak RSS to 24.8 MB.
+//!
+//! **What it costs**, because a pool is not free: a png whose ancillary chunks charge more than
+//! the pool holds is refused, and `png` charges a chunk twice — see [`png_pool`] for the
+//! arithmetic and for the legal page a first draft of it refused. The refusal a reader might
+//! expect instead does *not* happen: `parse_iccp` discards its own error
+//! (`stream.rs:1696`, `let _ = self.parse_iccp_raw();`), so an over-large profile is silently
+//! dropped and the page decodes. That is the right outcome here — the profile is discarded
+//! anyway — but it means the pool is invisible on the path it was added for, which is why the
+//! regression test asserts it through the chunk-growth refusal instead.
 //!
 //! bmp and webp need no equivalent: `image-webp` reads a profile only through `icc_profile()`,
 //! which `from_decoder` never calls, and bmp has no compressed ancillary chunk at all.
@@ -113,28 +121,66 @@ pub fn webp_header(name: &str, buffer: &[u8]) -> Result<(u32, u32), PageError> {
     Ok(open_webp(name, buffer)?.dimensions())
 }
 
+/// Room for one output scanline in the png decoder's pool.
+///
+/// An **allowance, not a bound**: PNG's `IHDR` width is a 32-bit field and
+/// `unguarded_output_line_size` is `width × samples × bytes_per_sample` with no cap
+/// (`png-0.18.1/src/decoder/mod.rs:683-686`), so a png may ask for a scanline of gigabytes.
+/// 1 MiB covers every page whose *pixel count* the budget admits at any sane aspect ratio; a
+/// page wide enough to exceed it is refused, and [`png_geometry`] is what makes that refusal
+/// the budget's rather than the decoder's.
+const PNG_SCANLINE_ALLOWANCE: u64 = 1 << 20;
+
 /// The most bytes `image`'s png decoder may draw for its **own** allocations while reading
 /// `entry` bytes of png.
 ///
 /// Not a second page budget, and the distinction is what makes this number safe. `png`'s
-/// `Limits` bounds the decoder's internal allocations only — the growth of a chunk's raw bytes
-/// (`decoder/stream.rs:783-792`), an inflated `iCCP` profile (`stream.rs:1726-1728`), a text
-/// chunk, and **one output scanline** (`decoder/mod.rs:390-391`) — and not the pixel buffer,
-/// which `image` allocates itself and [`Budget`] bounds.
+/// `Limits` is a *decrementing* pool (`decoder/mod.rs:71-78`) over the decoder's internal
+/// allocations only — never the pixel buffer, which `image` allocates itself and [`Budget`]
+/// bounds, and which `PngDecoder::read_image` does not charge (`codecs/png.rs:242-262`).
 ///
-/// Every chunk's raw bytes come out of the entry, so their total cannot exceed it; the pool is
-/// therefore the entry's own length plus room for the widest scanline a png can have —
-/// 65,535 × 4 channels × 2 bytes is 524,280 — and never more than the budget's page ceiling.
-/// Sizing it from the entry rather than from a constant is what keeps a 2 MB entry from being
-/// allowed 64 MB of decoder scratch: measured, an archive of eight pngs each declaring `1x1`
-/// and carrying a profile that inflates to 2 GiB peaked at 13.86 GB before this bound existed.
-const PNG_SCANLINE_CEILING: u64 = 1 << 20;
-
+/// Three entries, because a chunk is charged **twice** and the first draft's arithmetic missed
+/// it — an independent review found a legal 3.2 MB png with a 2 MiB `tEXt` chunk being refused:
+///
+/// - `2 × entry` bounds the capacity growth of the buffer holding the largest chunk. It doubles
+///   from 128 and reserves each step (`stream.rs:782-792`), so reaching a capacity that holds
+///   `L` bytes costs up to just under `2L`, and the capacity persists across chunks because
+///   `raw_bytes.clear()` keeps it (`stream.rs:915`).
+/// - `1 × entry` bounds the sum of the per-chunk charges `tEXt`, `zTXt` and `iTXt` add on top
+///   (`stream.rs:1843,1858,1878`), because every chunk's bytes come out of the entry.
+/// - `iCCP` needs no term: its inflate is bounded by whatever the pool has left
+///   (`stream.rs:1726`), which is the whole point of giving the decoder a pool at all.
+///
+/// At `MAX_ENTRY_BYTES` that is 193 MiB, so the budget's page ceiling never binds outside a
+/// test that lowers it. Sizing from the entry rather than from a constant is what keeps a 2 MB
+/// entry from being allowed 64 MB of scratch: measured, an archive of eight pngs each declaring
+/// `1x1` and carrying a profile that inflates to 2 GiB peaked at **13.86 GB** with no pool at
+/// all, and 24.8 MB with this one.
 fn png_pool(budget: Budget, entry: usize) -> u64 {
     let entry = u64::try_from(entry).unwrap_or(u64::MAX);
     entry
-        .saturating_add(PNG_SCANLINE_CEILING)
+        .saturating_mul(3)
+        .saturating_add(PNG_SCANLINE_ALLOWANCE)
         .min(budget.max_image_bytes())
+}
+
+/// The geometry a png's `IHDR` declares, read from the bytes rather than through a decoder.
+///
+/// Thirteen bytes at a fixed offset: eight of signature, then a four-byte length and the
+/// four-byte type, so the width and height sit at 16 and 20. Read here because *constructing* a
+/// decoder is itself an allocating operation — `read_info` reserves one output scanline against
+/// the pool — so a page whose pixel count is the problem has to be refused before that, or the
+/// refusal stops naming the quantity and the limit and says "Memory limit exceeded" instead.
+///
+/// `None` for bytes that are not a png at all, which the decoder then refuses by name.
+fn png_geometry(buffer: &[u8]) -> Option<(u32, u32)> {
+    if buffer.len() < 24 || &buffer[12..16] != b"IHDR" {
+        return None;
+    }
+    Some((
+        u32::from_be_bytes(buffer[16..20].try_into().ok()?),
+        u32::from_be_bytes(buffer[20..24].try_into().ok()?),
+    ))
 }
 
 /// A png decoder over `buffer`, refusing an APNG.
@@ -146,6 +192,14 @@ fn open_png<'a>(
     buffer: &'a [u8],
     budget: Budget,
 ) -> Result<PngDecoder<Cursor<&'a [u8]>>, PageError> {
+    // Before the decoder exists, so an oversized page is refused naming its pixel count rather
+    // than by the decoder exhausting its own pool on a scanline.
+    if let Some((width, height)) = png_geometry(buffer) {
+        budget
+            .allow_source(width, height)
+            .map_err(|kind| PageError::new(name, kind))?;
+    }
+
     let mut limits = Limits::no_limits();
     limits.max_alloc = Some(png_pool(budget, buffer.len()));
     let decoder = PngDecoder::with_limits(Cursor::new(buffer), limits)
@@ -226,7 +280,13 @@ fn read<D: ImageDecoder>(
 ///
 /// Separate from [`narrow`], which decides what to do with the *samples*: this decides only the
 /// channel count and whether a second buffer is built, which is what the budget needs before a
-/// pixel exists. `the_two_narrowing_tables_agree` asserts the pair cannot drift.
+/// pixel exists.
+///
+/// `the_two_narrowing_tables_agree` cross-checks the **channel** half against a real [`narrow`]
+/// call, so that half cannot drift. It cannot observe the `copies` half directly — no test can,
+/// short of an instrumented allocator — so it compares it against its own declared list of the
+/// moved arms. A change to `narrow` that composited in place, or that cloned an `Rgb8` buffer,
+/// would make `peak` charge wrongly and the test would still pass.
 struct Narrowing {
     channels: Channels,
     /// Whether [`narrow`] builds a new buffer while the decoder's is still alive.

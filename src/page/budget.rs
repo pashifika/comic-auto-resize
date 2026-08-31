@@ -117,8 +117,9 @@ impl Budget {
     ///
     /// Exposed for one caller: `image`'s png decoder inflates an `iCCP` chunk during *header*
     /// parsing, before its dimensions are readable, and the only way to bound that is to hand
-    /// the decoder a limit of its own. Handing it this one keeps a single number rather than
-    /// two that could disagree.
+    /// the decoder a pool of its own. This is the **cap** on that pool rather than its size —
+    /// `page::decode`'s raster module sizes it from the entry's own length and clamps it here,
+    /// so the clamp never binds in the binary and a test can lower it to exercise the pool.
     #[must_use]
     pub const fn max_image_bytes(&self) -> u64 {
         self.max_image_bytes

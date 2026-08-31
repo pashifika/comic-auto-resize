@@ -26,8 +26,8 @@ use comic_auto_resize::source::{ReadOptions, SourceError, ZipSource, probe};
 use support::{
     TempDir, animated_webp, apng_page, bmp_fixtures, bmp_page, by_position, header_only, jpeg_size,
     page, page_bytes, png_gray_page, png_half_transparent_page, png_page, png_rgb16_page,
-    png_rgba_page, png_rgba16_page, png_with_inflating_profile, read_archive, webp_page,
-    write_archive,
+    png_rgba_page, png_rgba16_page, png_with_inflating_profile, png_with_text_chunk, read_archive,
+    webp_page, write_archive,
 };
 
 /// The binary under test, built by Cargo for this integration test at the same profile.
@@ -441,6 +441,72 @@ fn an_inflating_colour_profile_is_bounded_by_a_pool_the_decoder_is_given() {
     let decoded = decode("iccp.png", &modest, Format::Png, DecodeSettings::default())
         .expect("a profile within the pool is inflated and dropped");
     assert_eq!((decoded.page.width(), decoded.page.height()), (1, 1));
+}
+
+/// The regression the pool itself introduced, caught by the round-2 re-review.
+///
+/// `png`'s `Limits` is a *decrementing* pool that charges a chunk twice — once for the doubling
+/// capacity of the buffer holding it, again for its own length when it is `tEXt`, `zTXt` or
+/// `iTXt`. A pool of one entry plus a scanline therefore refused a **legal** 3.2 MB png over a
+/// 2 MiB comment, exiting non-zero with no archive where the build before the pool decoded it.
+/// The pool is three entries now, for the arithmetic in `png_pool`'s own documentation.
+#[test]
+fn a_legal_png_with_a_large_text_chunk_still_decodes() {
+    // The measured boundary was a 2 MiB comment against a 1.1 MB page; these bracket it.
+    for comment in [0, 300 << 10, 2 << 20, 4 << 20] {
+        let png = png_with_text_chunk(1000, 1500, comment);
+        let decoded = decode("comment.png", &png, Format::Png, DecodeSettings::default())
+            .unwrap_or_else(|error| {
+                panic!("a {comment}-byte comment must not make a page undecodable: {error}")
+            });
+        assert_eq!((decoded.page.width(), decoded.page.height()), (1000, 1500));
+    }
+}
+
+/// A png whose *declared* geometry is over the pixel ceiling is refused naming that ceiling,
+/// however wide it is.
+///
+/// The pool made this reachable in the wrong way: constructing the decoder reserves one output
+/// scanline against it, so a page wide enough for the scanline to exhaust the pool was refused
+/// with "Memory limit exceeded" rather than by the budget. `png_geometry` reads `IHDR` and
+/// refuses before the decoder exists, so the quantity and the limit reach the user for every
+/// png rather than only for narrow ones.
+#[test]
+fn an_oversized_png_is_refused_naming_the_pixel_ceiling_however_wide_it_is() {
+    // Both are over the 100 Mpx source ceiling; the second's scanline alone would exhaust any
+    // pool sized from its own tiny entry.
+    for (width, height) in [(65500u32, 65500u32), (400_000, 300)] {
+        // A 33-byte png: signature and IHDR, which is all `png_geometry` reads.
+        let mut forged = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut ihdr = width.to_be_bytes().to_vec();
+        ihdr.extend_from_slice(&height.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+        forged.extend_from_slice(&[0, 0, 0, 13]);
+        forged.extend_from_slice(b"IHDR");
+        forged.extend_from_slice(&ihdr);
+        forged.extend_from_slice(&[0, 0, 0, 0]);
+
+        for outcome in [
+            header("huge.png", &forged, Format::Png, Budget::default()).err(),
+            decode("huge.png", &forged, Format::Png, DecodeSettings::default()).err(),
+        ] {
+            let error = outcome.unwrap_or_else(|| {
+                panic!("{width}x{height} is over the pixel ceiling and must be refused")
+            });
+            assert!(
+                matches!(
+                    error.kind,
+                    PageErrorKind::TooLarge {
+                        quantity: "source pixels",
+                        ..
+                    }
+                ),
+                "{width}x{height} was refused by the decoder rather than by the budget: {:?}",
+                error.kind
+            );
+            assert!(error.to_string().contains("huge.png"), "{error}");
+        }
+    }
 }
 
 /// The oversize refusal comes from the *declared* dimensions, for every format — including the

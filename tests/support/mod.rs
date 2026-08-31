@@ -246,6 +246,27 @@ pub fn png_with_inflating_profile(inflated: usize) -> Vec<u8> {
     spliced
 }
 
+/// A png carrying a `tEXt` chunk of `comment` bytes before its first `IDAT`.
+///
+/// Legal, and the case a first draft of the decoder's memory pool refused: `png`'s `Limits` is a
+/// decrementing pool that charges a chunk *twice* — once for the capacity growth of the buffer
+/// holding it, which doubles and so costs up to `2L`, and again for the chunk's own length when
+/// it is `tEXt`, `zTXt` or `iTXt`. A pool sized at one entry plus a scanline therefore refused a
+/// 3.2 MB page over a 2 MiB comment, and the run exited non-zero with no archive.
+pub fn png_with_text_chunk(width: u32, height: u32, comment: usize) -> Vec<u8> {
+    let png = png_page(width, height);
+    let idat = png_chunk_offset(&png, *b"IDAT").expect("an encoded png has an IDAT");
+
+    // A NUL-separated keyword and text, which is what `tEXt` holds.
+    let mut text = b"Comment\0".to_vec();
+    text.resize(text.len() + comment, b'x');
+
+    let mut spliced = png[..idat].to_vec();
+    spliced.extend_from_slice(&png_chunk(*b"tEXt", &text));
+    spliced.extend_from_slice(&png[idat..]);
+    spliced
+}
+
 /// The offset of the first `kind` chunk's length field, walking chunk lengths rather than
 /// searching for the type: a chunk's *data* may hold the four bytes being looked for.
 fn png_chunk_offset(png: &[u8], kind: [u8; 4]) -> Option<usize> {
