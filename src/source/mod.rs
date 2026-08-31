@@ -25,6 +25,7 @@
 //! introduced one Change ago along with all its implementors. If a second push-only source
 //! ever arrives, that trade changes and the trait should flip.
 
+mod charset;
 mod directory;
 mod probe;
 mod rar;
@@ -32,6 +33,7 @@ mod sevenz;
 mod signature;
 mod zip;
 
+pub use charset::{BadLabel, Charset, DEFAULT_LABELS, Stated, Undecodable};
 pub use directory::DirectorySource;
 pub use probe::{
     CANDIDATES, Candidate, Format, MAGIC_MAX, Names, Naming, declared_format, output_name, probe,
@@ -97,6 +99,27 @@ pub trait Entries {
     fn next_entry(&mut self) -> Option<Result<Entry, SourceError>>;
 }
 
+/// What a reader needs from the command line, settled before the input is opened.
+///
+/// One struct rather than three parameters on five constructors, and the fields are what the
+/// *rule* needs rather than what each format uses: only zip consults `charset`, and 7z
+/// consults neither it nor `password`, because that is a property of those formats and not of
+/// the options. A reader ignoring a field says so where it ignores it.
+///
+/// [`Default`] is today's behaviour with nothing chosen — stored names, no encoding, no
+/// password. The guess is the command line's to make, so `--charset`'s non-empty default lives
+/// in `main` and not here.
+#[derive(Clone, Debug, Default)]
+pub struct ReadOptions {
+    pub naming: Naming,
+    /// Encodings to choose from where the container declares none, in the order given. Empty
+    /// means choose none, which is exactly the behaviour that preceded the option.
+    pub charset: Charset,
+    /// The password for an encrypted entry. `None` refuses one rather than reading its
+    /// ciphertext as though it were a page.
+    pub password: Option<String>,
+}
+
 /// An input being read once, in the order its entries are recorded in — or, for a directory,
 /// in the order the reader chose.
 pub enum Source {
@@ -128,9 +151,10 @@ impl Source {
     /// whole decision lives here rather than in the binary so that "a rar named `.cbz` reads
     /// as rar" is a property a test can assert without running a process.
     ///
-    /// `naming` decides whether an entry reaches the output under the name the input stored
-    /// or under one carrying its own position, and it is threaded from here because the
-    /// positional rule needs an entry total that only each reader can supply.
+    /// `options` is threaded from here rather than read where each rule applies, because both
+    /// halves need it before the first entry: the positional naming rule needs an entry total
+    /// only each reader can supply, and the encoding rule needs every name in the container
+    /// before the first page is handed on.
     ///
     /// # Errors
     ///
@@ -138,10 +162,10 @@ impl Source {
     /// reads, [`SourceError::NotReadable`] when the path is neither a file nor a directory,
     /// [`SourceError::Input`] when `path` cannot be opened or read, and whatever the chosen
     /// reader returns.
-    pub fn open(path: &Path, naming: Naming) -> Result<Self, SourceError> {
+    pub fn open(path: &Path, options: &ReadOptions) -> Result<Self, SourceError> {
         let metadata = std::fs::metadata(path).map_err(|source| SourceError::Input { source })?;
         if metadata.is_dir() {
-            return Self::directory(path, naming);
+            return Self::directory(path, options);
         }
         if !metadata.is_file() {
             // A device, a socket, a fifo. Refused before it is opened, because opening a
@@ -159,19 +183,19 @@ impl Source {
                 // Rewound so the reader sees the whole archive.
                 file.seek(std::io::SeekFrom::Start(0))
                     .map_err(|source| SourceError::Input { source })?;
-                Self::zip(file, naming)
+                Self::zip(file, options)
             }
             Some(ArchiveFormat::Rar) => {
                 // `unrar` is given the path, not a stream, so the probe handle has no further
                 // use. Dropped explicitly: left to the end of this scope it would still be
                 // open while `unrar` opened the same file a second time.
                 drop(file);
-                Self::rar(path, naming)
+                Self::rar(path, options)
             }
             Some(ArchiveFormat::SevenZ) => {
                 file.seek(std::io::SeekFrom::Start(0))
                     .map_err(|source| SourceError::Input { source })?;
-                Self::sevenz(file, naming)
+                Self::sevenz(file, options)
             }
             None => Err(SourceError::NotAnArchive {
                 formats: readable_formats(),
@@ -179,14 +203,15 @@ impl Source {
         }
     }
 
-    /// Opens `file` as a zip, reading its entry table.
+    /// Opens `file` as a zip, reading its entry table and every stored name.
     ///
     /// # Errors
     ///
-    /// [`SourceError::Archive`] when the entry table cannot be read, which is established
+    /// [`SourceError::Archive`] when the entry table cannot be read, and
+    /// [`SourceError::Charset`] when no listed encoding decodes every name — both established
     /// here rather than at the first entry.
-    pub fn zip(file: File, naming: Naming) -> Result<Self, SourceError> {
-        Ok(Self::Zip(ZipSource::new(file, naming)?))
+    pub fn zip(file: File, options: &ReadOptions) -> Result<Self, SourceError> {
+        Ok(Self::Zip(ZipSource::new(file, options)?))
     }
 
     /// Opens the rar archive at `path`, reading its archive header only.
@@ -201,17 +226,23 @@ impl Source {
     ///
     /// [`SourceError::UnsafePath`] when `path` contains an interior NUL, which `unrar` panics
     /// on rather than reporting. [`SourceError::Rar`] when the archive header cannot be read.
-    pub fn rar(path: &Path, naming: Naming) -> Result<Self, SourceError> {
-        Ok(Self::Rar(RarSource::open(path, naming)?))
+    pub fn rar(path: &Path, options: &ReadOptions) -> Result<Self, SourceError> {
+        Ok(Self::Rar(RarSource::open(path, options)?))
     }
 
     /// Opens `file` as a 7z, reading its header and starting the decoder thread.
     ///
+    /// `options.charset` is not consulted and cannot be: 7z stores a name as UTF-16, so there
+    /// are no legacy bytes to choose an encoding for. `options.password` is not consulted
+    /// either, and that is a property of this build rather than of the format — see
+    /// [`SevenZSource::new`].
+    ///
     /// # Errors
     ///
-    /// [`SourceError::SevenZ`] when the header cannot be read.
-    pub fn sevenz(file: File, naming: Naming) -> Result<Self, SourceError> {
-        Ok(Self::SevenZ(SevenZSource::new(file, naming)?))
+    /// [`SourceError::SevenZ`] when the header cannot be read, and
+    /// [`SourceError::Encrypted`] when the archive is encrypted.
+    pub fn sevenz(file: File, options: &ReadOptions) -> Result<Self, SourceError> {
+        Ok(Self::SevenZ(SevenZSource::new(file, options)?))
     }
 
     /// Lists the directory at `path`, choosing the order its pages will be read in.
@@ -221,8 +252,8 @@ impl Source {
     /// [`SourceError::Input`] when the directory itself cannot be listed,
     /// [`SourceError::Entry`] when one below it cannot, and the refusals the walk makes —
     /// see [`DirectorySource::open`].
-    pub fn directory(path: &Path, naming: Naming) -> Result<Self, SourceError> {
-        Ok(Self::Directory(DirectorySource::open(path, naming)?))
+    pub fn directory(path: &Path, options: &ReadOptions) -> Result<Self, SourceError> {
+        Ok(Self::Directory(DirectorySource::open(path, options)?))
     }
 }
 
@@ -357,8 +388,53 @@ pub enum SourceError {
         "the archive records {recorded} entries but only {kept} can be addressed, which happens when two entries share a stored name"
     )]
     RepeatedName { recorded: u64, kept: u64 },
+    /// No encoding in the user's list decodes every name the container left undeclared.
+    /// Refused rather than fallen back from: the fallback is the format's historical default,
+    /// which is what turns a page into a subdirectory, and a lossy decode would put U+FFFD in
+    /// an output name.
+    #[error(transparent)]
+    Charset(#[from] Undecodable),
+    /// The container encrypted this entry and no password was supplied. Refused rather than
+    /// read: the alternative is ciphertext in the output under a page's name.
+    #[error("{name}: the entry is encrypted; pass --pwd with the archive's password")]
+    Encrypted { name: String },
+    /// The container encrypted this entry in a form this build does not carry. Named by form,
+    /// because "wrong password" is what the dependency says here and it is the wrong
+    /// diagnosis: no password would have worked.
+    ///
+    /// *Declares* rather than *is*, because the two are separable: a zip entry can carry an
+    /// AE-x extra field with its encryption flag clear, which is malformed rather than
+    /// plaintext, and naming the form it declares is more use than asserting a state its own
+    /// header denies.
+    #[error("{name}: the entry declares {form} encryption, which this build cannot decrypt")]
+    EncryptionUnsupported { name: String, form: &'static str },
+    /// An encrypted entry that would not read after a password was supplied.
+    ///
+    /// The clause about one in 256 is not padding. `ZipCrypto` authenticates a password against
+    /// a single byte, which upstream documents, so 255 wrong passwords in 256 are refused
+    /// outright and the 256th is *accepted* — the data is then garbage and what surfaces is a
+    /// page that will not decode. From here that is indistinguishable from a damaged archive,
+    /// so the message names both rather than picking one.
+    #[error(
+        "{name}: {reason}, with a password supplied — this encryption form accepts one wrong password in 256, so the password may be wrong rather than the archive damaged"
+    )]
+    BadPassword { name: String, reason: String },
     #[error("{name}: cannot read the entry: {source}")]
     Entry {
+        name: String,
+        source: std::io::Error,
+    },
+    /// An entry the container lists but cannot yield at all: its record points at no entry
+    /// header, so neither its data nor its stored name bytes are reachable.
+    ///
+    /// Separate from [`SourceError::Entry`] only for what it has to say about the name. Every
+    /// other entry in the same archive is named by the encoding the reader chose; this one can
+    /// only be named by the container's own decode, so the message says which it is rather
+    /// than sending the reader to look for a page that exists under no such name.
+    #[error(
+        "{name}: cannot read the entry: {source}. That name is the container's own decoding of the stored bytes, which could not be read either"
+    )]
+    Unreachable {
         name: String,
         source: std::io::Error,
     },

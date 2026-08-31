@@ -2,12 +2,18 @@
 //!
 //! The surface contains exactly what is implemented. A flag may exist and be unimplemented,
 //! or not exist; it must not exist and silently do the wrong thing — so the flags Go had and
-//! this build does not (`--charset`, `--pwd`, `--delete-org`, `-o/--out`, `-r/--ratio`,
-//! `--small-skip`, `--optimizer`, `--progressive`) are absent rather than accepted and
-//! ignored. Absence is the honest form of "not yet".
+//! this build does not (`--delete-org`, `-o/--out`, `-r/--ratio`, `--small-skip`,
+//! `--optimizer`, `--progressive`) are absent rather than accepted and ignored. Absence is the
+//! honest form of "not yet".
 //!
-//! `--fix-idx` is the first flag added since the rewrite began, and it is here in the same
-//! Change that implements it, which is that rule read the other way round.
+//! `--fix-idx` was the first flag added since the rewrite began, and `--charset` and `--pwd`
+//! join it in the Change that implements them, which is that rule read the other way round.
+//!
+//! `--charset` is the first flag whose default is not "off", and the asymmetry is the point:
+//! `--fix-idx` defaults to off because the default path is *correct* and renaming is a
+//! preference, while here the default path is wrong — it decodes a Japanese archive's names as
+//! CP437 and turns a page into a subdirectory. A flag defaults to off when what it changes is
+//! a choice, and to on when what it changes is a defect.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -19,7 +25,7 @@ use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter}
 use comic_auto_resize::pipeline::{self, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
 use comic_auto_resize::sink::{InputKind, default_output};
-use comic_auto_resize::source::{Naming, Source};
+use comic_auto_resize::source::{Charset, DEFAULT_LABELS, Naming, ReadOptions, Source};
 use thiserror::Error;
 
 /// The largest width a JPEG can express, so the largest worth accepting.
@@ -67,6 +73,23 @@ struct Cli {
     /// default; enable it when a viewer orders pages by name rather than numerically.
     #[arg(long)]
     fix_idx: bool,
+
+    /// Encodings to try for an entry name the archive stores without declaring its encoding,
+    /// in order. The list is consulted only where the container declares none — a zip's
+    /// UTF-8 flag and its Info-ZIP Unicode Path field both outrank it — and one encoding is
+    /// chosen for the whole input, so no two pages of one book are decoded differently. Takes
+    /// `ja`, `zh`, `ko` or any WHATWG label an ASCII-compatible encoding answers to, such as
+    /// `shift_jis` or `gb18030`; a label naming one that is not — `utf-16le`, `iso-2022-jp` —
+    /// is refused, because a name decoded through it would lose its own extension. Pass an
+    /// empty value to choose none and leave such names as the format's historical default.
+    #[arg(long, default_value = DEFAULT_LABELS, value_parser = charset, value_name = "LIST")]
+    charset: Charset,
+
+    /// Password for an encrypted archive. This build decrypts a zip's `ZipCrypto` entries and
+    /// rar's encrypted entries; a zip encrypted with AES and a 7z, whose only encryption is
+    /// `AES-256`, are refused by name rather than read.
+    #[arg(long, value_name = "PASSWORD")]
+    pwd: Option<String>,
 }
 
 fn main() -> ExitCode {
@@ -101,10 +124,17 @@ fn run(cli: &Cli) -> Result<(u32, PathBuf), CliError> {
             ..EncodeSettings::default()
         },
     };
-    let naming = if cli.fix_idx {
-        Naming::ByPosition
-    } else {
-        Naming::Stored
+    // Every option is settled before the input is opened: an unknown `--charset` label was
+    // refused by the parser, and the encoding list is resolved rather than a string the reader
+    // would have to parse per archive.
+    let options = ReadOptions {
+        naming: if cli.fix_idx {
+            Naming::ByPosition
+        } else {
+            Naming::Stored
+        },
+        charset: cli.charset.clone(),
+        password: cli.pwd.clone(),
     };
 
     // The input's *kind* is established before its format, and both before anything is
@@ -117,7 +147,7 @@ fn run(cli: &Cli) -> Result<(u32, PathBuf), CliError> {
     // does the same. No `BufReader` for zip: `by_index` seeks to every entry and
     // `BufReader::seek` throws its buffer away, so a wrapper would be discarded once a page.
     // The table's own reads are small and unbuffered — measured at 2 ms for 1000 entries.
-    let source = Source::open(&cli.input, naming).map_err(|source| CliError::Archive {
+    let source = Source::open(&cli.input, &options).map_err(|source| CliError::Archive {
         path: cli.input.clone(),
         source,
     })?;
@@ -150,6 +180,14 @@ fn worker_count() -> NonZeroUsize {
     let cpus = thread::available_parallelism().map_or(4, NonZeroUsize::get);
     let jobs = if cpus >= 5 { cpus - 1 } else { 4 };
     NonZeroUsize::new(jobs).unwrap_or(NonZeroUsize::MIN)
+}
+
+/// Resolves `--charset`'s label list, so an unknown label is refused before the input opens.
+///
+/// Named rather than inlined because `clap`'s derive wants a function path, and the resolution
+/// belongs to the reader's rule rather than to the parser: `main` supplies only the default.
+fn charset(labels: &str) -> Result<Charset, comic_auto_resize::source::BadLabel> {
+    Charset::resolve(labels)
 }
 
 #[derive(Debug, Error)]

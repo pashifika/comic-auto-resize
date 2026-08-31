@@ -36,6 +36,16 @@ clap = { version = "=4.6.6", features = ["derive"] }
 # global pool is what makes a blocking send from inside a task a deadlock risk. Nothing
 # here runs on a shared pool.
 crossbeam-channel = "=0.5.16"
+# Entry-name decoding for a container that declares no encoding. Deliberately the whole
+# crate: it cannot be subsetted, measured — naming one static (`SHIFT_JIS`) costs 0.5% less
+# than the full WHATWG label lookup, because `new_variant_decoder` matches every variant and
+# makes every table reachable. So `--charset` takes any label an *ASCII-compatible* encoding
+# answers to rather than a curated list, which buys generality for nothing; the qualifier is
+# load-bearing, because an encoding that swallows the `2E` of `.jpg` would make the extension
+# filter drop the page. Licence `(Apache-2.0 OR MIT) AND BSD-3-Clause`: a conjunction, so the
+# `BSD-3-Clause` term is not optional — see `deny.toml`, where the entry is shared with
+# `mozjpeg-sys` and removable against neither.
+encoding_rs = "=0.8.35"
 # Both pinned exactly: a native build that changes underneath a previously green run is
 # the hardest kind of failure to attribute.
 fast_image_resize = "=6.1.0"

@@ -18,9 +18,9 @@ use std::process::Command;
 
 use comic_auto_resize::pipeline::{self, RunError, Settings};
 use comic_auto_resize::sink::{InputKind, default_output};
-use comic_auto_resize::source::{Entries, Naming, Source, SourceError, ZipSource};
+use comic_auto_resize::source::{Entries, ReadOptions, Source, SourceError, ZipSource};
 
-use support::{TempDir, page_bytes, read_archive, write_archive, write_tree};
+use support::{TempDir, by_position, page_bytes, read_archive, write_archive, write_tree};
 
 /// A small page, distinguishable from its neighbours by width.
 fn page(width: u32) -> Vec<u8> {
@@ -45,9 +45,9 @@ fn archive(names: &[&str]) -> Vec<u8> {
     std::fs::read(&path).expect("reads back the fixture")
 }
 
-/// Every output name the reader produces for `bytes` under `naming`.
-fn output_names(bytes: &[u8], naming: Naming) -> Result<Vec<String>, SourceError> {
-    let mut source = ZipSource::new(Cursor::new(bytes.to_vec()), naming)?;
+/// Every output name the reader produces for `bytes` under `options`.
+fn output_names(bytes: &[u8], options: &ReadOptions) -> Result<Vec<String>, SourceError> {
+    let mut source = ZipSource::new(Cursor::new(bytes.to_vec()), options)?;
     let mut names = Vec::new();
     while let Some(entry) = source.next_entry() {
         names.push(entry?.name);
@@ -56,7 +56,7 @@ fn output_names(bytes: &[u8], naming: Naming) -> Result<Vec<String>, SourceError
 }
 
 fn renumbered(names: &[&str]) -> Vec<String> {
-    output_names(&archive(names), Naming::ByPosition).expect("reads")
+    output_names(&archive(names), &by_position()).expect("reads")
 }
 
 fn settings() -> Settings {
@@ -78,7 +78,7 @@ fn settings() -> Settings {
 fn renumbering_is_off_unless_it_is_asked_for() {
     let bytes = archive(&["page1.jpg", "page2.jpg", "page10.jpeg"]);
     assert_eq!(
-        output_names(&bytes, Naming::Stored).expect("reads"),
+        output_names(&bytes, &ReadOptions::default()).expect("reads"),
         ["page1.jpg", "page2.jpg", "page10.jpg"]
     );
 }
@@ -185,7 +185,7 @@ fn two_entries_a_padding_rule_would_have_collapsed_get_distinct_names_and_no_ref
         ],
     );
     let output = scratch.join("out.zip");
-    let source = Source::open(&input, Naming::ByPosition).expect("opens");
+    let source = Source::open(&input, &by_position()).expect("opens");
     let report = pipeline::run(source, &output, &settings()).expect("no duplicate-name refusal");
     assert_eq!(report.pages, 2);
     assert_eq!(
@@ -231,7 +231,7 @@ fn a_directory_input_is_renumbered_by_the_same_rule() {
         ],
     );
 
-    let mut source = Source::open(&root, Naming::ByPosition).expect("opens");
+    let mut source = Source::open(&root, &by_position()).expect("opens");
     let mut names = Vec::new();
     while let Some(entry) = source.next_entry() {
         names.push(entry.expect("reads").name);
@@ -364,7 +364,7 @@ fn the_writers_duplicate_name_refusal_is_still_reachable_without_renumbering() {
         ],
     );
     let output = scratch.join("out.zip");
-    let source = Source::open(&input, Naming::Stored).expect("opens");
+    let source = Source::open(&input, &ReadOptions::default()).expect("opens");
     let error = pipeline::run(source, &output, &settings()).expect_err("a collision");
     assert!(matches!(error, RunError::NameCollision { .. }), "{error}");
 }

@@ -24,13 +24,37 @@
 //! two entries stored under one name byte for byte collapse into a single record and the
 //! loser would leave the book without a word. The end record counts what the archive says it
 //! holds; a disagreement with what the table kept is refused rather than shortened.
+//!
+//! # Why every stored name is read when the archive is opened
+//!
+//! A name's *bytes* are reachable only from a located entry — `ZipArchive` has no raw-name
+//! accessor, every `pub fn` on it was enumerated, and `metadata()` hands back a type with no
+//! way into its map. And the encoding those bytes are in has to be chosen for the whole
+//! archive rather than per entry, so the whole name set is needed before the first page.
+//!
+//! So the names are surveyed at open, through `by_index_raw`, and decoded once. Measured with
+//! a counting reader: `find_data_start` seeks to the local header, parses the fixed block, and
+//! computes the data offset arithmetically — thirty bytes and two seeks per entry, no entry
+//! data — and memoises the offset in a `OnceLock` the archive owns, so the `by_index` a page
+//! costs later re-reads nothing. The added cost against the previous build is therefore thirty
+//! bytes for each entry the extension filter rejects, and nothing for the pages.
+//!
+//! `by_index_raw` rather than `by_index`, and the difference is the point: it builds no
+//! decompressor and no crypto reader, so an entry whose codec this build lacks or whose data
+//! is encrypted still yields its name. Locating with `by_index` instead would make a run fail
+//! on a `ComicInfo.xml` the filter was about to drop. It is never used to read *data* — for
+//! that it hands back ciphertext as plaintext with no error, measured — and `read_one` does
+//! not call it.
 
 use std::io::{Read, Seek, SeekFrom};
 
-use zip::ZipArchive;
+use zip::{AesMode, HasZipMetadata, ZipArchive, ZipReadOptions};
 
+use super::charset::Stated;
 use super::probe::{self, MAGIC_MAX, Names, Naming};
-use super::{Entry, HINT_CEILING, MAX_ENTRY_BYTES, SourceError, fill, is_directory, unsafe_name};
+use super::{
+    Entry, HINT_CEILING, MAX_ENTRY_BYTES, ReadOptions, SourceError, fill, is_directory, unsafe_name,
+};
 
 /// The signature of the 32-bit end-of-central-directory record.
 const END_OF_DIRECTORY: [u8; 4] = [b'P', b'K', 5, 6];
@@ -44,10 +68,18 @@ pub struct ZipSource<R> {
     /// the archive held something that was not a page.
     next_index: u32,
     names: Names,
+    /// Every entry's name, decoded once when the archive was opened, in table order. See the
+    /// module doc for why it cannot be derived one entry at a time.
+    decoded: Vec<String>,
+    /// What the survey learned beside each name: whether the stored bytes were reachable, and
+    /// the encryption the entry declares. All three are reachable only from a located entry.
+    surveyed: Vec<Surveyed>,
+    /// The password an encrypted entry is read with, or `None` to refuse one.
+    password: Option<Vec<u8>>,
 }
 
 impl<R: Read + Seek> ZipSource<R> {
-    /// Reads the archive's entry table.
+    /// Reads the archive's entry table and every stored name.
     ///
     /// # Errors
     ///
@@ -55,33 +87,40 @@ impl<R: Read + Seek> ZipSource<R> {
     /// any entry, so a truncated or malformed one fails the run before a page is processed.
     /// [`SourceError::RepeatedName`] when the table kept fewer entries than the archive
     /// records, which is what two entries stored under one name look like from here.
-    pub fn new(mut reader: R, naming: Naming) -> Result<Self, SourceError> {
+    /// [`SourceError::Charset`] when no listed encoding decodes every name the archive left
+    /// undeclared.
+    pub fn new(mut reader: R, options: &ReadOptions) -> Result<Self, SourceError> {
         let recorded = recorded_entry_count(&mut reader).map_err(::zip::result::ZipError::Io)?;
-        let archive = ZipArchive::new(reader)?;
+        let mut archive = ZipArchive::new(reader)?;
         if let Some(recorded) = recorded {
             let kept = archive.len() as u64;
             if recorded > kept {
                 return Err(SourceError::RepeatedName { recorded, kept });
             }
         }
-        let names = match naming {
+        let names = match options.naming {
             Naming::Stored => Names::stored(),
             // The entry table is read by now, so the entry total costs nothing here.
             Naming::ByPosition => Names::by_position(archive.len()),
         };
+        let (stated, surveyed) = survey(&mut archive);
+        let decoded = options.charset.decode_all(&stated)?;
         Ok(Self {
             archive,
             next_position: 0,
             next_index: 0,
             names,
+            decoded,
+            surveyed,
+            password: options.password.as_ref().map(|pw| pw.as_bytes().to_vec()),
         })
     }
 
     /// The next page, or `None` at the end of the archive.
     ///
-    /// Entries that are not pages are passed over without being reached at all: a directory,
-    /// and any entry whose extension no candidate claims, cost nothing beyond the name the
-    /// entry table already holds.
+    /// Entries that are not pages are passed over without being read: a directory, and any
+    /// entry whose extension no candidate claims, cost nothing beyond the name the survey
+    /// already decoded.
     pub fn next_entry(&mut self) -> Option<Result<Entry, SourceError>> {
         while self.next_position < self.archive.len() {
             let position = self.next_position;
@@ -98,33 +137,84 @@ impl<R: Read + Seek> ZipSource<R> {
         None
     }
 
+    /// Why the entry at `position` must not be read, or `None` if it may be.
+    ///
+    /// Both refusals come before the entry is located, because locating an encrypted entry is
+    /// what produces the dependency's own diagnosis instead — `Password required to decrypt
+    /// file` for an encrypted entry with none supplied, whatever form it uses, and
+    /// `InvalidPassword` for an AE-x entry whose encryption flag is clear. Neither names the
+    /// form, which for AES is the whole of what the user needs told: no password would have
+    /// helped.
+    fn refuse_encryption(&self, position: usize, name: &str) -> Option<SourceError> {
+        let surveyed = self.surveyed[position];
+        if let Some(form) = surveyed.unsupported_form() {
+            return Some(SourceError::EncryptionUnsupported {
+                name: name.to_owned(),
+                form,
+            });
+        }
+        if surveyed.encrypted && self.password.is_none() {
+            return Some(SourceError::Encrypted {
+                name: name.to_owned(),
+            });
+        }
+        None
+    }
+
     /// One pass over the entry at `position` in the table.
     fn read_one(&mut self, position: usize) -> Yielded {
-        let Some(name) = self.archive.name_for_index(position) else {
+        // The decoded name, not `name_for_index`'s: that one is the archive's own guess, and
+        // for an archive that declares no encoding the guess is what this Change exists to
+        // replace. Borrowed rather than cloned — `decoded`, `archive`, `names` and `password`
+        // are separate fields, so the reads below coexist with locating the entry.
+        let Some(name) = self.decoded.get(position) else {
             // `position` came from the archive's own entry count, so this is unreachable.
             // Reported rather than asserted: the reader runs on its own thread, where a
             // panic costs the run its message and buys nothing.
             return Yielded::Failed(SourceError::Archive(::zip::result::ZipError::FileNotFound));
         };
+        let name = name.as_str();
         if is_directory(name) {
             return Yielded::Skipped;
         }
-        // The extension filter, before the entry is located, let alone read.
+        // The extension filter, on the decoded name and before the entry is read. Filtering
+        // the archive's guess instead is not merely cosmetic: a GB18030 trail byte may be
+        // `6A`, so a legacy name can gain or lose a `.jpg` in the guess.
         let Some(declared) = probe::declared_format(name) else {
             return Yielded::Skipped;
         };
-        // Ends the borrow of the entry table, which reading the entry needs mutably.
-        let name = name.to_owned();
+
+        if let Some(error) = self.refuse_encryption(position, name) {
+            return Yielded::Failed(error);
+        }
+        let surveyed = self.surveyed[position];
+        // A wrong ZipCrypto password is accepted one time in 256, and then the page is
+        // garbage rather than the password refused. Recorded here so every failure that shape
+        // takes can say so.
+        let false_accept = surveyed.encrypted && self.password.is_some();
 
         let index = self.next_index;
-        let mut file = match self.archive.by_index(position) {
+        let options = ZipReadOptions::new().password(self.password.as_deref());
+        let mut file = match self.archive.by_index_with_options(position, options) {
             Ok(file) => file,
             // Named, which the sequential reader could not do: it met a malformed entry
             // before its name, where the entry table carries the name of every entry
             // whether or not the entry itself can be read.
+            //
+            // The one case where that name is not the decoded one says so. An entry the survey
+            // could not locate has no reachable stored bytes, so its name is the container's
+            // own decode — and in an archive read under a chosen encoding, every *other* entry
+            // is reported as the characters that encoding names. An unremarked CP437 name
+            // among them sends the reader looking for a page that is not there under any name.
+            Err(error) if !surveyed.reachable => {
+                return Yielded::Failed(SourceError::Unreachable {
+                    name: name.to_owned(),
+                    source: error.into(),
+                });
+            }
             Err(error) => {
                 return Yielded::Failed(SourceError::Entry {
-                    name,
+                    name: name.to_owned(),
                     source: error.into(),
                 });
             }
@@ -135,7 +225,7 @@ impl<R: Read + Seek> ZipSource<R> {
         // claiming more than the limit costs nothing to refuse and is not read at all.
         if file.size() > MAX_ENTRY_BYTES {
             return Yielded::Failed(SourceError::TooLarge {
-                name,
+                name: name.to_owned(),
                 limit: MAX_ENTRY_BYTES,
             });
         }
@@ -143,16 +233,27 @@ impl<R: Read + Seek> ZipSource<R> {
         let mut head = [0; MAGIC_MAX];
         let head = match fill(&mut file, &mut head) {
             Ok(read) => &head[..read],
-            Err(source) => return Yielded::Failed(SourceError::Entry { name, source }),
+            // The first read of the decrypted stream, and the one a false-accepted ZipCrypto
+            // password fails for a *Deflate* entry: the plaintext is garbage, so inflating it
+            // errors before two bytes exist. Deflate is `zip`'s own default, so routing this
+            // arm past `read_failure` would have hidden the clause from the ordinary case and
+            // shown it only on a Stored one.
+            Err(source) => return Yielded::Failed(read_failure(name, false_accept, source)),
         };
 
         // The extension said this was a page. If the bytes disagree the archive is
         // inconsistent, which Go also treated as an error rather than a skip.
         match probe::probe(head) {
             Some(format) if format == declared => {}
+            _ if false_accept => {
+                return Yielded::Failed(SourceError::BadPassword {
+                    name: name.to_owned(),
+                    reason: format!("the entry does not hold {}", declared.name()),
+                });
+            }
             _ => {
                 return Yielded::Failed(SourceError::Mismatch {
-                    name,
+                    name: name.to_owned(),
                     declared: declared.name(),
                 });
             }
@@ -176,30 +277,58 @@ impl<R: Read + Seek> ZipSource<R> {
             .saturating_sub(bytes.len() as u64)
             .saturating_add(1);
         if let Err(source) = file.take(remaining).read_to_end(&mut bytes) {
-            return Yielded::Failed(SourceError::Entry { name, source });
+            return Yielded::Failed(read_failure(name, false_accept, source));
         }
         if bytes.len() as u64 > MAX_ENTRY_BYTES {
             return Yielded::Failed(SourceError::TooLarge {
-                name,
+                name: name.to_owned(),
                 limit: MAX_ENTRY_BYTES,
             });
         }
 
-        // The stored name goes into the *output* archive, so a traversing or absolute name
+        // The decoded name goes into the *output* archive, so a traversing or absolute name
         // would be carried to whatever extracts it. `zip`'s own documentation warns that
         // `ZipFile::name` may be absolute or escape via `..`. Rejected rather than
         // sanitised: silently rewriting a name would produce an archive whose entries do not
         // match the input's, which is worse than refusing.
-        if let Some(reason) = unsafe_name(&name) {
-            return Yielded::Failed(SourceError::UnsafeName { name, reason });
+        //
+        // After decoding, not before, and that is the load-bearing half: decoding decides
+        // which bytes are separators. Shift_JIS consumes `5C` as the trail byte of `表`, so
+        // the correct decode has no separator where the archive's guess had one — and a
+        // *wrongly* chosen encoding can produce one where the bytes had none, which is
+        // exactly what this check is here to refuse.
+        if let Some(reason) = unsafe_name(name) {
+            return Yielded::Failed(SourceError::UnsafeName {
+                name: name.to_owned(),
+                reason,
+            });
         }
 
         Yielded::Entry(Entry {
             index,
-            name: self.names.of(&name, declared),
+            name: self.names.of(name, declared),
             format: declared,
             bytes,
         })
+    }
+}
+
+/// The failure to report for a read that went wrong once the entry was located.
+///
+/// One function for every such site, because the distinction is one property of the *entry*
+/// rather than of the site: on an encrypted entry read with a password, any failure of the
+/// plaintext is as likely to be a wrong password false-accepted by `ZipCrypto`'s one-byte check
+/// as it is to be a damaged archive, and the two are indistinguishable from here.
+fn read_failure(name: &str, false_accept: bool, source: std::io::Error) -> SourceError {
+    if false_accept {
+        return SourceError::BadPassword {
+            name: name.to_owned(),
+            reason: source.to_string(),
+        };
+    }
+    SourceError::Entry {
+        name: name.to_owned(),
+        source,
     }
 }
 
@@ -209,6 +338,98 @@ enum Yielded {
     /// Not a page. The entry is left where it is rather than read past.
     Skipped,
     Failed(SourceError),
+}
+
+/// What the survey learned about one entry beside its name.
+#[derive(Clone, Copy)]
+struct Surveyed {
+    /// Whether the entry's stored name bytes were reachable at all. `false` means the record
+    /// points at no local header, so the name is the container's own decode and every check
+    /// below it is a guess — including this struct's other two fields.
+    reachable: bool,
+    /// General-purpose bit 0. Set means the data is ciphertext.
+    encrypted: bool,
+    /// The strength an AE-x extra field declared, which is the form this build does not
+    /// carry. `None` alongside `encrypted` means `ZipCrypto`, which it does.
+    aes: Option<AesMode>,
+}
+
+impl Surveyed {
+    /// The encryption form this build cannot decrypt, if this entry declares one.
+    ///
+    /// Established from the extra field rather than from the compression method, because
+    /// `AexEncryption::parse` rewrites `compression_method` to the *underlying* method — so an
+    /// AES entry opens like any other and is indistinguishable from a `ZipCrypto` one by the
+    /// dependency's own error alone.
+    ///
+    /// Read off the field alone and not gated on bit 0, which is why the refusal says
+    /// *declares*: `zip` parses a `0x9901` field whatever the flag says, so an entry can carry
+    /// one with bit 0 clear. Such an entry is malformed rather than plaintext — the dependency
+    /// refuses it too, as `InvalidPassword` — and naming the form it declares is the more
+    /// useful of the two answers.
+    fn unsupported_form(self) -> Option<&'static str> {
+        match self.aes? {
+            AesMode::Aes128 => Some("AES-128"),
+            AesMode::Aes192 => Some("AES-192"),
+            AesMode::Aes256 => Some("AES-256"),
+        }
+    }
+}
+
+/// Every entry's stored name and encryption, in table order.
+///
+/// The name a container has settled — general-purpose bit 11, or an Info-ZIP Unicode Path
+/// extra field — is taken as it stands and never reaches a chosen encoding. Both arrive here
+/// as one flag, because the dependency sets `is_utf8` for the extra field too
+/// (`read.rs:705-713`) after overwriting `file_name_raw` with its UTF-8 content. That is why
+/// the raw bytes are "the best name bytes the crate has" rather than "the bytes in the central
+/// directory", and why a decoder that assumed the latter would re-decode an already correct
+/// name through `Shift_JIS`.
+///
+/// **The flag is believed only where it is true.** `zip` builds `file_name` for a bit-11 entry
+/// with `from_utf8_lossy` (`read.rs:526-530`) and validates nothing, so a tool that sets the bit
+/// over legacy bytes yields a name full of U+FFFD — the lossy decode this module refuses for an
+/// undecided name, arriving by the one path that would skip the refusal. A `0x7075` name cannot
+/// reach that state, because the dependency builds it with `String::from_utf8(…)?` and
+/// propagates the error, so checking validity here only ever reclassifies a flag that lied. Such
+/// an entry is undecided, which also means `--charset` can rescue it.
+///
+/// An entry whose local header cannot be parsed contributes the archive's own decode and is
+/// left to fail when it is read, which is where it fails today. The survey refuses nothing:
+/// a malformed *entry* is not a malformed archive.
+fn survey<R: Read + Seek>(archive: &mut ZipArchive<R>) -> (Vec<Stated>, Vec<Surveyed>) {
+    let mut stated = Vec::with_capacity(archive.len());
+    let mut surveyed = Vec::with_capacity(archive.len());
+    for position in 0..archive.len() {
+        let guess = archive
+            .name_for_index(position)
+            .map_or_else(String::new, str::to_owned);
+        let Ok(file) = archive.by_index_raw(position) else {
+            stated.push(Stated::Decided(guess));
+            surveyed.push(Surveyed {
+                reachable: false,
+                encrypted: false,
+                aes: None,
+            });
+            continue;
+        };
+        let metadata = file.get_metadata();
+        let declared = metadata.is_utf8 && std::str::from_utf8(&metadata.file_name_raw).is_ok();
+        stated.push(if declared {
+            Stated::Decided(guess)
+        } else {
+            Stated::Undecided {
+                guess,
+                bytes: metadata.file_name_raw.to_vec(),
+            }
+        });
+        surveyed.push(Surveyed {
+            reachable: true,
+            encrypted: metadata.encrypted,
+            aes: metadata.aes_mode.map(|(mode, ..)| mode),
+        });
+    }
+    (stated, surveyed)
 }
 
 /// How many entries the archive's end record says it holds, or `None` when that cannot be

@@ -79,7 +79,9 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use sevenz_rust2::{ArchiveReader, Password};
 
 use super::probe::{self, MAGIC_MAX, Names, Naming};
-use super::{Entry, HINT_CEILING, MAX_ENTRY_BYTES, SourceError, fill, is_directory, unsafe_name};
+use super::{
+    Entry, HINT_CEILING, MAX_ENTRY_BYTES, ReadOptions, SourceError, fill, is_directory, unsafe_name,
+};
 
 /// A 7z archive being decoded on its own thread, one entry at a time.
 pub struct SevenZSource {
@@ -151,6 +153,40 @@ fn dictionary_bytes(method: &[u8], properties: &[u8]) -> Option<u64> {
     }
 }
 
+/// The first block that is AES-256 encrypted, if any is.
+///
+/// Read off the coder list the header already carries, the way [`oversized_dictionary`] reads
+/// the dictionary sizes. 7z has exactly one encryption method — AES-256-SHA256 — so a password
+/// could not help this build whatever the user supplies: the `aes256` feature is off, and the
+/// dependency would report `UnsupportedCompressionMethod` from the middle of a block decode.
+/// Named here instead, before a page is read.
+fn aes_block(archive: &sevenz_rust2::Archive) -> Option<usize> {
+    archive.blocks.iter().position(|block| {
+        block
+            .coders
+            .iter()
+            .any(|coder| coder.encoder_method_id() == sevenz_rust2::EncoderMethod::ID_AES256_SHA256)
+    })
+}
+
+/// The name of `block`'s first entry, for a refusal to name.
+///
+/// The block's *own* first entry rather than the archive's, because the two differ in the
+/// ordinary case: `7z a -p` stores the directory entry first, and an archive built by adding
+/// encrypted files to a plain one has both kinds of block — so naming `files[0]` would point at
+/// a directory, which has no stream to encrypt, or at a page that really is readable plaintext.
+///
+/// `None` where the mapping is absent, which leaves the caller to name the archive rather than
+/// the wrong entry.
+fn block_entry_name(archive: &sevenz_rust2::Archive, block: usize) -> Option<&str> {
+    archive
+        .stream_map
+        .block_first_file_index
+        .get(block)
+        .and_then(|&index| archive.files.get(index))
+        .map(|file| file.name.as_str())
+}
+
 impl SevenZSource {
     /// Opens `file` as a 7z archive, reading its header.
     ///
@@ -160,11 +196,33 @@ impl SevenZSource {
     /// # Errors
     ///
     /// [`SourceError::SevenZ`] when the header cannot be read, which covers an archive whose
-    /// headers are encrypted and one written with a codec this build does not carry, and
+    /// headers are encrypted and one written with a codec this build does not carry,
+    /// [`SourceError::EncryptionUnsupported`] when a block is AES-256 encrypted, and
     /// [`SourceError::Dictionary`] when a block declares more working memory than
     /// [`MAX_DICTIONARY_BYTES`].
-    pub fn new(file: std::fs::File, naming: Naming) -> Result<Self, SourceError> {
-        let mut reader = ArchiveReader::new(file, Password::empty())?;
+    pub fn new(file: std::fs::File, options: &ReadOptions) -> Result<Self, SourceError> {
+        // `Password::empty()` rather than `options.password`, and that is deliberate: this
+        // build carries no AES, so a password can decrypt nothing here and passing one would
+        // only move the failure from the header to the middle of a block. The two refusals
+        // below name the form instead.
+        //
+        // An archive written with `-mhe=on` encrypts its *header*, and that one fails inside
+        // `ArchiveReader::new` before any of this runs: `read_encoded_header` builds the
+        // header's own coder chain and, with `aes256` off, reaches
+        // `UnsupportedCompressionMethod("AES256_SHA256")`. Re-raised as the same refusal the
+        // data-encrypted case gets, so both shapes of 7z encryption give the user one answer.
+        let mut reader =
+            ArchiveReader::new(file, Password::empty()).map_err(|error| match &error {
+                sevenz_rust2::Error::UnsupportedCompressionMethod(method)
+                    if method == "AES256_SHA256" =>
+                {
+                    SourceError::EncryptionUnsupported {
+                        name: "the archive's own header".to_owned(),
+                        form: "AES-256",
+                    }
+                }
+                _ => SourceError::SevenZ(error),
+            })?;
         // Not a trade. `ArchiveReader::new` defaults to `available_parallelism()`, which
         // selects the multi-threaded LZMA2 reader and gives every worker its own dictionary:
         // measured on one 512 MiB solid block, 225 ms and 35.6 MB at one thread against
@@ -179,7 +237,17 @@ impl SevenZSource {
             });
         }
 
-        let names = match naming {
+        // The whole archive rather than one entry, because 7z encrypts a block and a block is
+        // shared. Named by form: no password this build accepts would read it.
+        if let Some(block) = aes_block(reader.archive()) {
+            return Err(SourceError::EncryptionUnsupported {
+                name: block_entry_name(reader.archive(), block)
+                    .map_or_else(|| "the archive".to_owned(), str::to_owned),
+                form: "AES-256",
+            });
+        }
+
+        let names = match options.naming {
             Naming::Stored => Names::stored(),
             // The header is parsed by now, so the entry total costs nothing here.
             Naming::ByPosition => Names::by_position(reader.archive().files.len()),

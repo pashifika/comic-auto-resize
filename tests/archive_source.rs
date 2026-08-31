@@ -11,7 +11,7 @@ use std::io::{Cursor, Write};
 use comic_auto_resize::page::{Channels, PageImage};
 use comic_auto_resize::page::{EncodeSettings, encode};
 use comic_auto_resize::source::{
-    CANDIDATES, Format, MAGIC_MAX, MAX_ENTRY_BYTES, Naming, SourceError, ZipSource, probe,
+    CANDIDATES, Format, MAGIC_MAX, MAX_ENTRY_BYTES, ReadOptions, SourceError, ZipSource, probe,
 };
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -45,7 +45,7 @@ fn archive(entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
 fn read_all(bytes: &[u8]) -> Result<Vec<(u32, String)>, SourceError> {
     // `ZipSource` rather than `Source`, because these tests are about the zip reader and the
     // enum names `File` for the one reader the binary ever opens. Same code under test.
-    let mut source = ZipSource::new(Cursor::new(bytes), Naming::Stored)?;
+    let mut source = ZipSource::new(Cursor::new(bytes), &ReadOptions::default())?;
     let mut yielded = Vec::new();
     while let Some(entry) = source.next_entry() {
         let entry = entry?;
@@ -59,7 +59,7 @@ fn read_all(bytes: &[u8]) -> Result<Vec<(u32, String)>, SourceError> {
 /// Separate from `read_all` rather than a widening of it, so the tests that predate the
 /// central-directory reader keep asserting exactly what they asserted before.
 fn read_all_sized(bytes: &[u8]) -> Result<Vec<(String, usize)>, SourceError> {
-    let mut source = ZipSource::new(Cursor::new(bytes), Naming::Stored)?;
+    let mut source = ZipSource::new(Cursor::new(bytes), &ReadOptions::default())?;
     let mut yielded = Vec::new();
     while let Some(entry) = source.next_entry() {
         let entry = entry?;
@@ -323,6 +323,12 @@ fn an_entry_that_inflates_past_the_limit_is_refused() {
 
 /// A malformed entry is named, which the sequential reader could not do: it met the damage
 /// before the name, where the entry table carries every name up front.
+///
+/// It is also the one entry whose name is *not* the decoded one, because a record pointing at
+/// no local header yields no stored name bytes either — so the refusal says which decode the
+/// name came from. In an archive read under a chosen encoding, every other entry is reported as
+/// the characters that encoding names, and an unremarked CP437 name among them would send the
+/// reader looking for a page that exists under no such name.
 #[test]
 fn an_entry_the_table_lists_but_cannot_locate_is_named() {
     let entries = [("page01.jpg", page(8, 8)), ("page02.jpg", page(8, 8))];
@@ -336,8 +342,13 @@ fn an_entry_the_table_lists_but_cannot_locate_is_named() {
 
     let error = read_all(&bytes).expect_err("the second entry cannot be located");
     assert!(
-        matches!(&error, SourceError::Entry { name, .. } if name == "page02.jpg"),
-        "expected an entry failure naming the entry, got {error}"
+        matches!(&error, SourceError::Unreachable { name, .. } if name == "page02.jpg"),
+        "expected an unreachable-entry failure naming the entry, got {error}"
+    );
+    let message = error.to_string();
+    assert!(
+        message.contains("container's own decoding"),
+        "the refusal must say the name is not the decoded one: {message}"
     );
 }
 
@@ -453,4 +464,100 @@ fn a_name_whose_component_normalises_to_a_parent_is_refused() {
             "{stored}: expected a traversal refusal, got {error}"
         );
     }
+}
+
+/// What one pass over a reader cost.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Cost {
+    bytes: u64,
+    seeks: u64,
+}
+
+/// A reader that counts what is drawn through it.
+struct Counting<R> {
+    inner: R,
+    cost: std::rc::Rc<std::cell::Cell<Cost>>,
+}
+
+impl<R: std::io::Read> std::io::Read for Counting<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        let mut cost = self.cost.get();
+        cost.bytes += read as u64;
+        self.cost.set(cost);
+        Ok(read)
+    }
+}
+
+impl<R: std::io::Seek> std::io::Seek for Counting<R> {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        let mut cost = self.cost.get();
+        cost.seeks += 1;
+        self.cost.set(cost);
+        self.inner.seek(to)
+    }
+}
+
+/// What `work` drew through a counting reader over `bytes`.
+fn counted(bytes: &[u8], work: impl FnOnce(Counting<Cursor<&[u8]>>)) -> Cost {
+    let cost = std::rc::Rc::new(std::cell::Cell::new(Cost::default()));
+    work(Counting {
+        inner: Cursor::new(bytes),
+        cost: std::rc::Rc::clone(&cost),
+    });
+    cost.get()
+}
+
+/// What locating an entry to read its stored name costs, measured rather than argued.
+///
+/// The reader needs every entry's name *bytes* before the first page, because the encoding a
+/// container declares nothing about is chosen for the whole container — and those bytes are
+/// reachable only from a located entry. So each entry is located once when the archive is
+/// opened, and the requirement is that locating reads no entry data and leaves the pipeline's
+/// bound alone.
+///
+/// Measured here as the difference between reading the entry table and reading it plus
+/// locating every entry, which isolates exactly the call the survey adds.
+#[test]
+fn locating_an_entry_to_read_its_name_reads_no_entry_data() {
+    // Non-pages, so the extension filter drops every one of them: whatever this reads, it is
+    // not a page being read on purpose. A quarter-megabyte each, so touching even one entry's
+    // data would be unmistakable against the bound below.
+    let payload = vec![b'x'; 256 * 1024];
+    let entries: Vec<(&str, Vec<u8>)> = ["a.xml", "b.xml", "c.xml", "d.xml", "e.xml", "f.xml"]
+        .into_iter()
+        .map(|name| (name, payload.clone()))
+        .collect();
+    let bytes = archive(&entries);
+    let count = entries.len() as u64;
+
+    let table_only = counted(&bytes, |reader| {
+        zip::ZipArchive::new(reader).expect("the entry table reads");
+    });
+    let table_and_locate = counted(&bytes, |reader| {
+        let mut archive = zip::ZipArchive::new(reader).expect("the entry table reads");
+        for position in 0..archive.len() {
+            archive.by_index_raw(position).expect("locates the entry");
+        }
+    });
+
+    // Thirty bytes: the local header's four-byte signature and its twenty-six-byte fixed
+    // block, from which the data offset is computed arithmetically rather than by scanning.
+    // Two seeks: one to the local header, one to the data it just located.
+    assert_eq!((table_and_locate.bytes - table_only.bytes) / count, 30);
+    assert_eq!((table_and_locate.seeks - table_only.seeks) / count, 2);
+
+    // And the reader as a whole reads no entry data for an entry it passes over. The fixed
+    // cost it is bounded against is the backwards search for the end-of-directory record,
+    // which is at most 65,577 bytes and predates this Change.
+    let source = counted(&bytes, |reader| {
+        let mut source = ZipSource::new(reader, &ReadOptions::default()).expect("opens");
+        assert!(source.next_entry().is_none(), "no entry is a page");
+    });
+    assert!(
+        source.bytes < 128 * 1024,
+        "the reader drew {} B over an archive of six {} B entries, so it read entry data",
+        source.bytes,
+        payload.len()
+    );
 }

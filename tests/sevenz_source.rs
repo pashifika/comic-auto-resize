@@ -14,10 +14,11 @@ use std::path::Path;
 
 use comic_auto_resize::pipeline::{self, RunError};
 use comic_auto_resize::source::{
-    Entries, Entry, MAX_DICTIONARY_BYTES, MAX_ENTRY_BYTES, Naming, Source, SourceError, ZipSource,
+    Entries, Entry, MAX_DICTIONARY_BYTES, MAX_ENTRY_BYTES, ReadOptions, Source, SourceError,
+    ZipSource,
 };
 
-use support::{TempDir, page_bytes, seven_zip, seven_zip_listing, write_seven_zip};
+use support::{TempDir, by_position, page_bytes, seven_zip, seven_zip_listing, write_seven_zip};
 
 /// A small page, distinguishable from its neighbours by size.
 fn page(width: u32) -> Vec<u8> {
@@ -37,7 +38,7 @@ fn with_archive(label: &str, files: &[(&str, Vec<u8>)], flags: &[&str], body: im
 
 /// Every page the source yields, in order.
 fn read_all(path: &Path) -> Result<Vec<Entry>, SourceError> {
-    let mut source = Source::open(path, Naming::Stored)?;
+    let mut source = Source::open(path, &ReadOptions::default())?;
     let mut entries = Vec::new();
     while let Some(entry) = source.next_entry() {
         entries.push(entry?);
@@ -258,7 +259,7 @@ fn renumbering_takes_its_width_from_the_7z_entry_table() {
             "the fixture must hold ten entries for the width to be observable"
         );
 
-        let mut source = Source::open(archive, Naming::ByPosition).expect("opens");
+        let mut source = Source::open(archive, &by_position()).expect("opens");
         let mut names = Vec::new();
         while let Some(entry) = source.next_entry() {
             names.push(entry.expect("reads").name);
@@ -318,7 +319,7 @@ fn an_archive_declaring_more_working_memory_than_the_limit_is_refused() {
     assert!(status.success());
     std::fs::remove_file(staging.join("page1.jpg")).expect("removes the staging file");
 
-    let error = Source::open(&archive, Naming::Stored)
+    let error = Source::open(&archive, &ReadOptions::default())
         .expect_err("an over-large dictionary must be refused at open");
     let message = error.to_string();
     assert!(message.contains("decoder dictionary"), "{message}");
@@ -331,7 +332,7 @@ fn an_archive_declaring_more_working_memory_than_the_limit_is_refused() {
 /// Every item the source produces, errors included, so a reader that keeps going after it has
 /// failed is visible rather than hidden behind an early return.
 fn read_every(path: &Path) -> Vec<Result<Entry, SourceError>> {
-    let mut source = Source::open(path, Naming::Stored).expect("opens");
+    let mut source = Source::open(path, &ReadOptions::default()).expect("opens");
     let mut items = Vec::new();
     while let Some(item) = source.next_entry() {
         items.push(item);
@@ -464,19 +465,56 @@ fn a_skipped_entry_in_a_solid_block_does_not_corrupt_the_next() {
 
 // ---------------------------------------------------------------- refusals at open
 
-/// The headers are plain and the data is encrypted, and this build carries no AES: the
-/// `aes256` default feature is off, so the archive is refused by a named error rather than
-/// read as rubbish.
+/// The headers are plain and the data is encrypted, and the refusal names the form.
+///
+/// 7z has exactly one encryption method — AES-256-SHA256 — and this build carries no AES, so
+/// `--pwd` could not help whatever the user supplies. That is why the password is not threaded
+/// into this reader at all and the archive is refused by name at open instead: the alternative
+/// is `UnsupportedCompressionMethod("AES256_SHA256")` from the middle of a block decode, after
+/// the output file already exists.
 #[test]
-fn an_encrypted_archive_is_refused_by_a_named_error() {
+fn an_encrypted_archive_is_refused_by_form_and_names_the_blocks_entry() {
     let files = [("page1.jpg", page(30))];
     with_archive("sevenz-encrypted", &files, &["-pSecret1"], |archive| {
-        let message = error_text(archive);
-        assert!(
-            message.contains("cannot read the archive"),
-            "an encrypted archive must be refused, got: {message}"
-        );
+        for password in [None, Some("Secret1".to_owned())] {
+            let options = ReadOptions {
+                password,
+                ..Default::default()
+            };
+            match Source::open(archive, &options).expect_err("refused at open") {
+                SourceError::EncryptionUnsupported { name, form } => {
+                    assert_eq!(form, "AES-256");
+                    // The entry in the encrypted block, not `files[0]`: the two differ in the
+                    // ordinary case, because `7z a -p` on a directory stores the directory
+                    // entry first and a directory has no stream to encrypt.
+                    assert_eq!(name, "page1.jpg");
+                }
+                other => panic!("expected an AES refusal by form, got {other}"),
+            }
+        }
     });
+}
+
+/// An archive whose *headers* are encrypted gives the same answer, though it fails one layer
+/// earlier: `ArchiveReader::new` builds the header's own coder chain and reaches
+/// `UnsupportedCompressionMethod("AES256_SHA256")` before any block is seen. Re-raised, so both
+/// shapes of 7z encryption are one refusal rather than two vocabularies.
+#[test]
+fn a_header_encrypted_archive_is_refused_by_the_same_form() {
+    let files = [("page1.jpg", page(30))];
+    with_archive(
+        "sevenz-header-encrypted",
+        &files,
+        &["-pSecret1", "-mhe=on"],
+        |archive| match Source::open(archive, &ReadOptions::default()).expect_err("refused at open")
+        {
+            SourceError::EncryptionUnsupported { name, form } => {
+                assert_eq!(form, "AES-256");
+                assert!(name.contains("header"), "{name}");
+            }
+            other => panic!("expected an AES refusal by form, got {other}"),
+        },
+    );
 }
 
 // ---------------------------------------------------------------- the signature probe
@@ -490,7 +528,7 @@ fn a_7z_named_cbz_is_read_as_7z() {
         let disguised = archive.with_file_name("book.cbz");
         std::fs::rename(archive, &disguised).expect("renames");
         assert!(matches!(
-            Source::open(&disguised, Naming::Stored).expect("opens"),
+            Source::open(&disguised, &ReadOptions::default()).expect("opens"),
             Source::SevenZ(_)
         ));
         assert_eq!(read_all(&disguised).expect("reads").len(), 1);
@@ -510,7 +548,7 @@ fn a_7z_runs_end_to_end_and_the_output_keeps_the_order() {
     ];
     with_archive("sevenz-pipeline", &files, &[], |archive| {
         let output = archive.with_file_name("out.zip");
-        let source = Source::open(archive, Naming::Stored).expect("opens");
+        let source = Source::open(archive, &ReadOptions::default()).expect("opens");
         let report = pipeline::run(source, &output, &settings()).expect("runs");
         assert_eq!(report.pages, 3);
 
@@ -528,7 +566,7 @@ fn a_7z_with_no_page_reports_that_rather_than_writing_an_empty_archive() {
     let files = [("notes.xml", b"<ComicInfo/>".to_vec())];
     with_archive("sevenz-empty", &files, &[], |archive| {
         let output = archive.with_file_name("out.zip");
-        let source = Source::open(archive, Naming::Stored).expect("opens");
+        let source = Source::open(archive, &ReadOptions::default()).expect("opens");
         let error = pipeline::run(source, &output, &settings()).expect_err("no pages");
         assert!(matches!(error, RunError::Empty), "{error}");
         assert!(!output.exists());
@@ -552,11 +590,11 @@ fn the_output_is_read_back_by_the_zip_reader_not_by_the_7z_one() {
     let files = [("page1.jpg", page_bytes(400, 600))];
     with_archive("sevenz-output-kind", &files, &[], |archive| {
         let output = archive.with_file_name("out.zip");
-        let source = Source::open(archive, Naming::Stored).expect("opens");
+        let source = Source::open(archive, &ReadOptions::default()).expect("opens");
         pipeline::run(source, &output, &settings()).expect("runs");
 
         let file = std::fs::File::open(&output).expect("opens the output");
-        let mut zip = ZipSource::new(file, Naming::Stored).expect("the output is a zip");
+        let mut zip = ZipSource::new(file, &ReadOptions::default()).expect("the output is a zip");
         assert_eq!(
             zip.next_entry()
                 .expect("one page")

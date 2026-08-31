@@ -15,7 +15,7 @@ use std::process::Command;
 
 use comic_auto_resize::pipeline::{self, RunError, Settings};
 use comic_auto_resize::sink::{InputKind, default_output};
-use comic_auto_resize::source::{Entries, Entry, Naming, Source, SourceError};
+use comic_auto_resize::source::{Entries, Entry, ReadOptions, Source, SourceError};
 
 use support::{TempDir, page_bytes, read_archive, write_tree};
 
@@ -28,7 +28,7 @@ fn page(width: u32) -> Vec<u8> {
 
 /// Every page the source yields, in order.
 fn read_all(root: &Path) -> Result<Vec<Entry>, SourceError> {
-    let mut source = Source::open(root, Naming::Stored)?;
+    let mut source = Source::open(root, &ReadOptions::default())?;
     let mut entries = Vec::new();
     while let Some(entry) = source.next_entry() {
         entries.push(entry?);
@@ -314,7 +314,7 @@ fn something_that_is_not_a_regular_file_is_refused_before_it_is_opened() {
         .expect("runs mkfifo");
     assert!(status.success(), "the fixture needs a fifo");
 
-    let error = Source::open(&root, Naming::Stored)
+    let error = Source::open(&root, &ReadOptions::default())
         .expect_err("the listing must refuse it, before the output exists");
     let message = error.to_string();
     assert!(message.contains("page2.jpg"), "{message}");
@@ -367,7 +367,7 @@ fn a_page_swapped_for_a_link_after_listing_is_refused_rather_than_read() {
     write_tree(&root, &[("page1.jpg", page(30)), ("page2.jpg", page(31))]);
 
     // Listed as two regular files, then the second becomes a link before it is read.
-    let mut source = Source::open(&root, Naming::Stored).expect("opens");
+    let mut source = Source::open(&root, &ReadOptions::default()).expect("opens");
     let first = source.next_entry().expect("a page").expect("reads");
     assert_eq!(first.name, "page1.jpg");
 
@@ -397,7 +397,7 @@ fn the_output_is_named_after_the_directory_and_written_beside_it() {
         assert_eq!(output, scratch.join("vol1_resize.zip"));
         assert!(!output.starts_with(root), "the output is inside its input");
 
-        let source = Source::open(root, Naming::Stored).expect("opens");
+        let source = Source::open(root, &ReadOptions::default()).expect("opens");
         assert_eq!(
             pipeline::run(source, &output, &settings())
                 .expect("runs")
@@ -420,7 +420,8 @@ fn a_directory_holding_no_page_says_so_rather_than_naming_a_format() {
         &[("ComicInfo.xml", b"<ComicInfo/>".to_vec())],
         |scratch, root| {
             let output = scratch.join("out.zip");
-            let source = Source::open(root, Naming::Stored).expect("a directory always opens");
+            let source =
+                Source::open(root, &ReadOptions::default()).expect("a directory always opens");
             let error = pipeline::run(source, &output, &settings()).expect_err("no pages");
             assert!(matches!(error, RunError::Empty), "{error}");
 
@@ -440,7 +441,7 @@ fn a_directory_holding_no_page_says_so_rather_than_naming_a_format() {
 fn a_directory_is_accepted_without_being_probed() {
     with_tree("dir-kind", &[("page1.jpg", page(30))], |_scratch, root| {
         assert!(matches!(
-            Source::open(root, Naming::Stored).expect("opens"),
+            Source::open(root, &ReadOptions::default()).expect("opens"),
             Source::Directory(_)
         ));
     });

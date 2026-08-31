@@ -70,7 +70,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::probe::{self, Format, MAGIC_MAX, Names, Naming};
-use super::{Entry, HINT_CEILING, MAX_ENTRY_BYTES, SourceError, fill, unsafe_name};
+use super::{Entry, HINT_CEILING, MAX_ENTRY_BYTES, ReadOptions, SourceError, fill, unsafe_name};
 
 /// A directory listed once, then read in the order the listing chose.
 pub struct DirectorySource {
@@ -102,11 +102,14 @@ impl DirectorySource {
     /// regular file; and [`SourceError::UnsafeName`] for a name the walk built that cannot be
     /// carried into the output archive. All are established here, before the output file
     /// exists, because the listing happens before anything is read.
-    pub fn open(root: &Path, naming: Naming) -> Result<Self, SourceError> {
+    ///
+    /// Neither `options.charset` nor `options.password` applies: a filesystem hands back a
+    /// name already decoded, and a directory of pages has nothing to decrypt.
+    pub fn open(root: &Path, options: &ReadOptions) -> Result<Self, SourceError> {
         let mut pages = Vec::new();
         walk(root, "", &mut pages)?;
 
-        let names = match naming {
+        let names = match options.naming {
             Naming::Stored => Names::stored(),
             // The listing is made anyway, so the entry total is free. It counts the pages the
             // extension filter kept rather than every file, which is the one format where an
