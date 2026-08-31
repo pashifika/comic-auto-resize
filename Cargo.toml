@@ -66,10 +66,18 @@ mozjpeg-sys = { version = "=2.2.3", default-features = false }
 # licence reason rather than a size one, which is the difference `deny.toml` cares about:
 # `bzip2` reaches `libbz2-rs-sys` declaring `bzip2-1.0.6` and `ppmd` reaches `ppmd-rust`
 # declaring `CC0-1.0 OR MIT-0`, and neither `bzip2-1.0.6` nor `MIT-0` is in the allow-list, so
-# `cargo deny` refuses the build outright. `aes256` (encrypted archives this build does not
-# read), `compress` (writing, and the output is zip) and `util` (whole-archive extraction to
-# disk, which this pipeline never does) are off because they are capability the binary cannot
-# use. What remains covers Copy, LZMA, LZMA2, BCJ, BCJ2 and Delta — 7-Zip writes LZMA2 by
+# `cargo deny` refuses the build outright. `compress` (writing, and the output is zip) and
+# `util` (whole-archive extraction to disk, which this pipeline never does) are off because
+# they are capability the binary cannot use.
+#
+# `aes256` is off for a third reason, and it is neither of those two: **supply-chain surface**.
+# It is a real capability, `cargo deny` passes on it clean, and it is declined anyway — 15
+# crates for reading an archive no sample in `samples/` is, and 7z's only encryption method is
+# AES-256, so an encrypted 7z is refused by name at open instead. Measured, so a later Change
+# can reverse this without a new survey: +15 crates, +16,672 B, and 12 of those crates shared
+# with `zip`'s `aes-crypto`. See `rasen/changes/entry-name-charset/evidence/dependency.md`.
+#
+# What remains covers Copy, LZMA, LZMA2, BCJ, BCJ2 and Delta — 7-Zip writes LZMA2 by
 # default and Copy for "store", so an ordinary comic archive is read.
 #
 # No `[patch.crates-io]` entry: the entry reader is handed `&mut dyn Read`, so
@@ -89,9 +97,16 @@ thiserror = "=2.0.20"
 # "forbid"` means this crate could not call the FFI even if it wanted to.
 unrar-ng = { version = "=0.7.7", default-features = false }
 # Reading needs Deflate; writing uses Stored, because JPEG data does not compress. So one
-# backend, and defaults off to keep `aes-crypto`, `bzip2`, `deflate64`, `lzma`, `ppmd`,
-# `time`, `zstd`, and `xz` out of a binary that cannot invoke them. An entry in one of
+# backend, and defaults off to keep `bzip2`, `deflate64`, `lzma`, `ppmd`, `time`, `zstd`, and
+# `xz` out of a binary that cannot invoke them. An entry in one of
 # those codings is reported as unsupported rather than skipped.
+#
+# `aes-crypto` is off for a different reason from those, and the manifest has to say which:
+# **supply-chain surface**. AES is a real capability whose licence check passes clean, and it
+# is declined for 19 crates in service of reading an archive no sample in `samples/` is. An
+# AES-encrypted entry is refused by form rather than mis-read. Measured: +19 crates, +34,352 B,
+# 12 shared with `sevenz-rust2`'s `aes256`. ZipCrypto needs no feature at all — `mod zipcrypto`
+# is unconditional — so `--pwd` reads a classic-encrypted zip in this build.
 zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
 
 # Temporary, for two things the released crate cannot do. `--dct` cannot reach the

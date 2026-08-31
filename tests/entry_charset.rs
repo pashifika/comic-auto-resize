@@ -265,6 +265,47 @@ fn a_utf8_flag_over_bytes_that_are_not_utf8_is_not_believed() {
     );
 }
 
+/// Both declarations at once, which is what the precedence order between them is *for*: the
+/// flag says UTF-8 and the stated name says something else. The stated name wins, because the
+/// dependency applies the extra field after the flag decision and overwrites the raw bytes with
+/// its content.
+#[test]
+fn a_stated_name_wins_over_a_flag_that_declares_a_different_encoding() {
+    let archive = encoded_archive(&[Encoded::new(SJIS_COVER, page())
+        .utf8()
+        .unicode_path("表紙絵.jpg")]);
+
+    assert_eq!(
+        names(&archive, &options("ja,zh")).expect("reads"),
+        ["表紙絵.jpg"]
+    );
+}
+
+/// An entry that cannot be *read* is still named by the name the output would have used.
+///
+/// Two ways to fail, one assertion each, and both with a legacy name so the decoded form is
+/// distinguishable from the container's guess. This is the property the design originally gave
+/// up on: it held that no name was reachable on these paths, and `by_index_raw` is why that was
+/// wrong.
+#[test]
+fn an_entry_that_cannot_be_read_is_named_by_its_decoded_name() {
+    // A codec this build does not carry. `zip`'s defaults are off, so LZMA (14) is refused when
+    // the entry is located rather than when the archive is opened.
+    let unsupported = encoded_archive(&[Encoded::new(SJIS_COVER, page()).compressed_as(14)]);
+    match names(&unsupported, &options("ja")).expect_err("refused") {
+        SourceError::Entry { name, .. } => assert_eq!(name, "表紙.jpg"),
+        other => panic!("expected a named entry failure, got {other}"),
+    }
+
+    // And an encrypted entry with no password.
+    let encrypted =
+        encoded_archive(&[Encoded::new(SJIS_COVER, page()).encrypted(Encryption::ZipCrypto)]);
+    match names(&encrypted, &options("ja")).expect_err("refused") {
+        SourceError::Encrypted { name } => assert_eq!(name, "表紙.jpg"),
+        other => panic!("expected a named encryption refusal, got {other}"),
+    }
+}
+
 /// A declared name and an undeclared one in one archive: the declared one is believed and does
 /// not constrain the choice, and the undeclared one is decoded.
 #[test]
@@ -612,4 +653,34 @@ fn the_password_flag_requires_a_value_and_its_help_names_the_forms() {
         charset.contains("whole input"),
         "--charset's help must say one encoding is chosen for the whole input: {charset}"
     );
+}
+
+/// `--pwd` changes the output, which is the `command-line` requirement every accepted flag has
+/// to satisfy — and for this flag the difference is the whole output: without it there is none.
+#[test]
+fn the_password_flag_changes_the_output() {
+    let scratch = TempDir::new("charset-pwd-effect");
+    let input = scratch.join("in.zip");
+    support::write_encrypted_archive(&input, &[("page01.jpg", page_bytes(320, 440))], "hunter2");
+    let output = default_output(&input, InputKind::File).expect("names an output");
+
+    let refused = Command::new(BINARY)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(!refused.status.success(), "an encrypted archive was read");
+    assert!(!output.exists(), "a refused run left an archive behind");
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(message.contains("--pwd"), "{message}");
+
+    let status = Command::new(BINARY)
+        .args(["--pwd", "hunter2"])
+        .arg(&input)
+        .status()
+        .expect("runs the binary");
+    assert!(
+        status.success(),
+        "the right password did not read the archive"
+    );
+    assert_eq!(read_archive(&output).len(), 1);
 }
