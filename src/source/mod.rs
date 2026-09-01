@@ -63,6 +63,39 @@ use crate::page::Format;
 /// Chosen, not measured. A 1280-wide JPEG page is tens of kilobytes and a 600dpi scan a few
 /// megabytes, so 64 MiB is orders of magnitude of headroom while still refusing an archive
 /// that claims a gigabyte in one entry.
+///
+/// # It binds before the page budget for a deep uncompressed format, and it is not raised
+///
+/// For a format whose entries carry raw pixels at 24 bits or more this is reached long before
+/// the page budget's pixel ceiling. Measured, a 24-bit bmp entry reaches this limit at
+/// **22,369,603 pixels** — 4096x5461 occupies 67,104,822 B and is accepted, 4096x5462 occupies
+/// 67,117,110 B and is refused by name — so a 24-bit bmp's reachable page size is 22% of the
+/// 100 Mpx the page budget states.
+///
+/// **That ordering is per stored form.** `image` accepts 1-, 2-, 4-, 8-, 16-, 24- and 32-bit
+/// bmp along with RLE4 and RLE8, and expands every palettised form to `Rgb8`, so the entry
+/// ceiling is 16.8 Mpx at 32 bits, 22,369,603 px at 24, 33.6 Mpx at 16 and 67.1 Mpx at 8 — and
+/// at 4 bits and below it is 134 Mpx or more, past the point where the page budget's
+/// **decoded-byte** limit binds first at 89,478,485 px. Measured with a 1-bit fixture:
+/// 10000x10000 clears this limit at 12,520,062 B and is then refused with `decoded bytes is
+/// 300000000`, and 10000x10001 is refused with `source pixels is 100010000`. So a bmp can be
+/// refused by the page budget after all; what is out of reach is the pixel ceiling for an
+/// uncompressed page at 24 bits or deeper.
+///
+/// **RLE4 and RLE8 sit outside that ordering**, because their entry size follows the run
+/// structure rather than the sample depth. A run is a count byte and a palette index
+/// (`image-0.25.10/src/codecs/bmp/decoder.rs:1197-1200`) and a count of one is legal, so a page
+/// stored as one-pixel runs spends two entry bytes a pixel and meets this limit at about
+/// 33.5 Mpx — half the ceiling of the uncompressed 8-bit form RLE8 compresses — while the same
+/// page stored as long runs meets the page budget's decoded-byte limit instead. Either can bind
+/// and the encoder decides which.
+///
+/// **Raising this to let a 24-bit bmp reach that ceiling is refused twice over.** It would need
+/// 300 MB — 286.1 MiB — which times the pipeline's `2 x jobs` credit window is 5.4 GB of entry
+/// buffers before a single pixel is decoded; and it would raise the ceiling for every format in
+/// order to serve the one whose pages are least likely to be large. A 22.4 Mpx bmp is a
+/// 6000x3728 page. The refusal is correct and stays; what was missing was anyone saying which
+/// limit fired.
 pub const MAX_ENTRY_BYTES: u64 = 64 << 20;
 
 /// One page read out of an archive.

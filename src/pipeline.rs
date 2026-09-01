@@ -49,6 +49,144 @@
 //! the extra entry: in a push shape every source reads before it offers, so all four would
 //! pay it instead of one.
 //!
+//! # What the run's peak actually is, with every factor named
+//!
+//! The argument above is about the *count* of pages in flight, and it is right about it:
+//! measured on 100 pages against 1000 of the same 1520x2150 page, the peak grows by 1.039 for
+//! jpg, 1.073 for png, 1.060 for bmp and 1.055 for webp on the build this documents — every one
+//! inside the 1.5 the claim allows, and the window needs no change. The same four ratios on the
+//! baseline this branched from were 1.043, 1.052, 1.047 and 1.066, so charging the decoder's
+//! scratch left the count argument exactly where it was. What that argument did not say is what
+//! *one* page in flight costs, and that is decided by which decoder read the archive rather
+//! than by the archive.
+//!
+//! ```text
+//! peak ≈ J × worker + W × MAX_ENTRY_BYTES + base
+//!
+//!   worker   = retained + max(decode, page + destination)
+//!   retained = 2 × max over the pages the worker has resized of
+//!                  src_width × dst_height × channels
+//!   decode   = declared × scratch_factor(format, colour) + page   (page: only where both live)
+//! ```
+//!
+//! `J` is the worker count and `W` the credit window, both in [`Capacities`]. `declared` is
+//! `ImageDecoder::total_bytes()`, `scratch_factor` is stated per arm in `page::decode`'s raster
+//! module, `page` is the decoded page and `destination` the resampler's output buffer, and
+//! `MAX_ENTRY_BYTES` bounds the entry each credit holds.
+//!
+//! `retained` sits under both stages rather than on one side of the maximum, and that is what
+//! this shape corrects. The buffer is `fast_image_resize`'s two-pass scratch
+//! (`resizer.rs:418-422`), and it lives in the per-worker `Resizer` rather than in the call, so
+//! it survives the page that grew it: a worker holds the previous page's scratch while it
+//! decodes the next one. The two stages a worker runs are disjoint in time and this buffer is in
+//! neither of them, so it is resident whichever stage the peak falls in, and a maximum that puts
+//! it on the resize side loses it whenever the decode side wins. The `2 ×` is the growth bound
+//! and not a safety margin: the buffer is grown with `Vec::resize`, whose amortized rule takes
+//! `max(2 × old_capacity, required)`, so two pages differing by a single row leave the worker
+//! holding twice the larger temporary rather than the temporary itself, and by induction that
+//! holds over any number of growths rather than only the first. The allocation is the
+//! dependency's and predates this bound; what changed is that the bound now covers it, in the
+//! term that is always resident.
+//!
+//! ## The shape against a run
+//!
+//! Every earlier statement of this bound was derived and left there. This one was checked: nine
+//! pages of 4608x7281 — 33,550,848 pixels, the accepted side of the webp `Rgb8` ceiling, one row
+//! under the refusal — through nine workers at the default 1280 target. That makes `dst_height`
+//! 2023, so `retained` is `2 × 4608 × 2023 × 3` = 55.93 MB, the page is 100.65 MB and the
+//! destination 7.77 MB. The decode side below is the arm's *measured* bytes a source pixel and
+//! not its charge, because a charge that deliberately sits above its arm predicts nothing about a
+//! run: 7.00 for this webp arm and 3.00 for png, both from `page::decode`'s raster module.
+//!
+//! | arm | predicted worker | × 9 | measured peak |
+//! |---|---|---|---|
+//! | webp `Rgb8` | 55.93 + max(234.86, 108.42) = 290.79 MB | 2.62 GB | 2,590,294,016 B |
+//! | png `Rgb8` | 55.93 + max(100.65, 108.42) = 164.35 MB | 1.48 GB | 1,387,397,120 B |
+//! | jpg, progressive | not predicted | — | 1,265,893,376 B |
+//!
+//! The entries were 11,670 B, 444,778 B and 627,015 B, so the window term at its bound —
+//! `W × MAX_ENTRY_BYTES`, 1.21 GB — is nowhere near what these archives reach: `W` times the
+//! entry each actually holds is 210 KB for the webp row and 8.0 and 11.3 MB for the other two,
+//! against peaks in the gigabytes. The per-worker product is nearly the whole of it. Both
+//! predictions sit above their run — by 1% for webp and 6.6% for png — which is the direction a
+//! bound has to miss in. The webp row is the first time this bound has been checked against a
+//! run rather than asserted. jpg is not predicted because its largest term is the one this
+//! formula does not charge — the progressive coefficient arrays named below.
+//!
+//! Neither side of the maximum is always the larger — the two predicted rows above land on one
+//! each — so it is load-bearing rather than decorative. The resize side wins for the three arms
+//! whose decoded buffer is *moved* into the page and whose scratch factor is one: png `L8`, png
+//! `Rgb8` and bmp `Rgb8`, whose decode is the page and nothing else, against a resize holding the
+//! page and the destination at once. The decode side wins for the rest, by a margin no downscale
+//! closes: an arm that copies holds its declared buffer on top of the page — at least four bytes
+//! a source pixel where the page is three, at least two where the page is one — and the
+//! destination is smaller than the page, because [`plan`](crate::policy::plan) passes a page
+//! through rather than enlarging it; and webp `Rgb8`, which is moved but allocates around its
+//! buffer, holds eight bytes a source pixel against at most six.
+//!
+//! Which of the two *stages* is dearer, counting the resize temporary against the resize that
+//! grows it rather than against the retained term, is a different question — and it is the one
+//! three revisions of this paragraph answered wrongly, so the derivation is shown rather than
+//! its conclusion. Counted that way the comparison is
+//!
+//! ```text
+//! declared × factor + page   >   page + 2 × temp + destination
+//! ```
+//!
+//! and cancelling `page` is only legal where the decode really holds the declared buffer *and*
+//! the page at once — the arms that copy. **For the three factor-one arms whose buffer is moved
+//! the decode is the page alone**, so nothing cancels, the right side is larger by
+//! `2 × temp + destination` and the resize is the dearer stage at every ratio; the condition
+//! below does not apply to them and would get them backwards. webp `Rgb8` is moved too but its
+//! factor is not one, so its decode is `8/3` of the page against `page + 2 × temp + destination`
+//! and it crosses like a copying arm, below `r ≈ 0.633`. For a copying arm the comparison
+//! reduces to
+//! `declared > 2 × temp + destination`, which at a fixed target width is a threshold on the
+//! downscale ratio `r` rather than a fixed answer: with `d` the declared bytes a *source pixel*
+//! — `declared` itself is `total_bytes()`, so this is `d = declared / (width × height)` — and
+//! `c` the page's channels, it is `d / c > 2r + r²`, roughly `r < 0.53` for the four-byte
+//! three-channel arms and `r < 0.73` for the two-byte grey ones. On the 1520x2150 page the
+//! growth ratios above were measured on, `r` is 0.842 and png `Rgba8` decodes seven bytes a
+//! source pixel — four declared, three composited — against `3 + 2 × 2.527 + 2.128` = 10.2 to
+//! resize, so the resize is the dearer stage there, and on a source wide enough to put `r` under
+//! 0.53 it is not. Each count this paragraph used to carry was taken at one geometry and written
+//! as though it held at every one, and the scope above is written as part of the algebra so the
+//! next reader cannot detach it again. The bound does not rest on any of this: the temporary
+//! belongs to both stages, so it is charged once, outside the maximum.
+//!
+//! There is a fourth term this does not charge and it is libjpeg's: a **progressive** source
+//! holds coefficient arrays following the source geometry whatever `scale_denom` asks for, and
+//! this crate's encoder writes progressive, so the tool's own output fed back in is the
+//! expensive JPEG case. Measured on one 6000x8000 page, the same picture costs 43.7 MB as a
+//! baseline JPEG and 186.4 MB as a progressive one — 2.97 bytes a pixel of coefficient arrays,
+//! which is 4:2:0's 1.5 samples at two bytes a coefficient. `page::budget` records it as
+//! uncharged; charging it needs a progressive flag the dependency does not expose.
+//!
+//! What the whole thing costs on real numbers, nine workers, one archive of nine pages:
+//!
+//! | page | jpg | png | webp |
+//! |---|---|---|---|
+//! | 4800x7989, 38.3 Mpx | 1.43 GB | 1.55 GB | 2.93 GB, now refused: 306.8 MB a page |
+//! | 6000x8000, 48.0 Mpx | 1.64 GB | — | refused: 384 MB a page |
+//!
+//! The jpg and png figures are what the machine paid with every page inside every stated
+//! limit. Both webp cells are refusals: the `Rgb8` charge of eight bytes a pixel admits
+//! `268,435,456 / 8` = **33,554,432 pixels**, and the `Rgba8` charge — nine bytes a pixel plus
+//! the three the composite costs — admits **22,369,621**, so the first row's 38.3 Mpx no longer
+//! gets in. Its 2.93 GB is what nine of those pages really did cost under the `7/3` this
+//! replaced, and is the reason the two webp factors were re-derived from `image-webp`'s source
+//! rather than left at the slope a ladder of `cwebp` output measured. The webp entries are
+//! 13 KB each, so the second row is 118 KB of input that would have put 3.49 GB resident before
+//! any of this was charged. A caller who knows the page count and the worker count still cannot
+//! predict the peak; the deciding term is which decoder read the archive, and for one format it
+//! is now bounded rather than merely large.
+//!
+//! **`J` is deliberately not bounded here.** It is the largest single factor, it is
+//! `worker_count()`'s to pick, and choosing it belongs to whoever owns the command-line surface
+//! — there is no `--jobs` yet, and adding one is where a default gets argued. What this module
+//! owes that decision is the per-worker term above, which is why it is stated as a product
+//! rather than as a number.
+//!
 //! # Working memory a decoder sizes from the input
 //!
 //! Peak memory is independent of page count, and that is what this section's claim is. It is
