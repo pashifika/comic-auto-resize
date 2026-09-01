@@ -9,21 +9,51 @@
 //! The limits are internal constants rather than options, for the reason `MIN_EDGE` is: a
 //! limit a user can raise is a limit that will be raised to force a bad page through.
 //!
-//! # Two limits bound one page, and for one format the other binds first
+//! # Two limits bound one page, and which binds first depends on the stored form
 //!
 //! These are not the only limit a page meets. [`MAX_ENTRY_BYTES`] bounds the *entry* a page
-//! arrives in, and it is reached at a far smaller pixel count than the limits here state for a
-//! format whose entries are uncompressed. Measured, a 24-bit bmp entry reaches 64 MiB at
+//! arrives in, and for a format whose entries carry raw pixels it is reached at a far smaller
+//! pixel count than the limits here state. Measured, a 24-bit bmp entry reaches 64 MiB at
 //! **22,369,603 pixels** — 4096x5461 fits at 67,104,822 B and 4096x5462 does not at
-//! 67,117,110 B, refused by name — so bmp's reachable ceiling is 22% of the 100 Mpx
-//! `MAX_SOURCE_PIXELS` advertises, and a bmp can never be refused by the pixel limit through
-//! any source this build has. png, webp and JPEG carry the same page in kilobytes and reach
-//! their own ceiling first.
+//! 67,117,110 B, refused by name — so a 24-bit bmp's reachable ceiling is 22% of the 100 Mpx
+//! `MAX_SOURCE_PIXELS` advertises. png, webp and JPEG carry the same page in kilobytes and
+//! reach their own ceiling first.
 //!
-//! Both refusals are correct and both stay. Stated here because a limit whose effective value
-//! depends on the format is a limit a reader will otherwise get wrong, and because the two
-//! refusals name different things: the entry limit names the entry and its own byte limit, and
-//! these name the quantity, the value and the limit.
+//! **That ordering is per stored form and not per format.** `image` accepts 1-, 2-, 4-, 8-,
+//! 16-, 24- and 32-bit bmp along with RLE4 and RLE8, and expands every palettised form to
+//! `Rgb8`, so a shallower page carries far more pixels in the same entry:
+//!
+//! | stored form | entry ceiling at 64 MiB | what actually binds first |
+//! |---|---|---|
+//! | 32-bit | 16.8 Mpx | the entry limit |
+//! | 24-bit | 22,369,603 px | the entry limit |
+//! | 16-bit | 33.6 Mpx | the entry limit |
+//! | 8-bit palettised | 67.1 Mpx | the entry limit |
+//! | 4-bit, 2-bit, 1-bit | 134 Mpx and up | the **decoded-byte** limit, at 89,478,485 px |
+//! | RLE4, RLE8 | content-dependent | either one, decided by the run structure |
+//!
+//! **The RLE row is content-dependent in both directions, which is why it names both limits.**
+//! A run is a count byte and a palette index (`image-0.25.10/src/codecs/bmp/decoder.rs:1197-1200`)
+//! and a count of one is legal, so a page stored entirely as one-pixel runs spends two entry
+//! bytes a pixel and meets the entry limit at about 33.5 Mpx — half the ceiling of the
+//! uncompressed 8-bit form RLE8 compresses. The same page stored as long runs spends two bytes
+//! for as many as 255 pixels and meets the decoded-byte limit at 89,478,485 px, like the row
+//! above it. The two swap at an average run of about three pixels, where `2/L` entry bytes a
+//! pixel for a run length `L` crosses `67,108,864 / 89,478,485`; which side a page lands on is
+//! the encoder's choice, so neither limit can be named as the one that binds.
+//!
+//! Measured on the release binary with a 1-bit palettised fixture: 10000x10001 is refused with
+//! `source pixels is 100010000, over the limit of 100000000`, 10000x10000 is refused with
+//! `decoded bytes is 300000000, over the limit of 268435456`, and 9000x9000 — whose entry is
+//! 10,152,062 B — is accepted and decodes to 243 MB. So a bmp *can* be refused by the pixel
+//! limit. What holds unqualified is only that an **uncompressed** page at 24 bits or deeper
+//! meets the entry limit first, which is the qualification `MAX_SOURCE_PIXELS` twenty lines
+//! below already carries.
+//!
+//! Every one of those refusals is correct and every one stays. Stated here because a limit
+//! whose effective value depends on the stored form is a limit a reader will otherwise get
+//! wrong, and because the refusals name different things: the entry limit names the entry and
+//! its own byte limit, and these name the quantity, the value and the limit.
 //!
 //! [`MAX_ENTRY_BYTES`]: crate::source::MAX_ENTRY_BYTES
 
@@ -196,6 +226,15 @@ mod tests {
         54 + height * ((width * 3 + 3) & !3)
     }
 
+    /// What a 1-bit palettised bmp entry of `width` x `height` occupies: the same headers, a
+    /// two-entry palette, and rows of packed bits padded to four bytes.
+    ///
+    /// The shallow end of the range `image` accepts, and the reason the ordering in the module
+    /// documentation is stated per stored form rather than per format.
+    fn bmp_1bit_entry_bytes(width: u64, height: u64) -> u64 {
+        62 + height * (4 * width.div_ceil(32))
+    }
+
     #[test]
     fn the_defaults_refuse_the_jpeg_maximum_and_allow_a_600dpi_spread() {
         let budget = Budget::default();
@@ -242,18 +281,24 @@ mod tests {
         assert!(message.contains("limit of 10"), "{message}");
     }
 
-    /// For an uncompressed format the *entry* limit is reached first, and by a wide margin.
+    /// For a 24-bit uncompressed page the *entry* limit is reached first, and by a wide margin
+    /// — and for a shallower one it is not reached at all.
     ///
     /// The two limits are independent — one bounds the bytes an entry occupies, the other the
     /// pixels a page may declare — and nothing makes them agree. Measured on the release binary
     /// at the boundary row: 4096x5461 is accepted and 4096x5462 is refused with `entry is
-    /// larger than the limit of 67108864 bytes`, both far inside every pixel limit here. So
-    /// bmp's reachable ceiling is what this asserts, not the one the pixel limit states.
+    /// larger than the limit of 67108864 bytes`, both far inside every pixel limit here.
+    ///
+    /// The second half is the assertion whose absence let a false absolute ship. `image`
+    /// expands a palettised bmp to `Rgb8`, so at one bit a stored pixel the entry limit stops
+    /// binding and the byte limit takes over. This pins a page the 24-bit form could never have
+    /// carried as inside the entry limit and outside the byte limit, which is precisely the
+    /// case the words "a bmp can never be refused by the pixel limit" denied.
     ///
     /// Asserted as arithmetic rather than through a 64 MiB fixture: the boundary needs an entry
     /// at the limit, which is two orders of magnitude past every other fixture in this suite
-    /// and does not belong in a suite CI runs on three hosts. The end-to-end runs at both rows
-    /// are recorded with the Change's measurements.
+    /// and does not belong in a suite CI runs on three hosts. The end-to-end runs at every row
+    /// named here are recorded with the Change's measurements.
     #[test]
     fn the_entry_limit_binds_before_the_pixel_limit_for_an_uncompressed_page() {
         // The last row that fits, and the first that does not.
@@ -268,18 +313,42 @@ mod tests {
         assert!(budget.allow_source(4096, 5462).is_ok());
         assert!(budget.allow_image(4096, 5462, Channels::Rgb).is_ok());
 
-        // Which makes the pixel ceiling unreachable for this format, not merely lower: an entry
-        // holding 100 Mpx of uncompressed BGR is fifteen times the entry limit.
+        // Which makes the pixel ceiling unreachable at this depth, not merely lower: an entry
+        // holding 100 Mpx of uncompressed 24-bit BGR is four and a half times the entry limit.
         assert!(
             bmp_entry_bytes(10_000, 10_000) > MAX_ENTRY_BYTES * 4,
-            "a 100 Mpx bmp entry must be far past the entry limit for the claim to hold"
+            "a 100 Mpx 24-bit bmp entry must be far past the entry limit for the claim to hold"
         );
         const {
             assert!(
                 (MAX_ENTRY_BYTES - 54) / 3 < MAX_SOURCE_PIXELS / 4,
-                "bmp's effective ceiling must be a small fraction of the stated one"
+                "a 24-bit bmp's effective ceiling must be a small fraction of the stated one"
             );
         }
+
+        // At one bit a stored pixel the same 100 Mpx page occupies 12.5 MB, so it clears the
+        // entry limit and the pixel limit and is refused by what its expansion to `Rgb8` costs.
+        // Measured on the release binary with a 1-bit fixture: `decoded bytes is 300000000,
+        // over the limit of 268435456` here, and `source pixels is 100010000` one row taller.
+        assert_eq!(bmp_1bit_entry_bytes(10_000, 10_000), 12_520_062);
+        assert!(bmp_1bit_entry_bytes(10_000, 10_000) < MAX_ENTRY_BYTES);
+        assert!(budget.allow_source(10_000, 10_000).is_ok());
+        assert!(
+            budget
+                .allow_decoded(u128::from(10_000u64 * 10_000 * 3))
+                .is_err(),
+            "a bmp does reach these limits; only a 24-bit one cannot"
+        );
+
+        // The accepted side of that boundary, so the refusal above is a boundary rather than a
+        // blanket: 9000x9000 is a 10,152,062 B entry that decodes to 243 MB and is allowed.
+        assert_eq!(bmp_1bit_entry_bytes(9_000, 9_000), 10_152_062);
+        assert!(budget.allow_source(9_000, 9_000).is_ok());
+        assert!(
+            budget
+                .allow_decoded(u128::from(9_000u64 * 9_000 * 3))
+                .is_ok()
+        );
     }
 
     /// Two limits, two refusals, and neither borrows the other's words.

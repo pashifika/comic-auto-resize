@@ -281,49 +281,112 @@ fn read<D: ImageDecoder>(
 ///
 /// `ImageDecoder::total_bytes()` is the buffer `image` allocates and hands to `read_image`
 /// (`image-0.25.10/src/io/free_functions.rs:305-319` allocates exactly one), and a concrete
-/// decoder may allocate more around it. That excess is sized by the input like everything
-/// else, so the budget charges it: `declared × numerator / denominator`.
+/// decoder may allocate more around it. The part of that excess that follows the page's
+/// **area** is what this factor charges: `declared × numerator / denominator`. The part that
+/// follows the *entry* instead is not charged, and cannot be by a factor of this shape — two
+/// such terms are named at the end of this comment.
 ///
-/// **The two webp arms are above one.** `image-webp`'s `read_image` allocates `w × h × 4` and
-/// copies down when the colour type is `Rgb8` (`image-webp-0.2.4/src/decoder.rs:687-691`), so
-/// three declared bytes a pixel cost seven — exactly `7/3`, held as a fraction rather than as a
-/// rounded 2.33 because the charge is an allocation bound. Every png and bmp arm writes into
-/// the buffer `image` gave it: png's `next_frame` fills it and byte-swaps in place, and bmp's
-/// `read_image_data` decodes into it a row at a time.
+/// **The two webp arms are above one.** Every png and bmp arm writes into the buffer `image`
+/// gave it — png's `next_frame` fills it and byte-swaps sixteen-bit samples in place, bmp's
+/// `read_image_data` decodes into it a row at a time — and `image-webp` allocates around it.
 ///
 /// The factor is per arm rather than global. A single worst-case factor would charge every png
 /// the price of webp's scratch and refuse pages that do not incur it — the excess is
 /// input-selected, so the charge has to be too.
 ///
+/// # The two webp factors are read off the decoder, and the measurement agrees with them
+///
+/// A measured slope is a fact about the streams that were measured. The ladder was written with
+/// `cwebp -lossless` at libwebp's default method, which picks a large transform block, so no
+/// stream on it carried a transform term big enough to see and the slope is not an upper bound
+/// over the streams `image-webp` accepts. Both figures below are worst cases over the
+/// allocations that follow the page's area, derived from the decoder's source; the measurement
+/// corroborates them rather than establishing them. Neither is a worst case over everything the
+/// decoder allocates, and the last section says what it leaves out.
+///
+/// `Rgb8`'s worst case is a VP8L stream, and the bytes a pixel it holds at once are 3 for the
+/// caller's buffer, 4 for the `w × h × 4` scratch `read_image` decodes into and copies down
+/// from (`image-webp-0.2.4/src/decoder.rs:687`), 0.25 for the predictor transform, 0.25 for the
+/// colour transform, and 0.375 for the meta-huffman entropy image and the `Vec<u16>` projected
+/// out of it: **7.875**, charged as `8/3`. Each transform *image* is
+/// `subsample_size(w, size_bits) × subsample_size(h, size_bits)` with
+/// `size_bits = read_bits(3) + 2` (`lossless.rs:216-222`, `:233-239`, `:309-325`), and
+/// `subsample_size(size, bits)` is `size` over `2^bits` rounded up (`:54-57`) — so a bitstream
+/// may choose 2, which makes one block cover sixteen pixels and the transform image a sixteenth
+/// of the page. The sub-streams carrying those transforms are read with `read_meta = false`, so
+/// none of them has an entropy image of its own and the term does not recurse.
+///
+/// `Rgba8`'s worst case is a lossy VP8 stream with an `ALPH` chunk: 4 for the caller's buffer,
+/// 1.5 for the YUV planes, 0.117 for the macroblock array, and 5.875 for `read_alpha_chunk`'s
+/// own lossless decode — 4 for its RGBA scratch, 1 for the green plane projected out of it
+/// (`extended.rs:306-312`), and 0.875 for that decode's own transforms: the itemised sum is
+/// **11.49**, charged as `9/4`. This arm copies, so [`Narrowing::peak`] adds the page's 3 on top
+/// and the page pays twelve bytes a pixel.
+///
+/// The macroblock term carries two notes, one each way, and the arm is recorded as bounded by
+/// **11.609** rather than by the 11.49 above because of the first. `macroblocks` is push-grown
+/// from `Vec::new()` with no `reserve` anywhere in the file (`vp8.rs:965`, `:1978`), so the same
+/// amortized rule that puts the `2 ×` on the resampler's retained buffer applies: capacity can
+/// settle at twice length, 0.234 rather than 0.117, and the sum with it is 11.609 — still inside
+/// the 12.00 charged. Cutting the other way, the array is not alive at the peak the other terms
+/// are taken at. `Vp8Decoder::decode_frame` builds the decoder, decodes, and returns the `Frame`
+/// by value (`vp8.rs:1945-1948`), so the decoder and its macroblocks are dropped before
+/// `read_alpha_chunk` allocates anything, and the simultaneous figure is 11.375. The term is
+/// kept in the sum anyway: a bound that drops a term on a simultaneity argument is a bound a
+/// refactor upstream can falsify without anyone noticing. Both notes are recorded so that a
+/// later tightening starts from the reasoning rather than from the number.
+///
 /// # One arm is as fine-grained as the decoder lets it be
 ///
 /// A webp is VP8 or VP8L and the two allocate differently, but `WebPDecoder` reports only a
 /// `ColorType`, so `(WebP, Rgb8)` covers both codings and `(WebP, Rgba8)` covers both again.
-/// Measured, bytes a pixel of total working set:
+/// Measured bytes a pixel of total working set, against what each row now charges:
 ///
 /// | arm | VP8L | VP8 | charged |
 /// |---|---|---|---|
-/// | `Rgb8` | 7.00 | 4.67 | `7/3` → 7.00 |
-/// | `Rgba8` | 7.00 | 10.74 | `2/1` → 11.00 |
+/// | `Rgb8` | 7.0001 | 4.6705 | `8/3` → 8.00 |
+/// | `Rgba8` | 6.9988 | 10.7372 | `9/4` → 9.00, and 12.00 with the page |
 ///
-/// Each row charges the **larger** of the two codings, because the code cannot see which one it
-/// has: a row charging the smaller would be a bound that does not hold. Reading the RIFF chunk's
-/// four-character code would separate them, and it is not worth it — the two regions it would
-/// recover are lossy `Rgb8` from 38.3 to 57.5 Mpx and lossless `Rgba8` from 24.4 to 38.3 Mpx,
-/// which are pages six thousand pixels on a side, and it would add a second opinion about which
-/// coding a buffer holds for `image-webp`'s to disagree with.
+/// Each row charges the coding it cannot rule out rather than the one in front of it, which is
+/// why `Rgb8` charges eight against a VP8 stream measuring 4.67. Reading the RIFF chunk's
+/// four-character code would separate the two codings, and it is not worth it: it would buy
+/// back the band between them at the price of a second opinion about which coding a buffer
+/// holds, for `image-webp`'s to disagree with.
 ///
-/// `Rgba8`'s `2/1` is the one factor that is not a ratio of two identified allocations: 1.9343
-/// measured, rounded up to the next simple fraction. VP8 with alpha holds the 4-byte output
-/// buffer, VP8's YUV planes at 1.5 B/px, and `read_alpha_chunk`'s own lossless decode at about
-/// 5 B/px, and then `narrow` composites the page's three beside it.
+/// # The allocations no factor models, because they follow the entry and not the page
+///
+/// Two of them, both in `image-webp`, and a per-pixel factor is the wrong shape for either.
+///
+/// `read_huffman_codes` builds one `HuffmanCodeGroup` per meta code the entropy image names
+/// (`lossless.rs:328-344`). The count is read from the entropy image's sixteen-bit meta codes
+/// (`:319-321`), so 65,536 groups are reachable however small the page is, and each group is
+/// five `HuffmanTree`s (`:47-49`) whose `Tree` variant carries a node vector and a table of up
+/// to `1 << MAX_TABLE_BITS` entries (`huffman.rs:11`, `:23-27`, `:74-77`). What an attacker
+/// spends to reach that count is entry bytes, so `MAX_ENTRY_BYTES` is the only thing that bounds
+/// it — and it bounds the declaration rather than the allocation the declaration causes.
+///
+/// `Vp8Decoder::init_partitions` is the second (`vp8.rs:1029-1055`). It reads the trailing
+/// partition to the end of the VP8 chunk into `buf` and then copies it into a fresh `chunks`,
+/// holding it **twice**, and allocates one buffer per earlier partition besides. Those are sized
+/// by the compressed bytes themselves, so that term is bounded by `MAX_ENTRY_BYTES` — and by
+/// rather more than twice it for the trailing partition, because `read_to_end` grows `buf`
+/// amortized, so its capacity and the copy together reach about three times the partition. A
+/// tiny lossy webp inside a large entry incurs it in full.
+///
+/// **Recorded and uncharged**, for the reason `page::budget` records libjpeg's coefficient
+/// arrays and `pipeline` records the LZMA2 dictionary: a factor on the declared buffer is the
+/// wrong shape for a term that does not follow the pixels. Unlike the dictionary — which the
+/// archive declares in a header, which is why `source::sevenz` can refuse an oversized one
+/// before a block is decoded — the group count is discovered inside the dependency part-way
+/// through a decode, so there is no seam here to put a ceiling on and a bound would have to be
+/// `image-webp`'s. That is the disposition rather than an argument for it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Scratch {
     format: Format,
     colour: ColorType,
     numerator: u64,
     denominator: u64,
-    /// The dependency versions the figure was measured against.
+    /// The dependency versions the figure was established against.
     ///
     /// A scratch factor is a property of the decoder, so a bump that moves one has to be a
     /// re-measurement rather than a mystery. Recorded here for the reason
@@ -331,45 +394,56 @@ struct Scratch {
     against: &'static str,
 }
 
-/// The versions the png and bmp arms were measured against; both decode through `image` itself.
-const PNG_BMP: &str = "image 0.25.10, png 0.18.1";
+/// The versions the png arms were measured against.
+const PNG: &str = "image 0.25.10, png 0.18.1";
 
-/// The versions the webp arms were measured against.
+/// The version the bmp arms were measured against.
+///
+/// `image`'s own decoder and not `png`'s: bmp does not decode through the `png` crate, so a
+/// `png` bump cannot move a bmp row and must not read as though it could.
+const BMP: &str = "image 0.25.10";
+
+/// The versions the webp arms were derived and measured against.
 const WEBP: &str = "image 0.25.10, image-webp 0.2.4";
 
-/// Every arm these three decoders produce, with its measured factor.
+/// Every arm these three decoders produce, with its factor.
 ///
 /// Complete by construction rather than by hope: `every_arm_the_decoders_produce_is_measured`
-/// walks the colour types [`Narrowing::of`] admits against the formats [`read`] is reached
-/// with, and fails naming any pair this table does not carry. An arm that is nonetheless
-/// absent is charged one and **says it is unmeasured** — see [`Narrowing::scratch`].
+/// walks the colour types [`Narrowing::of`] admits against the three formats [`read`] is
+/// reached with, and requires every one of those pairs to be in this table or in the explicit
+/// list of pairs no decoder in this build reports. A pair in neither fails the test rather
+/// than falling through to an unmeasured factor. An arm that is nonetheless absent is charged
+/// one and **says it is unmeasured** — see [`Narrowing::scratch`].
 ///
 /// Method, because a factor without one is not a measurement: `page::decode` alone on a
 /// five-point size ladder from 3.27 to 48 Mpx, peak resident set against page area, slope
 /// after subtracting the entry buffer. The decode is isolated from the resampler deliberately.
-/// A run's peak is the *maximum* over its stages, and for every arm at one the resampler's
-/// two-pass buffer is the larger of the two — so a factor taken from the whole pipeline
-/// attributes the resampler's buffer to the decoder. That is how an earlier survey read
-/// webp's `7/3` as 2.72. Every measured slope came out within 0.1% of an exact integer count
-/// of bytes a pixel.
+/// A run's peak is the *maximum* over its stages, and for the arms whose decoded buffer is
+/// moved rather than copied the resampler's two-pass buffer is the larger of the two — so a
+/// factor taken from the whole pipeline attributes the resampler's buffer to the decoder. That
+/// is how an earlier survey read webp's ratio as 2.72. Every measured slope came out within
+/// 0.1% of an exact integer count of bytes a pixel.
 ///
-/// Fourteen measurements behind twelve rows: the two webp rows each cover two codings, and each
-/// charges the worse of its pair.
+/// The ten rows at one are measurements. The two webp rows are worst cases over the allocations
+/// that follow the page's area, read off `image-webp`'s source, because the ladder's streams do
+/// not exercise everything that decoder accepts — see [`Scratch`], which also names the two
+/// allocations no row here can cover. Fourteen measurements stand behind twelve rows even so:
+/// the two webp rows each cover two codings.
 const SCRATCH: &[Scratch] = &[
-    Scratch::new(Format::Png, ColorType::L8, 1, 1, PNG_BMP),
-    Scratch::new(Format::Png, ColorType::La8, 1, 1, PNG_BMP),
-    Scratch::new(Format::Png, ColorType::L16, 1, 1, PNG_BMP),
-    Scratch::new(Format::Png, ColorType::La16, 1, 1, PNG_BMP),
-    Scratch::new(Format::Png, ColorType::Rgb8, 1, 1, PNG_BMP),
-    Scratch::new(Format::Png, ColorType::Rgba8, 1, 1, PNG_BMP),
-    Scratch::new(Format::Png, ColorType::Rgb16, 1, 1, PNG_BMP),
-    Scratch::new(Format::Png, ColorType::Rgba16, 1, 1, PNG_BMP),
-    Scratch::new(Format::Bmp, ColorType::Rgb8, 1, 1, PNG_BMP),
-    Scratch::new(Format::Bmp, ColorType::Rgba8, 1, 1, PNG_BMP),
-    // The two arms that allocate around the buffer they were given, each charging the worse of
-    // the two codings it cannot distinguish.
-    Scratch::new(Format::WebP, ColorType::Rgb8, 7, 3, WEBP),
-    Scratch::new(Format::WebP, ColorType::Rgba8, 2, 1, WEBP),
+    Scratch::new(Format::Png, ColorType::L8, 1, 1, PNG),
+    Scratch::new(Format::Png, ColorType::La8, 1, 1, PNG),
+    Scratch::new(Format::Png, ColorType::L16, 1, 1, PNG),
+    Scratch::new(Format::Png, ColorType::La16, 1, 1, PNG),
+    Scratch::new(Format::Png, ColorType::Rgb8, 1, 1, PNG),
+    Scratch::new(Format::Png, ColorType::Rgba8, 1, 1, PNG),
+    Scratch::new(Format::Png, ColorType::Rgb16, 1, 1, PNG),
+    Scratch::new(Format::Png, ColorType::Rgba16, 1, 1, PNG),
+    Scratch::new(Format::Bmp, ColorType::Rgb8, 1, 1, BMP),
+    Scratch::new(Format::Bmp, ColorType::Rgba8, 1, 1, BMP),
+    // The two arms that allocate around the buffer they were given, each charging what the
+    // decoder's source permits rather than what the ladder's streams happened to ask for.
+    Scratch::new(Format::WebP, ColorType::Rgb8, 8, 3, WEBP),
+    Scratch::new(Format::WebP, ColorType::Rgba8, 9, 4, WEBP),
 ];
 
 impl Scratch {
@@ -460,10 +534,10 @@ impl Narrowing {
     /// The most bytes alive at once for a `width` × `height` page whose decoder asks for
     /// `decoded`.
     ///
-    /// Three terms, and each is a measurement rather than a reading of the code. `decoded` is
-    /// the decoder's own figure — eight bytes a pixel for `Rgba16` against the page's three —
-    /// times the factor its own allocations add. The page's buffer is added only where the two
-    /// coexist.
+    /// Three terms. `decoded` is the decoder's own figure — eight bytes a pixel for `Rgba16`
+    /// against the page's three — times the factor its own allocations add, which is a
+    /// measurement for ten arms and a reading of `image-webp`'s source for two. The page's
+    /// buffer is added only where the two coexist.
     fn peak(&self, decoded: u64, width: u32, height: u32) -> u128 {
         let page = if self.copies {
             u128::from(width) * u128::from(height) * u128::from(self.channels.count())
@@ -714,44 +788,103 @@ mod tests {
         assert!(narrow(DynamicImage::new_rgba32f(width, height)).is_err());
     }
 
-    /// A factor table is the shape that invites a guess dressed as a bound, so the table has to
-    /// be complete and every row has to carry the version it was measured against.
+    /// The colour types [`Narrowing::of`] admits.
     ///
-    /// Walks the colour types [`Narrowing::of`] admits against the three formats [`read`] is
-    /// reached with, and requires a measurement for every pair a decoder can actually produce.
-    /// The pairs a decoder cannot produce are asserted the other way: absent from the table,
-    /// charged one, and *reported* absent rather than silently indistinguishable from a
-    /// measured one.
+    /// The list its `match` is written against, held separately so the grid below is a grid
+    /// rather than a restatement of [`SCRATCH`]'s own key set. A colour type dropped from that
+    /// `match` fails the first assertion, and one added to the `match` **and to this list** but
+    /// to neither [`SCRATCH`] nor [`NOT_PRODUCED`] fails the partition.
+    ///
+    /// What slips is the reverse. A colour type added to the `match` alone leaves the grid at
+    /// twenty-four pairs, the partition intact and the two lengths equal, so nothing fails and
+    /// the new arm is charged an unmeasured one. `the_two_narrowing_tables_agree` closes that
+    /// for `Rgb32F` and `Rgba32F` by name and for nothing else, and `image::ColorType` is
+    /// `#[non_exhaustive]` (`image-0.25.10/src/color.rs:13-14`), so the direction cannot be
+    /// closed by enumerating variants from outside `image`. Writing [`Narrowing::of`]'s `match`
+    /// over this list would close it, and that is a change to the code rather than to the test.
+    const NARROWED: &[ColorType] = &[
+        ColorType::L8,
+        ColorType::La8,
+        ColorType::L16,
+        ColorType::La16,
+        ColorType::Rgb8,
+        ColorType::Rgba8,
+        ColorType::Rgb16,
+        ColorType::Rgba16,
+    ];
+
+    /// Every admitted pair no decoder in this build reports, with the reason it does not.
+    ///
+    /// The complement of [`SCRATCH`] over [`NARROWED`] against the three formats, written down
+    /// rather than left implicit. What that buys is stated precisely, because the neighbouring
+    /// docstring had to be corrected for claiming more: this list makes the **grid** total, so a
+    /// colour type added to [`NARROWED`] and classified into neither list fails the partition
+    /// instead of falling through to an unmeasured factor. It does **not** catch a decoder that
+    /// starts reporting a pair already enumerated here — that pair passes the partition and the
+    /// length check and is charged an unmeasured `1/1`, and pre-classifying it is what makes the
+    /// drift silent. Closing that needs a measurement when the dependency moves, which is what
+    /// [`Scratch::against`] on the [`SCRATCH`] rows exists to prompt — the rows here carry a
+    /// reason and no version — not another assertion.
+    const NOT_PRODUCED: &[(Format, ColorType)] = &[
+        // `image`'s bmp decoder *can* report `L8`, but only after `set_indexed_color`, and
+        // `read` builds the decoder without ever calling it — so this arm is out of reach
+        // through this crate's usage rather than through the decoder's nature
+        // (`image-0.25.10/src/codecs/bmp/decoder.rs:1352-1359`).
+        (Format::Bmp, ColorType::L8),
+        // No bmp form pairs greyscale with alpha: a palette expands to `Rgb8`, and the alpha
+        // channel of a 32-bit or bitfield source makes the whole page `Rgba8`.
+        (Format::Bmp, ColorType::La8),
+        // A bmp sample is at most eight bits wide — a 16-bit bmp is 5-5-5 or 5-6-5 packed and
+        // is expanded, not widened — so no sixteen-bit arm exists to report.
+        (Format::Bmp, ColorType::L16),
+        (Format::Bmp, ColorType::La16),
+        (Format::Bmp, ColorType::Rgb16),
+        (Format::Bmp, ColorType::Rgba16),
+        // `WebPDecoder::color_type` is `has_alpha()` and nothing else
+        // (`image-0.25.10/src/codecs/webp/decoder.rs:48-54`), so a webp is `Rgba8` or `Rgb8`
+        // however its samples were coded and the greyscale arms are unreachable.
+        (Format::WebP, ColorType::L8),
+        (Format::WebP, ColorType::La8),
+        // The webp bitstream carries eight-bit samples, so there is no sixteen-bit arm either.
+        (Format::WebP, ColorType::L16),
+        (Format::WebP, ColorType::La16),
+        (Format::WebP, ColorType::Rgb16),
+        (Format::WebP, ColorType::Rgba16),
+    ];
+
+    /// A factor table is the shape that invites a guess dressed as a bound, so the table has to
+    /// be complete and every row has to carry the versions it was established against.
+    ///
+    /// Complete means a **partition**, not a tally. The grid is [`NARROWED`] against the three
+    /// formats [`read`] is reached with — twenty-four pairs — and each of them is a row in
+    /// [`SCRATCH`] or a row in [`NOT_PRODUCED`], never both and never neither. An earlier shape
+    /// of this test walked a hand-written list whose contents were `SCRATCH`'s own key set,
+    /// which restates the table instead of constraining it: a dependency bump that made a
+    /// decoder report a new colour type would have left that arm charged an unmeasured one and
+    /// this test green.
     ///
     /// [`read`]: super::read
     #[test]
     fn every_arm_the_decoders_produce_is_measured() {
-        // What each decoder's `color_type()` can return. png expands its palette and reports
-        // one of eight; `image`'s bmp and webp decoders report one of two.
-        let produced = [
-            (
-                Format::Png,
-                &[
-                    ColorType::L8,
-                    ColorType::La8,
-                    ColorType::L16,
-                    ColorType::La16,
-                    ColorType::Rgb8,
-                    ColorType::Rgba8,
-                    ColorType::Rgb16,
-                    ColorType::Rgba16,
-                ][..],
-            ),
-            (Format::Bmp, &[ColorType::Rgb8, ColorType::Rgba8][..]),
-            (Format::WebP, &[ColorType::Rgb8, ColorType::Rgba8][..]),
-        ];
+        const FORMATS: [Format; 3] = [Format::Png, Format::Bmp, Format::WebP];
 
-        let mut measured = 0;
-        for (format, colours) in produced {
-            for &colour in colours {
-                let arm = Scratch::of(format, colour).unwrap_or_else(|| {
-                    panic!("{format:?} produces {colour:?} and no factor was measured for it")
-                });
+        for &colour in NARROWED {
+            for format in FORMATS {
+                assert!(
+                    Narrowing::of(format, colour).is_some(),
+                    "{format:?}/{colour:?}: `NARROWED` names a colour type `Narrowing::of` \
+                     refuses, so the grid is not the grid the code admits"
+                );
+
+                let measured = Scratch::of(format, colour);
+                assert_ne!(
+                    measured.is_some(),
+                    NOT_PRODUCED.contains(&(format, colour)),
+                    "{format:?}/{colour:?} must be in exactly one of `SCRATCH` and \
+                     `NOT_PRODUCED`; a pair in neither is an arm nobody decided about"
+                );
+
+                let Some(arm) = measured else { continue };
                 assert!(
                     !arm.against.is_empty(),
                     "{format:?}/{colour:?} names no dependency version"
@@ -763,17 +896,20 @@ mod tests {
                     arm.numerator,
                     arm.denominator
                 );
-                measured += 1;
             }
         }
+
+        // The two lists cover the grid and nothing outside it. The loop walks pairs, so it
+        // passes on a duplicated row and on a row for a pair the grid does not contain; the
+        // lengths are what catch both.
         assert_eq!(
-            measured,
-            SCRATCH.len(),
-            "the table carries a row for an arm no decoder produces, or two rows for one arm"
+            SCRATCH.len() + NOT_PRODUCED.len(),
+            FORMATS.len() * NARROWED.len(),
+            "the two lists must partition the twenty-four pairs exactly"
         );
 
-        // An arm outside the table is charged one, and says it is unmeasured rather than
-        // reading as a measured 1.00. `image`'s bmp decoder never reports `L8`.
+        // A pair in `NOT_PRODUCED` is charged one, and says it is unmeasured rather than
+        // reading as a measured 1.00.
         let unmeasured =
             Narrowing::of(Format::Bmp, ColorType::L8).expect("`L8` is a shape narrowing covers");
         assert!(
@@ -787,21 +923,30 @@ mod tests {
         );
     }
 
-    /// The charge is the figure that was measured, not the code's own multiplication.
+    /// The charge is the figure the table states, reproduced to the byte rather than read back
+    /// out of the code's own multiplication.
     ///
-    /// Every number below is peak resident set from `page::decode` alone on a 6000x8000 page,
-    /// less the process base and the entry buffer:
+    /// Every measured number below is peak resident set from `page::decode` alone on a
+    /// 6000x8000 page, less the process base and the entry buffer. For png the charge *is* the
+    /// measured working set. For the two webp arms it sits deliberately above it: the worst
+    /// case column is [`Scratch`]'s per-pixel itemisation at this page size rounded **up**,
+    /// that is what those two rows are charged against, and the ladder's streams do not reach
+    /// it. Up, because a worst-case column that rounds down states a worst case that is not
+    /// one: `Rgba8`'s itemised 11.4921875 bytes a pixel is 551,625,000 B at this page, so the
+    /// cell reads 551.63 and not 551.62.
     ///
-    /// | arm | declared | measured working set | charged |
-    /// |---|---|---|---|
-    /// | png `Rgb8` | 144,000,000 | 144.07 MB | 144,000,000 |
-    /// | webp `Rgb8`, VP8L | 144,000,000 | 335.83 MB | 336,000,000 |
-    /// | webp `Rgb8`, VP8 | 144,000,000 | 224.18 MB | 336,000,000 |
-    /// | webp `Rgba8`, VP8 | 192,000,000 | 515.39 MB | 528,000,000 |
+    /// | arm | declared | measured | worst case | charged |
+    /// |---|---|---|---|---|
+    /// | png `Rgb8` | 144,000,000 | 144.07 MB | — | 144,000,000 |
+    /// | webp `Rgb8`, VP8L | 144,000,000 | 335.83 MB | 378.00 MB | 384,000,000 |
+    /// | webp `Rgb8`, VP8 | 144,000,000 | 224.18 MB | 378.00 MB | 384,000,000 |
+    /// | webp `Rgba8`, VP8 | 192,000,000 | 515.39 MB | 551.63 MB | 576,000,000 |
     ///
     /// The same page and the same declared buffer, and the charge differs by what one decoder
     /// allocates around it. Asserted at the byte, because a factor held as a rounded decimal
-    /// would land near these figures and not on them.
+    /// would land near these figures and not on them. The `Rgba8` cell is that itemisation;
+    /// [`Scratch`] records the arm as bounded by 11.609 once the macroblock array is counted at
+    /// its capacity rather than its length, which is 557.25 MB here and still under the charge.
     #[test]
     fn the_charge_is_the_measured_working_set() {
         let (width, height) = (6000, 8000);
@@ -811,35 +956,34 @@ mod tests {
         let png = Narrowing::of(Format::Png, ColorType::Rgb8).expect("png produces `Rgb8`");
         assert_eq!(png.peak(declared, width, height), 144_000_000);
 
+        // Eight bytes a pixel: three declared, four for the scratch `read_image` copies down
+        // from, and 0.875 of predictor, colour-transform and entropy data that a bitstream may
+        // ask for and `cwebp`'s default method does not.
         let webp = Narrowing::of(Format::WebP, ColorType::Rgb8).expect("webp produces `Rgb8`");
-        assert_eq!(webp.peak(declared, width, height), 336_000_000);
+        assert_eq!(webp.peak(declared, width, height), 384_000_000);
 
-        // `Rgba8` covers both codings too, and here VP8 is the worse of the pair: 10.74 bytes a
-        // pixel measured against VP8L's 7.00, because VP8 holds its YUV planes and decodes the
-        // alpha chunk's own lossless stream while the output buffer is alive. The row charges
-        // `2/1`, which with the composited page is eleven bytes a pixel.
+        // `Rgba8` covers both codings too, and here VP8 is the worse of the pair: the output
+        // buffer, the YUV planes, the macroblock array and `read_alpha_chunk`'s own lossless
+        // decode are alive at once. The row charges `9/4`, which with the composited page is
+        // twelve bytes a pixel against an itemised 11.49 and a bound of 11.609.
         let alpha = Narrowing::of(Format::WebP, ColorType::Rgba8).expect("webp produces `Rgba8`");
         let declared_rgba = u64::from(width) * u64::from(height) * 4;
-        assert_eq!(alpha.peak(declared_rgba, width, height), 528_000_000);
-        assert!(
-            alpha.peak(declared_rgba, width, height) >= 515_385_600,
-            "the charge must cover the 10.74 bytes a pixel VP8 with alpha was measured at"
-        );
+        assert_eq!(alpha.peak(declared_rgba, width, height), 576_000_000);
 
         // Rounded up rather than towards zero, so a bound is never short by a byte.
         assert_eq!(
             webp.peak(1, 1, 1),
             3,
-            "1 x 7/3 rounds up to 3, not down to 2"
+            "1 x 8/3 rounds up to 3, not down to 2"
         );
     }
 
     /// The factor is per arm, and this is the test that fails if someone folds the worst one
     /// into the per-buffer limit instead.
     ///
-    /// One geometry, three arms, one limit: a 6000x8000 webp is refused because it really does
-    /// allocate 336 MB, and the same geometry as a png or a bmp is allowed because it really
-    /// does not. Lowering the per-buffer limit by webp's factor would refuse all three, which
+    /// One geometry, three arms, one limit: a 6000x8000 webp is refused because it may really
+    /// allocate 384 MB, and the same geometry as a png or a bmp is allowed because it cannot.
+    /// Lowering the per-buffer limit by webp's factor would refuse all three, which
     /// is the outcome the per-arm table exists to avoid.
     #[test]
     fn widening_one_arm_cannot_refuse_a_page_that_does_not_incur_it() {
@@ -862,7 +1006,7 @@ mod tests {
             budget
                 .allow_decoded(webp.peak(declared, width, height))
                 .is_err(),
-            "336 MB is over the 256 MiB one buffer may occupy"
+            "384 MB is over the 256 MiB one buffer may occupy"
         );
     }
 

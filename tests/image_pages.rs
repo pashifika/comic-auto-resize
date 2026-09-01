@@ -647,14 +647,14 @@ fn the_decoders_own_buffer_and_the_page_it_becomes_are_both_charged() {
 /// And the decoder's *own* allocations, which are not the buffer it declares.
 ///
 /// `image-webp`'s `read_image` allocates `w × h × 4` and copies down into the `w × h × 3`
-/// buffer `image` handed it, so a webp whose colour type is `Rgb8` costs seven bytes a pixel
-/// where its declared buffer is three — measured at exactly `7/3` on a five-point size ladder,
-/// against the 2.33 an independent review predicted from the source. The same picture as a png
-/// costs three, because png's decoder fills the buffer it was given.
+/// buffer `image` handed it, and a lossless stream may hold another 0.875 of predictor, colour
+/// transform and entropy data around both — so a webp whose colour type is `Rgb8` is charged
+/// eight bytes a pixel where its declared buffer is three. The same picture as a png costs
+/// three, because png's decoder fills the buffer it was given.
 ///
-/// One geometry, one ceiling, two formats, two outcomes. That is the assertion: the factor is
+/// One geometry, one ceiling, three formats, two outcomes. That is the assertion: the factor is
 /// per arm rather than global, so a ceiling lowered to cover webp's scratch — which is what
-/// folding the factor into the per-buffer limit would be — would refuse the png too.
+/// folding the factor into the per-buffer limit would be — would refuse the other two as well.
 #[test]
 fn a_decoders_own_allocations_are_charged_and_only_to_the_arm_that_makes_them() {
     let declared = u128::from(WIDTH * HEIGHT * 3);
@@ -697,8 +697,8 @@ fn a_decoders_own_allocations_are_charged_and_only_to_the_arm_that_makes_them() 
     assert_eq!(quantity, "decoded bytes");
     assert_eq!(
         actual,
-        declared * 7 / 3,
-        "the charge is not the measured seven bytes a pixel"
+        declared * 8 / 3,
+        "the charge is not the eight bytes a pixel the webp row states"
     );
 
     // The same geometry, the same ceiling, through a decoder that allocates nothing extra.
