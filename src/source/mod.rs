@@ -63,6 +63,20 @@ use crate::page::Format;
 /// Chosen, not measured. A 1280-wide JPEG page is tens of kilobytes and a 600dpi scan a few
 /// megabytes, so 64 MiB is orders of magnitude of headroom while still refusing an archive
 /// that claims a gigabyte in one entry.
+///
+/// # It binds before the page budget for an uncompressed format, and it is not raised
+///
+/// For a format whose entries carry raw pixels this is reached long before the page budget's
+/// pixel ceiling. Measured, a 24-bit bmp entry reaches this limit at **22,369,603 pixels** —
+/// 4096x5461 occupies 67,104,822 B and is accepted, 4096x5462 occupies 67,117,110 B and is
+/// refused by name — so a bmp's reachable page size is 22% of the 100 Mpx the page budget
+/// states, and a bmp is never refused by the pixel limit at all.
+///
+/// **Raising this to let bmp reach that ceiling is refused twice over.** It would need 300 MiB,
+/// which times the pipeline's `2 x jobs` credit window is 5.4 GB of entry buffers before a
+/// single pixel is decoded; and it would raise the ceiling for every format in order to serve
+/// the one whose pages are least likely to be large. A 22.4 Mpx bmp is a 6000x3700 page. The
+/// refusal is correct and stays; what was missing was anyone saying which limit fired.
 pub const MAX_ENTRY_BYTES: u64 = 64 << 20;
 
 /// One page read out of an archive.

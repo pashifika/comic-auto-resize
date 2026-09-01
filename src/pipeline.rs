@@ -49,6 +49,57 @@
 //! the extra entry: in a push shape every source reads before it offers, so all four would
 //! pay it instead of one.
 //!
+//! # What the run's peak actually is, with every factor named
+//!
+//! The argument above is about the *count* of pages in flight, and it is right about it:
+//! measured on 100 pages against 1000 of the same 1520x2150 page, the peak grows by 1.043 for
+//! jpg, 1.052 for png, 1.047 for bmp and 1.066 for webp — every one inside the 1.5 the claim
+//! allows, and the window needs no change. What it did not say is what *one* page in flight
+//! costs, and that is decided by which decoder read the archive rather than by the archive.
+//!
+//! ```text
+//! peak ≈ J × max(decode, resize) + W × MAX_ENTRY_BYTES + base
+//!
+//!   decode = declared × scratch_factor(format, colour) + page   (page: only where both live)
+//!   resize = page + src_width × dst_height × channels + destination
+//! ```
+//!
+//! `J` is the worker count and `W` the credit window, both in [`Capacities`]. `declared` is
+//! `ImageDecoder::total_bytes()`, `scratch_factor` is measured per arm in `page::decode`'s
+//! raster module, and `MAX_ENTRY_BYTES` bounds the entry each credit holds. A **maximum** over
+//! the two stages rather than a sum, because a worker decodes and then resizes; which of them
+//! is the larger depends on the format, and for every arm whose scratch factor is one it is the
+//! resize. `src_width × dst_height × channels` is `fast_image_resize`'s two-pass buffer
+//! (`resizer.rs:418-422`), held inside the `Resizer` and grown to the largest page a worker has
+//! seen — so it is per worker and it does not shrink.
+//!
+//! There is a fourth term this does not charge and it is libjpeg's: a **progressive** source
+//! holds coefficient arrays following the source geometry whatever `scale_denom` asks for, and
+//! this crate's encoder writes progressive, so the tool's own output fed back in is the
+//! expensive JPEG case. Measured on one 6000x8000 page, the same picture costs 43.7 MB as a
+//! baseline JPEG and 186.4 MB as a progressive one — 2.97 bytes a pixel of coefficient arrays,
+//! which is 4:2:0's 1.5 samples at two bytes a coefficient. `page::budget` records it as
+//! uncharged; charging it needs a progressive flag the dependency does not expose.
+//!
+//! What the whole thing costs on real numbers, nine workers, one archive of nine pages, every
+//! page inside every stated limit:
+//!
+//! | page | jpg | png | webp |
+//! |---|---|---|---|
+//! | 4800x7989, 38.3 Mpx | 1.43 GB | 1.55 GB | **2.93 GB** |
+//! | 6000x8000, 48.0 Mpx | 1.64 GB | — | refused: 336 MB a page |
+//!
+//! The webp entries are 13 KB each, so the second row is 118 KB of input that would have put
+//! 3.49 GB resident before the scratch factor was charged. A caller who knows the page count
+//! and the worker count still cannot predict the peak; the deciding term is which decoder read
+//! the archive, and for one format it is now bounded rather than merely large.
+//!
+//! **`J` is deliberately not bounded here.** It is the largest single factor, it is
+//! `worker_count()`'s to pick, and choosing it belongs to whoever owns the command-line surface
+//! — there is no `--jobs` yet, and adding one is where a default gets argued. What this module
+//! owes that decision is the per-worker term above, which is why it is stated as a product
+//! rather than as a number.
+//!
 //! # Working memory a decoder sizes from the input
 //!
 //! Peak memory is independent of page count, and that is what this section's claim is. It is

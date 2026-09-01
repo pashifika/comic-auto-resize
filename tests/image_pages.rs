@@ -644,6 +644,74 @@ fn the_decoders_own_buffer_and_the_page_it_becomes_are_both_charged() {
     );
 }
 
+/// And the decoder's *own* allocations, which are not the buffer it declares.
+///
+/// `image-webp`'s `read_image` allocates `w × h × 4` and copies down into the `w × h × 3`
+/// buffer `image` handed it, so a webp whose colour type is `Rgb8` costs seven bytes a pixel
+/// where its declared buffer is three — measured at exactly `7/3` on a five-point size ladder,
+/// against the 2.33 an independent review predicted from the source. The same picture as a png
+/// costs three, because png's decoder fills the buffer it was given.
+///
+/// One geometry, one ceiling, two formats, two outcomes. That is the assertion: the factor is
+/// per arm rather than global, so a ceiling lowered to cover webp's scratch — which is what
+/// folding the factor into the per-buffer limit would be — would refuse the png too.
+#[test]
+fn a_decoders_own_allocations_are_charged_and_only_to_the_arm_that_makes_them() {
+    let declared = u128::from(WIDTH * HEIGHT * 3);
+
+    // The fixture really is the `Rgb8` arm: `image`'s webp encoder writes VP8L without alpha,
+    // and an `Rgba8` decode would have composited. Without that, the assertion below could not
+    // tell which arm charged what.
+    let decoded = decode(
+        "plain.webp",
+        &webp_page(WIDTH, HEIGHT),
+        Format::WebP,
+        DecodeSettings::default(),
+    )
+    .expect("the fixture decodes under the default budget");
+    assert!(
+        !decoded.composited,
+        "the fixture must be the `Rgb8` arm, or this test measures a different one"
+    );
+    assert_eq!(decoded.page.channels(), Channels::Rgb);
+
+    // A ceiling above the declared buffer and below what the decoder actually allocates.
+    let between = DecodeSettings {
+        budget: Budget::new(1 << 30, u64::try_from(declared * 2).expect("fits")),
+        ..DecodeSettings::default()
+    };
+
+    let error = decode(
+        "plain.webp",
+        &webp_page(WIDTH, HEIGHT),
+        Format::WebP,
+        between,
+    )
+    .expect_err("the declared buffer fits; the decoder's working set does not");
+    let PageErrorKind::TooLarge {
+        quantity, actual, ..
+    } = error.kind
+    else {
+        panic!("expected a budget refusal, got {:?}", error.kind);
+    };
+    assert_eq!(quantity, "decoded bytes");
+    assert_eq!(
+        actual,
+        declared * 7 / 3,
+        "the charge is not the measured seven bytes a pixel"
+    );
+
+    // The same geometry, the same ceiling, through a decoder that allocates nothing extra.
+    assert!(
+        decode("plain.png", &png_page(WIDTH, HEIGHT), Format::Png, between).is_ok(),
+        "png fills the buffer it was given, so webp's factor must not reach it"
+    );
+    assert!(
+        decode("plain.bmp", &bmp_page(WIDTH, HEIGHT), Format::Bmp, between).is_ok(),
+        "bmp decodes into the buffer it was given, so webp's factor must not reach it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The counted outcome
 // ---------------------------------------------------------------------------
