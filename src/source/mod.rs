@@ -94,7 +94,7 @@ use crate::page::Format;
 /// 300 MB — 286.1 MiB — which times the pipeline's `2 x jobs` credit window is 5.4 GB of entry
 /// buffers before a single pixel is decoded; and it would raise the ceiling for every format in
 /// order to serve the one whose pages are least likely to be large. A 22.4 Mpx bmp is a
-/// 6000x3700 page. The refusal is correct and stays; what was missing was anyone saying which
+/// 6000x3728 page. The refusal is correct and stays; what was missing was anyone saying which
 /// limit fired.
 pub const MAX_ENTRY_BYTES: u64 = 64 << 20;
 

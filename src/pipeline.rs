@@ -125,18 +125,34 @@
 //! buffer, holds eight bytes a source pixel against at most six.
 //!
 //! Which of the two *stages* is dearer, counting the resize temporary against the resize that
-//! grows it, is a different question with a different answer, and it is the one two revisions of
-//! this paragraph answered wrongly. Counted that way the decode is the larger when
+//! grows it rather than against the retained term, is a different question — and it is the one
+//! three revisions of this paragraph answered wrongly, so the derivation is shown rather than
+//! its conclusion. Counted that way the comparison is
+//!
+//! ```text
+//! declared × factor + page   >   page + 2 × temp + destination
+//! ```
+//!
+//! and cancelling `page` is only legal where the decode really holds the declared buffer *and*
+//! the page at once — the arms that copy. **For the three factor-one arms whose buffer is moved
+//! the decode is the page alone**, so nothing cancels, the right side is larger by
+//! `2 × temp + destination` and the resize is the dearer stage at every ratio; the condition
+//! below does not apply to them and would get them backwards. webp `Rgb8` is moved too but its
+//! factor is not one, so its decode is `8/3` of the page against `page + 2 × temp + destination`
+//! and it crosses like a copying arm, below `r ≈ 0.633`. For a copying arm the comparison
+//! reduces to
 //! `declared > 2 × temp + destination`, which at a fixed target width is a threshold on the
-//! downscale ratio `r` and not a property of the arm: with `c` the page's channels it is
-//! `declared / c > 2r + r²`, so roughly `r < 0.53` for the four-byte three-channel arms and
-//! `r < 0.73` for the two-byte grey ones. On the 1520x2150 page the growth ratios above were
-//! measured on, `r` is 0.842 and png `Rgba8` decodes seven bytes a source pixel — four declared,
-//! three composited — against `3 + 2 × 2.527 + 2.128` = 10.2 to resize, so the resize is the
-//! dearer stage there and on a source wide enough to put `r` under 0.53 it is not. Each count
-//! this paragraph used to carry was taken at one geometry and written as though it held at every
-//! one. The bound does not rest on the answer: the temporary belongs to both stages, so it is
-//! charged once, outside the maximum.
+//! downscale ratio `r` rather than a fixed answer: with `d` the declared bytes a *source pixel*
+//! — `declared` itself is `total_bytes()`, so this is `d = declared / (width × height)` — and
+//! `c` the page's channels, it is `d / c > 2r + r²`, roughly `r < 0.53` for the four-byte
+//! three-channel arms and `r < 0.73` for the two-byte grey ones. On the 1520x2150 page the
+//! growth ratios above were measured on, `r` is 0.842 and png `Rgba8` decodes seven bytes a
+//! source pixel — four declared, three composited — against `3 + 2 × 2.527 + 2.128` = 10.2 to
+//! resize, so the resize is the dearer stage there, and on a source wide enough to put `r` under
+//! 0.53 it is not. Each count this paragraph used to carry was taken at one geometry and written
+//! as though it held at every one, and the scope above is written as part of the algebra so the
+//! next reader cannot detach it again. The bound does not rest on any of this: the temporary
+//! belongs to both stages, so it is charged once, outside the maximum.
 //!
 //! There is a fourth term this does not charge and it is libjpeg's: a **progressive** source
 //! holds coefficient arrays following the source geometry whatever `scale_denom` asks for, and

@@ -47,8 +47,8 @@
 //! `decoded bytes is 300000000, over the limit of 268435456`, and 9000x9000 — whose entry is
 //! 10,152,062 B — is accepted and decodes to 243 MB. So a bmp *can* be refused by the pixel
 //! limit. What holds unqualified is only that an **uncompressed** page at 24 bits or deeper
-//! meets the entry limit first, which is the qualification `MAX_SOURCE_PIXELS` twenty lines
-//! below already carries.
+//! meets the entry limit first, and `MAX_SOURCE_PIXELS` twenty lines below says so in those
+//! terms.
 //!
 //! Every one of those refusals is correct and every one stays. Stated here because a limit
 //! whose effective value depends on the stored form is a limit a reader will otherwise get
@@ -69,8 +69,11 @@ use super::{Channels, PageErrorKind};
 /// geometry, not the scaled output: a progressive image this size holds coefficient arrays
 /// for every block whatever `scale_num` asks for.
 ///
-/// **Not reachable for every format.** See the module documentation: an uncompressed page
-/// meets [`MAX_ENTRY_BYTES`](crate::source::MAX_ENTRY_BYTES) at 22.4 Mpx and never gets here.
+/// **Not reachable for every stored form.** See the module documentation: an uncompressed page
+/// at 24 bits a stored pixel or deeper meets
+/// [`MAX_ENTRY_BYTES`](crate::source::MAX_ENTRY_BYTES) at 22.4 Mpx and never gets here. A
+/// shallower stored form — a 1-bit or 4-bit palette, or an RLE run structure that unpacks far
+/// more than it stores — does reach this limit, and `budget.rs`'s own tests exercise it.
 const MAX_SOURCE_PIXELS: u64 = 100_000_000;
 
 /// The most bytes one image buffer may occupy, decoded or resized.
