@@ -1100,7 +1100,10 @@ fn the_worker_count_is_the_hosts_by_default_and_does_not_reach_the_output() {
 /// `errgroup` is bounded at the same derived count.
 #[test]
 fn a_worker_count_above_the_hosts_ceiling_is_refused_before_any_work() {
-    let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    // The same fallback the binary uses when the host will not answer — `DEFAULT_CORES`, the
+    // count the reference tool assumes — because a test that assumed a different one would
+    // compute a different ceiling and fail on exactly the error path the constant defines.
+    let cores = std::thread::available_parallelism().map_or(4, NonZeroUsize::get);
     let derived = if cores >= 5 { cores - 1 } else { 4 };
     let ceiling = (cores * 2).max(derived);
 
@@ -1137,6 +1140,32 @@ fn a_worker_count_above_the_hosts_ceiling_is_refused_before_any_work() {
             "--jobs {jobs} produced an output archive"
         );
     }
+
+    // Refused *before the input is opened*, which the assertions above cannot tell from a
+    // refusal inside the run: against a path that does not exist, an over-ceiling count still
+    // reports the ceiling, while a legal one gets as far as opening and reports the missing
+    // file. A ceiling check moved out of the parser would swap those two messages.
+    let absent = directory.join("not-here.zip");
+    let refused = Command::new(BINARY)
+        .args(["--jobs", &(ceiling + 1).to_string()])
+        .arg(&absent)
+        .output()
+        .expect("runs the binary");
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains(&ceiling.to_string()),
+        "the count was not refused before the input was reached: {message}"
+    );
+    let opened = Command::new(BINARY)
+        .args(["--jobs", &ceiling.to_string()])
+        .arg(&absent)
+        .output()
+        .expect("runs the binary");
+    let message = String::from_utf8_lossy(&opened.stderr);
+    assert!(
+        !opened.status.success() && message.contains("not-here.zip"),
+        "a legal count should have reached the input: {message}"
+    );
 
     // The number is the host's, so the help states the rule rather than the number — and both
     // arms of it, because on a host of one or two cores the four-worker floor is the arm that

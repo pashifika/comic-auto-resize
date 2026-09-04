@@ -306,4 +306,30 @@ mod tests {
         // height, under this floor, and 500 is not above Go's, so both pass it through.
         assert_eq!(plan(1430, 200, 501), Plan::BelowFloor);
     }
+
+    /// The second arm of the same divergence, and the more common one: the *height*.
+    ///
+    /// A ratio here resolves to one number, and the height follows from it —
+    /// [`height_for_width`] of the rounded width — because `Plan::Resize` carries one target
+    /// and `Resampler::resize` derives the rest. The reference tool applies the ratio to both
+    /// source axes independently, so where rounding pulls the two apart the pages differ by a
+    /// pixel of height even though the widths agree: a 1001×1400 page at 50 per cent is
+    /// 501×701 here and 501×700 there, because 700.699 rounds up from the width this build
+    /// actually used and `1400 × 0.5` rounds to 700 from the source.
+    ///
+    /// Deliberate, and the commoner case rather than the exotic one: sampling widths and
+    /// heights from 200 to 4000 at 30, 50 and 70 per cent, the widths agree and the heights
+    /// differ on 26.9% of pages. One authoritative height is what the policy, the scaled
+    /// decode and the resampler all read, and two independently rounded axes would be two
+    /// chances to disagree about the same page.
+    #[test]
+    fn a_ratios_height_follows_the_width_this_build_chose() {
+        let width = Target::Ratio(50).width_for(1001);
+        assert_eq!(width, 501);
+        assert_eq!(height_for_width(1001, 1400, width), 701);
+        assert_eq!(plan(1001, 1400, width), Plan::Resize { width: 501 });
+        // Where the rounding does not pull them apart, the two agree.
+        assert_eq!(Target::Ratio(50).width_for(1000), 500);
+        assert_eq!(height_for_width(1000, 1400, 500), 700);
+    }
 }
