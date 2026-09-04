@@ -837,7 +837,8 @@ fn no_option_sets_the_minimum_edge_or_a_budget() {
     }
 }
 
-/// An out-of-range value is refused by the parser, before the input is opened.
+/// An out-of-range value, or a combination that names one quantity twice, is refused by the
+/// parser before the input is opened.
 #[test]
 fn an_out_of_range_option_value_is_refused_before_any_work() {
     let directory = TempDir::new("bad-values");
@@ -854,6 +855,12 @@ fn an_out_of_range_option_value_is_refused_before_any_work() {
         vec!["--ratio", "101"],
         // Zero workers is no pipeline at all, and the parser is where that is refused.
         vec!["--jobs", "0"],
+        // Both name a target width, one relative and one absolute, so there is no precedence
+        // to pick. Both orders, because a conflict declared on one arm has to refuse from
+        // either side — and deleting the exclusivity would otherwise leave every other test
+        // passing while `-r` silently won.
+        vec!["--ratio", "30", "--auto-width", "1000"],
+        vec!["--auto-width", "1000", "--ratio", "30"],
     ] {
         let output = Command::new(BINARY)
             .args(&args)
@@ -906,7 +913,8 @@ fn an_out_of_range_option_value_is_refused_before_any_work() {
 ///
 /// `--jobs` is the one accepted flag that must **not** change the output: it changes what the
 /// run costs, and the archive being identical at any worker count is the ordering writer's
-/// guarantee. That direction is asserted in `the_worker_count_does_not_reach_the_output`.
+/// guarantee. That direction is asserted in
+/// `the_worker_count_is_the_hosts_by_default_and_does_not_reach_the_output`.
 #[test]
 fn every_accepted_flag_changes_the_output() {
     fn run_with(args: &[&str], label: &str) -> Vec<u8> {
@@ -1079,6 +1087,62 @@ fn the_worker_count_is_the_hosts_by_default_and_does_not_reach_the_output() {
     assert_eq!(
         archives[0], archives[1],
         "the worker count changed the archive"
+    );
+}
+
+/// The worker count has a ceiling, and it is the host's rather than a constant.
+///
+/// Each page is decoded, resized and encoded on its worker, so past the host's own
+/// parallelism another worker buys no throughput and costs its whole per-worker term in
+/// memory. Refusing at the parser is also what keeps an absurd value away from the channel
+/// allocation and the thread spawn, where the machine answers with a panic rather than the
+/// tool answering with a refusal. The reference tool cannot be exceeded at all: its own
+/// `errgroup` is bounded at the same derived count.
+#[test]
+fn a_worker_count_above_the_hosts_ceiling_is_refused_before_any_work() {
+    let cores = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let derived = if cores >= 5 { cores - 1 } else { 4 };
+    let ceiling = (cores * 2).max(derived);
+
+    let directory = TempDir::new("jobs-ceiling");
+    let input = valid_input(&directory);
+
+    // The ceiling itself runs, so the refusals below are the ceiling and not a smaller
+    // accident.
+    let status = Command::new(BINARY)
+        .args(["--jobs", &ceiling.to_string()])
+        .arg(&input)
+        .status()
+        .expect("runs the binary");
+    assert!(status.success(), "--jobs {ceiling} was refused");
+    fs::remove_file(default_output(&input)).expect("clears the output");
+
+    for jobs in [ceiling + 1, 1_000_000, usize::MAX] {
+        let output = Command::new(BINARY)
+            .args(["--jobs", &jobs.to_string()])
+            .arg(&input)
+            .output()
+            .expect("runs the binary");
+        assert!(
+            !output.status.success(),
+            "--jobs {jobs} was accepted; the host cannot use it"
+        );
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            message.contains(&ceiling.to_string()),
+            "the refusal does not name the ceiling: {message}"
+        );
+        assert!(
+            !default_output(&input).exists(),
+            "--jobs {jobs} produced an output archive"
+        );
+    }
+
+    // The number is the host's, so the help states the rule rather than the number.
+    let help = help_for("--jobs");
+    assert!(
+        help.contains("twice this host's core count"),
+        "`--jobs`'s help does not state the ceiling: {help}"
     );
 }
 

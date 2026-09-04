@@ -256,11 +256,16 @@ pub struct Capacities {
 }
 
 impl Capacities {
+    /// The window is saturated rather than wrapped: `--jobs` is a caller's number with no
+    /// upper bound, and `usize::MAX / WINDOW_PER_JOB` workers wrapping to a zero-capacity
+    /// window would turn `credits` into a rendezvous — the one shape the bound above argues
+    /// against — instead of failing. A count that large fails when the channel is allocated
+    /// or when the threads are spawned, which is the caller's answer either way.
     #[must_use]
     pub const fn for_jobs(jobs: NonZeroUsize) -> Self {
         let jobs = jobs.get();
         Self {
-            credits: jobs * WINDOW_PER_JOB,
+            credits: jobs.saturating_mul(WINDOW_PER_JOB),
             work: jobs,
             done: jobs,
         }
@@ -672,5 +677,18 @@ mod tests {
             // of order without stalling the reader.
             assert!(capacities.credits > capacities.work);
         }
+    }
+
+    /// The window saturates instead of wrapping.
+    ///
+    /// A count this large cannot run — the channel allocation refuses it long before the
+    /// threads do — but wrapping would have made `credits` zero, which is the rendezvous the
+    /// test above exists to reject, and it would have been reported as a window rather than
+    /// as a failure.
+    #[test]
+    fn an_absurd_worker_count_saturates_the_window_rather_than_wrapping_it() {
+        let capacities = Capacities::for_jobs(NonZeroUsize::MAX);
+        assert_eq!(capacities.credits, usize::MAX);
+        assert!(capacities.credits >= capacities.work);
     }
 }

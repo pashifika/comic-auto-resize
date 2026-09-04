@@ -279,4 +279,25 @@ mod tests {
         assert_eq!(Target::Width(1000).width_for(1520), 1000);
         assert_eq!(Target::Width(1000).width_for(400), 1000);
     }
+
+    /// The one place exact integer arithmetic is observably not the reference tool's.
+    ///
+    /// Go computes `math.Round(width × float64(percent)/100)`, and `percent/100` is inexact
+    /// in binary: `1430 × 0.35` evaluates to `500.49999999999994`, which rounds *down* to
+    /// 500 where the exact half rounds up to 501. Go's floor is `reW <= 500` and inclusive,
+    /// so that one pixel is the difference between a resize and a pass-through there. Here
+    /// the value is exact and the page is resized.
+    ///
+    /// Enumerated over widths 1..=65,535 and percentages 1..=100, the two rules disagree on
+    /// 3,293 pairs, always by one pixel and always with this rule the higher; exactly two of
+    /// those land on Go's inclusive floor, and one of them — width 715 at 70 per cent — is
+    /// unreachable there because 70 is the value its `autoResize` special-cases. This test
+    /// fails if the derivation is ever moved to floating point.
+    #[test]
+    fn a_ratio_is_exact_where_the_reference_tools_float_is_not() {
+        assert_eq!(Target::Ratio(35).width_for(1430), 501);
+        assert_eq!(plan(1430, 2000, 501), Plan::Resize { width: 501 });
+        // The less dramatic form of the same disagreement: one pixel, both tools resizing.
+        assert_eq!(Target::Ratio(58).width_for(875), 508);
+    }
 }

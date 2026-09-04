@@ -132,11 +132,12 @@ struct Cli {
     #[arg(long, value_name = "PASSWORD")]
     pwd: Option<String>,
 
-    /// How many pages are decoded, resized and encoded at once. Peak memory scales with
-    /// this: roughly the worker count times the largest page's decoded working set, which
-    /// measured 2.59 GB for nine workers on nine 4608x7281 webp pages. Lower it on a machine
-    /// that cannot spare that; the full term is in `src/pipeline.rs`.
-    #[arg(long, default_value_t = worker_count(), value_name = "COUNT")]
+    /// How many pages are decoded, resized and encoded at once, at most twice this host's
+    /// core count. Peak memory scales with this: roughly the worker count times the largest
+    /// page's decoded working set, which measured 2.59 GB for nine workers on nine 4608x7281
+    /// webp pages. Lower it on a machine that cannot spare that; the full term is in
+    /// `src/pipeline.rs`. The reference tool derives this number and offers no way to set it.
+    #[arg(long, default_value_t = worker_count(), value_parser = jobs, value_name = "COUNT")]
     jobs: NonZeroUsize,
 }
 
@@ -166,7 +167,9 @@ fn main() -> ExitCode {
             let notes = if notes.is_empty() {
                 String::new()
             } else {
-                format!(" ({})", notes.join(", "))
+                // Joined with a semicolon rather than a comma, because a clause may carry a
+                // comma of its own and two facts must not read as three fragments.
+                format!(" ({})", notes.join("; "))
             };
             // `Ok` and `--delete-org` together mean the input is gone: a removal that failed
             // is an error, so there is no third state to report.
@@ -334,6 +337,46 @@ fn worker_count() -> NonZeroUsize {
     let cpus = thread::available_parallelism().map_or(4, NonZeroUsize::get);
     let jobs = if cpus >= 5 { cpus - 1 } else { 4 };
     NonZeroUsize::new(jobs).unwrap_or(NonZeroUsize::MIN)
+}
+
+/// The largest worker count worth accepting: twice the host's parallelism, and never below
+/// the default.
+///
+/// Bounded rather than open. Each page is decoded, resized and encoded on its worker, so past
+/// the host's own parallelism another worker buys no throughput and costs its whole
+/// per-worker term in memory; twice it is headroom for a host whose reported parallelism
+/// understates what it will run. Past that the machine answers instead of the tool — a
+/// thread-spawn failure or an allocation failure rather than a refusal naming the value —
+/// which is the wrong shape of answer for a value the parser can see.
+///
+/// The reference tool has no ceiling because it has no flag: `errgroup.WithContext(ctx, cpus)`
+/// bounds its own concurrency at the same derived count and there is no way to ask for more.
+/// So every count this accepts above the default is already more than that build could run.
+///
+/// Never below [`worker_count`], because a host reporting fewer than two cores still gets the
+/// reference tool's floor of four workers and a default the parser refuses is not a default.
+fn max_jobs() -> NonZeroUsize {
+    let cores = thread::available_parallelism().map_or(1, NonZeroUsize::get);
+    let ceiling = cores.saturating_mul(2).max(worker_count().get());
+    NonZeroUsize::new(ceiling).unwrap_or(NonZeroUsize::MIN)
+}
+
+/// Refuses a worker count the host cannot use, before the input is opened.
+///
+/// Zero is refused by the type — a run with no workers is not a run — and the ceiling by
+/// [`max_jobs`]. Named rather than inlined for the reason `charset` is: `clap`'s derive wants
+/// a function path.
+fn jobs(value: &str) -> Result<NonZeroUsize, String> {
+    let jobs: NonZeroUsize = value
+        .parse()
+        .map_err(|_| format!("`{value}` is not a worker count"))?;
+    let ceiling = max_jobs();
+    if jobs > ceiling {
+        return Err(format!(
+            "{jobs} is more than this host can use; the most is {ceiling}"
+        ));
+    }
+    Ok(jobs)
 }
 
 /// Resolves `--charset`'s label list, so an unknown label is refused before the input opens.
