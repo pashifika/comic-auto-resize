@@ -7,6 +7,7 @@
 //! sort by name.
 
 use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -63,12 +64,38 @@ impl Sink {
     /// # Errors
     ///
     /// [`RunError::OutputExists`] when `path` is taken, [`RunError::PartialExists`] when the
-    /// partial is, and [`RunError::Io`] when it cannot be created.
+    /// partial is, and [`RunError::Io`] when the partial cannot be created or when `path`
+    /// cannot be queried at all.
     pub fn create(path: &Path) -> Result<Self, RunError> {
-        if path.exists() {
-            return Err(RunError::OutputExists {
-                path: path.to_path_buf(),
-            });
+        // `symlink_metadata` rather than `Path::exists`, which follows the final link and so
+        // answers false for a dangling one: a broken symbolic link at the output path would
+        // pass the check and then be replaced by the rename, against a requirement that says
+        // the resolved path must not already exist. An entry is an entry, whatever it points
+        // at. This also strengthens the refusal `--delete-org` leans on, because the input is
+        // an entry under every spelling.
+        //
+        // Three arms rather than `is_ok()`, because "cannot tell" is not "not there" and the
+        // two are one mistake apart. `create_new` below acts on `<output>.part`, a *different*
+        // entry needing a *different* right — adding a child to the directory, where this
+        // needs read-attributes on the output itself — so a directory ACL can permit the
+        // creation while refusing the query, and a Windows sharing violation on an output
+        // another process holds open does exactly that. Treating that as absence would let the
+        // run create the partial, succeed, and then `rename` over the very file this refusal
+        // exists to protect, because rename replaces its destination by contract. So anything
+        // but a plain absence stops the run with the error the query gave.
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(RunError::OutputExists {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(RunError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
         }
 
         // Beside the destination, so the rename is within one directory and therefore
@@ -236,13 +263,70 @@ pub enum InputKind {
     Directory,
 }
 
+/// The output path for `input`, given whatever `-o` supplied.
+///
+/// `requested` resolves two ways, and the split is where this tool's responsibility ends. A
+/// value naming a **location** — its final character is a path separator, or it already
+/// exists and is a directory — is that directory joined with [`default_output`]'s name.
+/// Anything else is a **filename** and is used verbatim: no extension appended, replaced or
+/// validated, so `-o out.cbz` writes a zip archive called `out.cbz`. Naming only a location
+/// is not a mistake, so the filename is supplied; naming a file is a decision, so it is not
+/// second-guessed. The reference tool appends `.zip` to the value and refuses an existing
+/// directory outright; both follow from the defect the default name corrects.
+///
+/// The default name is derived only where `requested` supplies none, so `car / -o out.zip`
+/// never meets a refusal about a stem it did not need.
+///
+/// # Errors
+///
+/// [`RunError::MissingOutputDirectory`] when the directory to write into is not there. The
+/// tool declines to create it, and the containment check needs a path that canonicalises,
+/// which a directory that does not exist has none of.
+///
+/// [`RunError::OutputInsideInput`] when the resolved path lands inside a directory input,
+/// where the next run would read it as a page. Both arms reach in — `-o vol1/out.zip` names
+/// a filename inside the input and `-o vol1/` joins to one — so the bound is on the resolved
+/// path rather than on either arm.
+///
+/// [`RunError::UnnamedInput`] as [`default_output`], and [`RunError::Io`] when a path that
+/// exists cannot be canonicalised.
+pub fn resolve_output(
+    input: &Path,
+    kind: InputKind,
+    requested: Option<&Path>,
+) -> Result<PathBuf, RunError> {
+    let Some(requested) = requested else {
+        // Nothing to bound: the default is placed beside the input rather than in it, and
+        // its directory is one the input is already in.
+        return default_output(input, kind);
+    };
+
+    let output = if is_location(requested) {
+        let (_, name) = default_parts(input, kind)?;
+        requested.join(name)
+    } else {
+        requested.to_path_buf()
+    };
+
+    let directory = output_directory(&output);
+    if !directory.is_dir() {
+        return Err(RunError::MissingOutputDirectory {
+            path: directory.to_path_buf(),
+        });
+    }
+    if kind == InputKind::Directory {
+        refuse_inside_input(input, &output, directory)?;
+    }
+    Ok(output)
+}
+
 /// The default output path for `input`: its name plus `_resize.zip`, in its own directory.
 ///
 /// The `_resize` suffix is load-bearing rather than cosmetic. Without it a `.zip` input
-/// resolves to its own path, so the refusal to overwrite would fire on every run — and a
-/// future `--delete-org` would destroy the input. With it the two can never coincide,
-/// because the resolved name always ends in `_resize.zip` and always gains that suffix from
-/// whatever stem it started with.
+/// resolves to its own path, so the refusal to overwrite would fire on every run — and
+/// `--delete-org` would destroy the input. With it the two can never coincide, because the
+/// resolved name always ends in `_resize.zip` and always gains that suffix from whatever
+/// stem it started with.
 ///
 /// For a directory the suffix is load-bearing a second time. `vol1` and `vol1.zip` do not
 /// collide, so nothing else would stop the output being written *inside* the input, where the
@@ -254,18 +338,28 @@ pub enum InputKind {
 /// `.`, `..` and `/` are. Resolved against the filesystem first, so `.` names the directory
 /// the user is standing in rather than nothing.
 pub fn default_output(input: &Path, kind: InputKind) -> Result<PathBuf, RunError> {
+    let (base, name) = default_parts(input, kind)?;
+    // Beside the input rather than in it: `with_file_name` replaces the last component,
+    // which for `/books/vol1` is `vol1` and gives `/books/vol1_resize.zip`.
+    Ok(base.with_file_name(name))
+}
+
+/// The default output's name, and the path it is placed beside.
+///
+/// Split out because `-o` naming a location needs the name without the placement.
+fn default_parts(input: &Path, kind: InputKind) -> Result<(PathBuf, OsString), RunError> {
     let (base, mut name) = match kind {
         InputKind::Directory => {
             // Resolved once, not once per use: two `canonicalize` calls are two chances to
             // disagree if the tree moves between them. Nothing to remove from the name
             // either, because a directory has no extension.
             let base = resolved(input)?;
-            let name = base
-                .file_name()
-                .map(std::ffi::OsString::from)
-                .ok_or_else(|| RunError::UnnamedInput {
-                    path: input.to_path_buf(),
-                })?;
+            let name =
+                base.file_name()
+                    .map(OsString::from)
+                    .ok_or_else(|| RunError::UnnamedInput {
+                        path: input.to_path_buf(),
+                    })?;
             (base, name)
         }
         InputKind::File => (
@@ -274,9 +368,90 @@ pub fn default_output(input: &Path, kind: InputKind) -> Result<PathBuf, RunError
         ),
     };
     name.push("_resize.zip");
-    // Beside the input rather than in it: `with_file_name` replaces the last component,
-    // which for `/books/vol1` is `vol1` and gives `/books/vol1_resize.zip`.
-    Ok(base.with_file_name(name))
+    Ok((base, name))
+}
+
+/// Whether `value` names a location rather than a file.
+///
+/// The trailing separator has to be read before the value becomes a `Path`, because `Path`
+/// normalises it away: `Path::new("dir/").file_name()` is `Some("dir")` and `components()`
+/// drops it. `is_separator` is platform-correct, which matters because `\` is one on Windows
+/// and is not on macOS, and `to_string_lossy` cannot change the answer — a replacement
+/// character appears only where an invalid sequence was, and a trailing ASCII separator is
+/// not one.
+fn is_location(value: &Path) -> bool {
+    value
+        .as_os_str()
+        .to_string_lossy()
+        .ends_with(std::path::is_separator)
+        || fs::metadata(value).is_ok_and(|meta| meta.is_dir())
+}
+
+/// The directory `output` would be written into.
+///
+/// `Path::parent` of a bare file name is the empty path, which names the current directory
+/// but answers neither `is_dir` nor `canonicalize`, so it is spelled `.` here.
+fn output_directory(output: &Path) -> &Path {
+    match output.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+/// Flushes the archive at `output`, and the directory entry naming it where that is a barrier.
+///
+/// Called only where the input is about to be removed, which is the one moment the output
+/// becomes the only copy. [`Sink::finish`] renames the partial onto `output`, which publishes
+/// the name and promises nothing about the bytes beneath it: neither APFS nor NTFS orders the
+/// data before the namespace change, so a power loss in between can leave a truncated or
+/// absent archive where a run has already reported success.
+///
+/// Opened for reading on unix, where `fsync` accepts a read-only descriptor, and for writing on
+/// Windows, where `FlushFileBuffers` does not. The parent is synchronised only on unix. A
+/// directory handle can be opened on Windows without `unsafe` — `OpenOptionsExt::custom_flags`
+/// with `FILE_FLAG_BACKUP_SEMANTICS` is safe, stable `std` — but `FlushFileBuffers` on one is
+/// not a documented durability barrier there, and NTFS journals the rename, so the guarantee
+/// does not rest on a call this code declined to make.
+///
+/// # Errors
+///
+/// Whatever the open or the flush returned. The caller's business is that a failure here means
+/// nothing may be removed, not what went wrong.
+pub fn durable(output: &Path) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    options.open(output)?.sync_all()?;
+    #[cfg(unix)]
+    File::open(output_directory(output))?.sync_all()?;
+    Ok(())
+}
+
+/// Refuses a resolved output inside a directory input.
+///
+/// Canonical rather than lexical: `-o vol1/../vol1/out.zip` and a symbolic link into the tree
+/// both spell a contained path without looking like one. Two `canonicalize` calls, but they
+/// feed one comparison rather than two derivations, so the disagreement [`default_parts`]
+/// guards against has nothing to divide here. Both paths exist by the time this runs — the
+/// input is open, and the output's directory was just checked.
+fn refuse_inside_input(input: &Path, output: &Path, directory: &Path) -> Result<(), RunError> {
+    let tree = fs::canonicalize(input).map_err(|source| RunError::Io {
+        path: input.to_path_buf(),
+        source,
+    })?;
+    let into = fs::canonicalize(directory).map_err(|source| RunError::Io {
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    if into.starts_with(&tree) {
+        return Err(RunError::OutputInsideInput {
+            path: output.to_path_buf(),
+            input: input.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 /// `input` with `.`, `..` and any link resolved away, so it has a last component to work
@@ -293,7 +468,7 @@ fn resolved(input: &Path) -> Result<PathBuf, RunError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputKind, default_output};
+    use super::{InputKind, default_output, durable, output_directory};
     use std::path::{Path, PathBuf};
 
     fn file(input: &str) -> PathBuf {
@@ -363,5 +538,60 @@ mod tests {
                 "{input} resolved to itself as a directory"
             );
         }
+    }
+
+    /// The flush reports a failure rather than swallowing one, and the flush is what is tested.
+    ///
+    /// The first two arms only exercise the *open*, so a regression that deleted `sync_all`
+    /// outright would keep passing them — review found exactly that. The third arm closes it:
+    /// `/dev/null` opens and then refuses to be flushed, so it is the seam where the open
+    /// succeeds and only the barrier fails. Without the `sync_all` call this arm returns `Ok`
+    /// and the test goes red, which is the property the other two cannot have.
+    #[test]
+    fn the_durability_barrier_flushes_and_reports_a_flush_that_fails() {
+        let scratch = std::env::temp_dir().join(format!(
+            "comic-auto-resize-durable-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("creates the scratch directory");
+
+        let written = scratch.join("out.zip");
+        std::fs::write(&written, b"PK\x05\x06").expect("writes an archive");
+        durable(&written).expect("an existing archive is flushed");
+
+        let missing = scratch.join("gone.zip");
+        let error = durable(&missing).expect_err("a path with no file must not report success");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+
+        // The barrier itself, isolated from the open. A character device accepts the open and
+        // rejects the flush, so this is the one arm a no-op barrier cannot pass.
+        #[cfg(unix)]
+        {
+            let unflushable = durable(Path::new("/dev/null"))
+                .expect_err("a barrier that cannot flush must not report success");
+            assert_ne!(
+                unflushable.kind(),
+                std::io::ErrorKind::NotFound,
+                "the failure came from the open rather than the flush: {unflushable}"
+            );
+        }
+
+        std::fs::remove_dir_all(&scratch).expect("removes the scratch directory");
+    }
+
+    /// The empty-parent rule has one implementation, and the barrier shares it.
+    ///
+    /// `Path::parent` of a bare file name is the empty path, which names the current directory
+    /// but answers neither `is_dir` nor `canonicalize`. Both the resolution and the flush need
+    /// that spelled `.`, and a second copy of the rule is a second thing to get wrong.
+    #[test]
+    fn a_bare_file_name_names_the_current_directory() {
+        assert_eq!(output_directory(Path::new("out.zip")), Path::new("."));
+        assert_eq!(
+            output_directory(Path::new("dest/out.zip")),
+            Path::new("dest")
+        );
+        assert_eq!(output_directory(Path::new("/out.zip")), Path::new("/"));
     }
 }

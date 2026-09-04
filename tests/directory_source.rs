@@ -409,6 +409,119 @@ fn the_output_is_named_after_the_directory_and_written_beside_it() {
     });
 }
 
+/// No resolved output lands inside a directory input, through either arm.
+///
+/// The default cannot, because it is written beside the directory; an explicit value can,
+/// and reaches in two ways — `-o vol1/out.zip` names a filename inside the input and
+/// `-o vol1/` names a location that joins to one — so the bound is on the resolved path. The
+/// comparison is canonical rather than lexical, which is what catches the `..` detour and a
+/// symbolic link pointing into the tree.
+///
+/// The link arm is unix-only for the reason this file already records above: creating one on
+/// Windows needs a privilege an ordinary test run does not have. The rule is not
+/// platform-specific; the fixture is, and the three link-free spellings still run there.
+#[test]
+fn no_explicit_output_is_written_inside_a_directory_input() {
+    let files = [("page1.jpg", page(400))];
+    with_tree("dir-inside", &files, |scratch, root| {
+        let link = scratch.join("link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root, &link).expect("links");
+
+        let mut requested = vec![
+            // The filename arm, reaching straight in.
+            root.join("out.zip").into_os_string(),
+            // The location arm, which joins to `vol1/vol1_resize.zip`.
+            {
+                let mut location = root.as_os_str().to_os_string();
+                location.push(std::path::MAIN_SEPARATOR_STR);
+                location
+            },
+            // Lexically outside, canonically inside.
+            root.join("..")
+                .join("vol1")
+                .join("out.zip")
+                .into_os_string(),
+        ];
+        if link.exists() {
+            requested.push(link.join("out.zip").into_os_string());
+        }
+
+        for value in requested {
+            let output = Command::new(BINARY)
+                .arg("-o")
+                .arg(&value)
+                .arg(root)
+                .output()
+                .expect("runs the binary");
+            let shown = value.to_string_lossy().into_owned();
+            assert!(!output.status.success(), "-o {shown} was accepted");
+            let message = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                message.contains("inside the input"),
+                "-o {shown} was refused for the wrong reason: {message}"
+            );
+            assert_eq!(
+                std::fs::read_dir(root).expect("reads").count(),
+                1,
+                "-o {shown} wrote into the input"
+            );
+        }
+
+        // And a value outside the tree is accepted, so the refusals above are not passing
+        // because every explicit value is refused.
+        let beside = scratch.join("beside.zip");
+        let status = Command::new(BINARY)
+            .arg("-o")
+            .arg(&beside)
+            .arg(root)
+            .status()
+            .expect("runs the binary");
+        assert!(status.success(), "an output beside the input was refused");
+        assert_eq!(read_archive(&beside).len(), 1);
+    });
+}
+
+/// `--delete-org` is refused for a directory input, before any page is read.
+///
+/// The pipeline reads the page files a directory holds and passes over everything else, so
+/// removing the input would take files it never read; widening it to a recursive delete would
+/// promise more than "delete the original". The reference tool attempts the removal, fails,
+/// logs it, and exits zero — a flag accepted and then ignored.
+#[test]
+fn deleting_the_original_is_refused_for_a_directory_input() {
+    let files = [
+        ("page1.jpg", page(400)),
+        ("ComicInfo.xml", b"<x/>".to_vec()),
+    ];
+    with_tree("dir-delete-org", &files, |scratch, root| {
+        let output = Command::new(BINARY)
+            .arg("--delete-org")
+            .arg(root)
+            .output()
+            .expect("runs the binary");
+        assert!(
+            !output.status.success(),
+            "--delete-org was accepted for a directory input"
+        );
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            message.contains("is a directory") && message.contains("not a tree"),
+            "the refusal does not say why: {message}"
+        );
+        assert!(root.is_dir(), "the input tree was removed");
+        assert_eq!(
+            std::fs::read_dir(root).expect("reads").count(),
+            2,
+            "the tree lost a file"
+        );
+        assert!(
+            !scratch.join("vol1_resize.zip").exists(),
+            "the refusal came after the output was written"
+        );
+    });
+}
+
 // ---------------------------------------------------------------- refusals at open
 
 /// Task 3.9. A directory with no pages is not an unrecognised format: it is an input that

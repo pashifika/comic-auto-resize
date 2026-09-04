@@ -697,20 +697,18 @@ fn valid_input(directory: &TempDir) -> std::path::PathBuf {
 /// accepted and ignored.
 ///
 /// `--charset` and `--pwd` were here until they were implemented, and moved into the list
-/// below in the same Change — the movement `--fix-idx` made before them.
+/// below in the same Change — the movement `--fix-idx` made before them, and the one
+/// `-o/--out` and `--delete-org` make now.
 #[test]
 fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
     let directory = TempDir::new("unknown-flags");
     let input = valid_input(&directory);
 
     for flag in [
-        "--delete-org",
         "--jobs",
         "-r",
         "--ratio",
         "--split",
-        "-o",
-        "--out",
         "--small-skip",
         "--optimizer",
         "--progressive",
@@ -739,13 +737,15 @@ fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
 /// `--help` lists exactly what exists, in both directions.
 #[test]
 fn help_lists_every_implemented_option_and_nothing_else() {
-    // The seven the tool implements, plus what clap adds for free.
+    // The nine the tool implements, plus what clap adds for free.
     let mut expected = vec![
         "auto-width".to_owned(),
         "charset".to_owned(),
         "dct".to_owned(),
+        "delete-org".to_owned(),
         "fix-idx".to_owned(),
         "help".to_owned(),
+        "out".to_owned(),
         "pwd".to_owned(),
         "quality".to_owned(),
         "resize-mode".to_owned(),
@@ -823,10 +823,13 @@ fn an_out_of_range_option_value_is_refused_before_any_work() {
 
 /// Each accepted flag that changes a page's *bytes* changes them in a way attributable to it.
 ///
-/// A flag that parses and then does nothing is the failure this guards against. The three
-/// that change entry *names* rather than page bytes are asserted where their rules live:
-/// `--fix-idx` in `tests/entry_naming.rs`, `--charset` and `--pwd` in
-/// `tests/entry_charset.rs`.
+/// A flag that parses and then does nothing is the failure this guards against. Nine flags
+/// exist and four of them change page bytes, so the other five are asserted where their rules
+/// live: `--fix-idx` in `tests/entry_naming.rs`, `--charset` and `--pwd` in
+/// `tests/entry_charset.rs`, and `-o`/`--delete-org` — which change neither page bytes nor
+/// entry names, only where the output goes and whether the input survives — in
+/// `an_output_value_resolves_as_a_location_or_as_a_filename` and
+/// `the_input_is_removed_only_after_the_output_is_in_place` below.
 #[test]
 fn every_accepted_flag_changes_the_output() {
     fn run_with(args: &[&str], label: &str) -> Vec<u8> {
@@ -866,5 +869,691 @@ fn every_accepted_flag_changes_the_output() {
             "{args:?} changed the geometry"
         );
         assert_ne!(changed, baseline, "{args:?} did not change the output");
+    }
+}
+
+// ---------------------------------------------------------------- the output path
+
+/// A value naming a location is joined with the default name; a value naming anything else
+/// is the output path exactly.
+///
+/// The two arms are the boundary of what the tool takes responsibility for, so both are
+/// asserted against the file that appears rather than against the message. A fresh input per
+/// case, because a case that succeeds leaves an output behind.
+#[test]
+fn an_output_value_resolves_as_a_location_or_as_a_filename() {
+    // A trailing separator selects the location arm, and it has to be read before the value
+    // becomes a `Path`, which normalises it away.
+    let separators = TempDir::new("out-location");
+    let input = valid_input(&separators);
+    let destination = separators.join("dest");
+    fs::create_dir(&destination).expect("creates the destination");
+    let mut trailing = destination.clone().into_os_string();
+    trailing.push(std::path::MAIN_SEPARATOR_STR);
+    let status = Command::new(BINARY)
+        .arg("-o")
+        .arg(&trailing)
+        .arg(&input)
+        .status()
+        .expect("runs the binary");
+    assert!(status.success(), "a trailing separator was refused");
+    assert!(
+        destination.join("in_resize.zip").exists(),
+        "a location did not get the default name joined to it"
+    );
+
+    // An existing directory is a location without one.
+    let existing = TempDir::new("out-existing-dir");
+    let input = valid_input(&existing);
+    let destination = existing.join("dest");
+    fs::create_dir(&destination).expect("creates the destination");
+    let status = Command::new(BINARY)
+        .arg("-o")
+        .arg(&destination)
+        .arg(&input)
+        .status()
+        .expect("runs the binary");
+    assert!(status.success(), "an existing directory was refused");
+    assert!(
+        destination.join("in_resize.zip").exists(),
+        "an existing directory did not get the default name joined to it"
+    );
+
+    // The name joined to a location is the *default* name, so the input's extension is gone
+    // rather than preserved or re-appended. This is the one regression the new resolution
+    // code can cause: the reference tool writes `in.cbz` as `in_resize.cbz.zip`, and an
+    // implementation that reached for `file_name` instead of `file_stem` would too.
+    let carried = TempDir::new("out-location-stem");
+    let input = carried.join("in.cbz");
+    write_pages(&input, 1, 320, 440);
+    let destination = carried.join("dest");
+    fs::create_dir(&destination).expect("creates the destination");
+    let status = Command::new(BINARY)
+        .arg("-o")
+        .arg(&destination)
+        .arg(&input)
+        .status()
+        .expect("runs the binary");
+    assert!(status.success(), "a `.cbz` input was refused");
+    assert_eq!(
+        fs::read_dir(&destination)
+            .expect("reads")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect::<Vec<_>>(),
+        vec![std::ffi::OsString::from("in_resize.zip")],
+        "the location arm did not drop the input's extension"
+    );
+
+    // Anything else is a filename, verbatim: no extension appended, replaced or validated.
+    // `out.cbz` is a zip archive called `out.cbz`, and `out` has no extension at all. The
+    // bare `out.zip` is the commonest spelling and the one whose `Path::parent` is the empty
+    // path, so it is the only case that exercises the "no directory component" arm of the
+    // missing-directory check — run from the input's own directory to make it bare.
+    for name in ["out.cbz", "out", "out.zip"] {
+        let directory = TempDir::new("out-verbatim");
+        let input = valid_input(&directory);
+        let bare = name == "out.zip";
+        let mut command = Command::new(BINARY);
+        command.current_dir(directory.path()).arg("-o");
+        if bare {
+            command.arg(name).arg("in.zip");
+        } else {
+            command.arg(directory.join(name)).arg(&input);
+        }
+        let output = command.output().expect("runs the binary");
+        assert!(
+            output.status.success(),
+            "-o {name} was refused: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let requested = directory.join(name);
+        assert_eq!(
+            read_archive(&requested).len(),
+            1,
+            "-o {name} is not a one-page zip"
+        );
+        assert!(
+            !directory.join(&format!("{name}.zip")).exists(),
+            "-o {name} had `.zip` appended, which is the reference tool's behaviour"
+        );
+        assert!(
+            !default_output(&input).exists(),
+            "-o {name} wrote the default name as well"
+        );
+    }
+}
+
+/// The directory to write into must already exist, through either arm, and the refusal names
+/// the directory rather than the value.
+///
+/// Creating it is declined, and the containment check needs a path that canonicalises, which
+/// a directory that is not there has none of.
+#[test]
+fn a_missing_output_directory_is_refused_and_named() {
+    for (label, file) in [("missing-filename", "out.zip"), ("missing-location", "")] {
+        let directory = TempDir::new(label);
+        let input = valid_input(&directory);
+        // `nowhere/out.zip` for the filename arm, and `nowhere/` for the location arm.
+        let mut requested = directory.join("nowhere").into_os_string();
+        requested.push(std::path::MAIN_SEPARATOR_STR);
+        requested.push(file);
+        let output = Command::new(BINARY)
+            .arg("-o")
+            .arg(&requested)
+            .arg(&input)
+            .output()
+            .expect("runs the binary");
+        assert!(!output.status.success(), "{label} was accepted");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            message.contains("nowhere") && message.contains("no such directory"),
+            "{label} did not name the missing directory: {message}"
+        );
+        assert!(
+            !directory.join("nowhere").exists(),
+            "{label} created the directory"
+        );
+        assert!(
+            !default_output(&input).exists(),
+            "{label} fell back to the default name"
+        );
+    }
+
+    // An empty value is neither arm: it names no directory to join a default name to and no
+    // file to use verbatim, so it is refused rather than resolved to something unprintable.
+    let directory = TempDir::new("empty-out");
+    let input = valid_input(&directory);
+    let output = Command::new(BINARY)
+        .arg("-o")
+        .arg("")
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(!output.status.success(), "an empty -o was accepted");
+    assert!(
+        !default_output(&input).exists(),
+        "an empty -o wrote an output"
+    );
+}
+
+/// The existing-path refusal follows the resolved path, not the default one.
+///
+/// Go tests the raw `-o` value in its flag parser, so `-o out` passes its check and then
+/// truncates an existing `out.zip`. Here the path that gets written is the path that is
+/// checked — and the check runs before a thread starts, so the file it refused is untouched.
+#[test]
+fn the_existing_path_refusal_follows_the_resolved_path() {
+    // The filename arm, against a file the default name would never have collided with.
+    let directory = TempDir::new("resolved-exists");
+    let input = valid_input(&directory);
+    let taken = directory.join("out");
+    fs::write(&taken, b"not an archive").expect("writes the obstacle");
+    let output = Command::new(BINARY)
+        .arg("-o")
+        .arg(&taken)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(!output.status.success(), "an existing -o path was accepted");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already exists"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(&taken).expect("reads"),
+        b"not an archive",
+        "the existing file was disturbed"
+    );
+
+    // The location arm resolves to the default name inside the destination, so that is the
+    // path the refusal is about.
+    let destination = directory.join("dest");
+    fs::create_dir(&destination).expect("creates the destination");
+    let occupied = destination.join("in_resize.zip");
+    fs::write(&occupied, b"already here").expect("writes the obstacle");
+    let output = Command::new(BINARY)
+        .arg("-o")
+        .arg(&destination)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&occupied).expect("reads"), b"already here");
+}
+
+/// An output path whose entry cannot be queried stops the run, naming that path.
+///
+/// "Cannot tell" is not "not there": the query needs read-attributes on the output, while the
+/// `create_new` that follows needs add-child on its *directory*, and those are distinct rights
+/// on both targets. Reading a query error as absence would let the run create the partial and
+/// then rename over the very entry the refusal protects, because rename replaces its
+/// destination.
+///
+/// The discriminator is which path the message names. Refusing on the query names the output;
+/// falling through to `create_new` would name `<output>.part`, an internal name no requirement
+/// mentions.
+#[cfg(unix)]
+#[test]
+fn an_output_path_that_cannot_be_queried_stops_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new("opaque-output");
+    let input = valid_input(&directory);
+    let opaque = directory.join("opaque");
+    fs::create_dir(&opaque).expect("creates the output's directory");
+    let requested = opaque.join("out.zip");
+
+    let original = fs::metadata(&opaque).expect("reads").permissions();
+    fs::set_permissions(&opaque, PermissionsExt::from_mode(0o644)).expect("drops the traverse bit");
+    let output = Command::new(BINARY)
+        .arg("-o")
+        .arg(&requested)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    fs::set_permissions(&opaque, original).expect("restores the directory");
+
+    assert!(
+        !output.status.success(),
+        "an unqueryable output was accepted"
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("out.zip") && !message.contains(".part"),
+        "the refusal did not come from the query on the output itself: {message}"
+    );
+    assert!(
+        !default_output(&input).exists(),
+        "the run fell back to the default name"
+    );
+}
+
+/// `--delete-org` on a path that is simply absent reports the missing input.
+///
+/// Absence is the one query failure that falls through, so that opening the input produces the
+/// error the user needs rather than a complaint about identifying a path that is not there.
+#[test]
+fn deleting_an_absent_input_reports_the_missing_input() {
+    let directory = TempDir::new("delete-org-absent-input");
+    let output = Command::new(BINARY)
+        .arg("--delete-org")
+        .arg(directory.join("nothing-here.zip"))
+        .output()
+        .expect("runs the binary");
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !message.contains("cannot be identified"),
+        "an absent input was reported as unidentifiable: {message}"
+    );
+    assert!(
+        message.contains("nothing-here.zip"),
+        "the missing input is not named: {message}"
+    );
+}
+
+/// The input is removed once the output is in place, and not before.
+#[test]
+fn the_input_is_removed_only_after_the_output_is_in_place() {
+    let directory = TempDir::new("delete-org");
+    let input = valid_input(&directory);
+    let output = Command::new(BINARY)
+        .arg("--delete-org")
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(default_output(&input).exists(), "no output was written");
+    assert!(!input.exists(), "the input survived --delete-org");
+
+    // One line, and the removal named on it.
+    let line = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(line.lines().count(), 1, "still one line: {line}");
+    assert!(
+        line.contains("removed"),
+        "the removal is not reported: {line}"
+    );
+
+    // And the other direction, which is the half that makes "exactly when" a claim: a run
+    // without the flag prints what it always printed. The compositing note set this rule and
+    // is asserted both ways in `tests/image_pages.rs`; this clause follows it.
+    let kept = TempDir::new("delete-org-absent");
+    let input = valid_input(&kept);
+    let output = Command::new(BINARY)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(output.status.success());
+    let line = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(line.lines().count(), 1, "still one line: {line}");
+    assert!(
+        !line.contains("removed"),
+        "a run without the flag reported a removal: {line}"
+    );
+    assert!(input.exists(), "the input went without the flag");
+
+    // A run that fails after the source was opened leaves the input alone. An archive
+    // holding no page this build can read reaches that state: the source opened, the entries
+    // were walked, and there was nothing to write.
+    let directory = TempDir::new("delete-org-failed");
+    let empty = directory.join("empty.zip");
+    write_archive(
+        &empty,
+        &[("ComicInfo.xml".to_owned(), b"<ComicInfo/>".to_vec())],
+    );
+    let output = Command::new(BINARY)
+        .arg("--delete-org")
+        .arg(&empty)
+        .output()
+        .expect("runs the binary");
+    assert!(
+        !output.status.success(),
+        "a page-less archive reported success"
+    );
+    assert!(empty.exists(), "a failed run removed the input");
+}
+
+/// An output resolving onto the input is refused by *existence*, not by an equality test.
+///
+/// The input necessarily exists by the time the output is resolved, because `Source::open`
+/// succeeded first, so `path.exists()` catches every spelling of it. Two spellings equality
+/// would miss are asserted here: a relative path, and — where the filesystem is
+/// case-insensitive, which both release targets default to — a case variant.
+#[test]
+fn an_output_equal_to_the_input_is_refused_however_it_is_spelled() {
+    let directory = TempDir::new("self-destruct");
+    let input = valid_input(&directory);
+    let name = input
+        .file_name()
+        .expect("a name")
+        .to_str()
+        .expect("ASCII")
+        .to_owned();
+
+    let mut spellings = vec![format!(".{}{name}", std::path::MAIN_SEPARATOR)];
+    // Probed rather than assumed: a case-sensitive volume exists on both platforms, and the
+    // claim is about the filesystem the run is on.
+    let probe = directory.join("Probe");
+    fs::write(&probe, b"").expect("writes the probe");
+    if directory.join("probe").exists() {
+        spellings.push(name.to_uppercase());
+    }
+    fs::remove_file(&probe).expect("removes the probe");
+
+    for spelling in spellings {
+        let output = Command::new(BINARY)
+            .current_dir(directory.path())
+            .arg("--delete-org")
+            .arg("-o")
+            .arg(&spelling)
+            .arg(&name)
+            .output()
+            .expect("runs the binary");
+        assert!(!output.status.success(), "-o {spelling} was accepted");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            message.contains("already exists"),
+            "-o {spelling} was refused for the wrong reason: {message}"
+        );
+        assert!(input.exists(), "-o {spelling} destroyed the input");
+    }
+}
+
+/// A dangling symbolic link at the resolved path is an entry, so the output is refused.
+///
+/// `Path::exists` follows the final link and answers false for a broken one, which would have
+/// let the rename replace the link. The requirement is that the resolved path must not already
+/// exist, and a broken link exists.
+#[cfg(unix)]
+#[test]
+fn a_dangling_link_at_the_resolved_path_is_refused_rather_than_replaced() {
+    let directory = TempDir::new("dangling-out");
+    let input = valid_input(&directory);
+    let requested = directory.join("out.zip");
+    std::os::unix::fs::symlink(directory.join("nothing-here"), &requested).expect("links");
+
+    let output = Command::new(BINARY)
+        .arg("-o")
+        .arg(&requested)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(!output.status.success(), "a dangling link was written over");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already exists"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::symlink_metadata(&requested)
+            .expect("the link survives")
+            .file_type()
+            .is_symlink(),
+        "the link was replaced"
+    );
+}
+
+/// `--delete-org` is refused for a symbolic-link input, before any page is read.
+///
+/// `Source::open` follows the link and reads the archive it points at, while
+/// `fs::remove_file` would unlink the link and leave that archive in place — the flag
+/// reporting that it removed the input archive while the archive is still there. The bare run
+/// is asserted too, so the refusal is attributable to the flag rather than to the link.
+#[cfg(unix)]
+#[test]
+fn deleting_the_original_is_refused_for_a_symbolic_link_input() {
+    let directory = TempDir::new("delete-org-link");
+    let input = valid_input(&directory);
+    let link = directory.join("link.zip");
+    std::os::unix::fs::symlink(&input, &link).expect("links");
+
+    let output = Command::new(BINARY)
+        .arg("--delete-org")
+        .arg(&link)
+        .output()
+        .expect("runs the binary");
+    assert!(!output.status.success(), "--delete-org followed a link");
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("symbolic link"),
+        "the refusal does not say why: {message}"
+    );
+    assert!(input.exists(), "the archive the link pointed at is gone");
+    assert!(
+        fs::symlink_metadata(&link).is_ok(),
+        "the link itself was removed"
+    );
+    assert!(
+        !default_output(&link).exists(),
+        "the refusal came after the output was written"
+    );
+
+    // Without the flag the link is an ordinary input and the run succeeds.
+    let status = Command::new(BINARY)
+        .arg(&link)
+        .status()
+        .expect("runs the binary");
+    assert!(status.success(), "a link is a valid input without the flag");
+    assert!(default_output(&link).exists());
+}
+
+/// A removal that fails names both the output that was written and the input that survived.
+///
+/// Without both facts the obvious retry meets the existing-output refusal and reports a
+/// second, unrelated failure. The output goes outside the input's directory, because the
+/// directory is what is made unwritable to deny the removal.
+///
+/// `written, but the input` is asserted rather than just the two paths, because the sibling
+/// variant `OutputNotDurable` also formats both of them; without a discriminating substring
+/// this would pass for either, and neither would be pinned.
+#[test]
+fn a_removal_that_fails_names_the_output_and_the_surviving_input() {
+    let directory = TempDir::new("delete-org-denied");
+    let held = directory.join("held");
+    fs::create_dir(&held).expect("creates the input's directory");
+    let input = held.join("in.zip");
+    write_pages(&input, 1, 320, 440);
+    let requested = directory.join("out.zip");
+
+    // Two ways to deny an unlink, because the platforms do not share one.
+    //
+    // On unix the permission that matters is the *parent's* write bit; a read-only file
+    // unlinks fine. On Windows the read-only attribute is not a denial either — `remove_file`
+    // clears it and retries, which is what makes the two platforms agree — so the denial there
+    // is a sharing violation: the fixture holds the input open with `share_mode` set to
+    // `FILE_SHARE_READ` alone, which still lets the run open and read the archive and refuses
+    // the delete, because that needs `FILE_SHARE_DELETE`. Either way the archive stays
+    // readable, so the run reaches the removal rather than failing earlier.
+    let restore: Box<dyn FnOnce()> = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let original = fs::metadata(&held).expect("reads").permissions();
+            fs::set_permissions(&held, PermissionsExt::from_mode(0o500))
+                .expect("locks the directory");
+            let held = held.clone();
+            Box::new(move || {
+                fs::set_permissions(&held, original).expect("restores the directory");
+            })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            let held_open = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&input)
+                .expect("holds the input open");
+            Box::new(move || drop(held_open))
+        }
+    };
+    let output = Command::new(BINARY)
+        .arg("--delete-org")
+        .arg("-o")
+        .arg(&requested)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    restore();
+
+    assert!(
+        !output.status.success(),
+        "a failed removal reported success"
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("written, but the input")
+            && message.contains("out.zip")
+            && message.contains("in.zip"),
+        "the refusal does not name both paths as a failed removal: {message}"
+    );
+    assert!(requested.exists(), "the output was not written");
+    assert!(input.exists(), "the input is gone after a failed removal");
+}
+
+/// A flush that fails abandons the removal, and the input survives.
+///
+/// This is the guard between a power loss and the total loss of the book, so it is asserted
+/// rather than reasoned about. `fsync` on a healthy file cannot be made to fail, but the open
+/// in front of it can: the archive is created with mode `0o666` before the umask, so a run
+/// under `umask 0777` produces a mode `0o000` file that its own creator cannot reopen. The
+/// umask is set by the shell rather than by this process, because it is per-process state and
+/// the test harness is threaded.
+#[cfg(unix)]
+#[test]
+fn a_flush_that_fails_abandons_the_removal() {
+    let directory = TempDir::new("delete-org-undurable");
+    let input = valid_input(&directory);
+    let requested = directory.join("out.zip");
+    let script = format!(
+        "umask 0777; exec {} --delete-org -o {} {}",
+        BINARY,
+        requested.display(),
+        input.display()
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("runs the binary through a shell");
+
+    assert!(
+        !output.status.success(),
+        "an unflushable output reported success"
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("could not be flushed to disk")
+            && message.contains("out.zip")
+            && message.contains("in.zip"),
+        "the refusal does not name the flush and both paths: {message}"
+    );
+    assert!(
+        input.exists(),
+        "the input was removed although the output was never flushed"
+    );
+    assert!(requested.exists(), "the output was not written at all");
+}
+
+/// An input whose own entry cannot be queried is not deleted.
+///
+/// The query that fails is the one distinguishing a symbolic link from the archive it points
+/// at, so treating its failure as "an ordinary file" would put the flag back where it started.
+/// A parent without the traverse bit is what denies it: `lstat` of a known child needs `x` on
+/// the directory, and the same run without the flag is asserted to show the refusal is the
+/// flag's rather than the permission's.
+#[cfg(unix)]
+#[test]
+fn an_input_whose_kind_cannot_be_established_is_not_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new("delete-org-opaque");
+    let held = directory.join("held");
+    fs::create_dir(&held).expect("creates the input's directory");
+    let input = held.join("in.zip");
+    write_pages(&input, 1, 320, 440);
+
+    let original = fs::metadata(&held).expect("reads").permissions();
+    fs::set_permissions(&held, PermissionsExt::from_mode(0o644)).expect("drops the traverse bit");
+    let refused = Command::new(BINARY)
+        .arg("--delete-org")
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    let without = Command::new(BINARY)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    fs::set_permissions(&held, original).expect("restores the directory");
+
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("cannot be identified"),
+        "the refusal is not the flag's: {message}"
+    );
+    assert!(input.exists(), "an unidentifiable input was removed");
+
+    // Without the flag the same permission reaches the user as an ordinary open failure, so
+    // the refusal above is attributable to `--delete-org` and not to the directory.
+    assert!(!without.status.success());
+    assert!(
+        !String::from_utf8_lossy(&without.stderr).contains("cannot be identified"),
+        "a run without the flag raised the flag's refusal"
+    );
+}
+
+/// Both new flags' help states what they resolve to rather than what they are called.
+///
+/// The list test compares option names only, so it cannot catch a description that loses its
+/// rule — and `error-presentation` will rewrite this text in a later Change. `--fix-idx`,
+/// `--charset` and `--pwd` each set this precedent in their own suites.
+#[test]
+fn the_output_and_delete_flags_help_states_what_they_resolve_to() {
+    let help = String::from_utf8(
+        Command::new(BINARY)
+            .arg("--help")
+            .output()
+            .expect("runs the binary")
+            .stdout,
+    )
+    .expect("help is UTF-8");
+
+    // Split on the flag name first, as the three precedents do: asserting against the whole
+    // help output would pass if a clause migrated into another flag's description, into the
+    // positional's, or into the command's `about` line — and `error-presentation` rewriting
+    // this text in a later Change is exactly the edit that could move one without deleting it.
+    let description = |flag: &str| {
+        let at = help
+            .find(flag)
+            .unwrap_or_else(|| panic!("`{flag}` is not in the help: {help}"));
+        let rest = &help[at + flag.len()..];
+        // Every option's description ends where the next option's `      --` begins.
+        rest.find("\n      -")
+            .map_or(rest, |end| &rest[..end])
+            .to_owned()
+    };
+
+    // `-o`: which value selects the location arm, and that a filename is not extended.
+    let out = description("-o, --out");
+    for clause in ["path separator", "existing directory", "verbatim"] {
+        assert!(
+            out.contains(clause),
+            "`-o`'s own description does not say `{clause}`: {out}"
+        );
+    }
+    // `--delete-org`: that the removal happens only once the output is in place.
+    let delete = description("--delete-org ");
+    for clause in ["once the output archive is in place", "if the run failed"] {
+        assert!(
+            delete.contains(clause),
+            "`--delete-org`'s own description does not say `{clause}`: {delete}"
+        );
     }
 }

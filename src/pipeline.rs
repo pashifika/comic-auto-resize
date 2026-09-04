@@ -337,8 +337,13 @@ pub fn run<S: Entries + Send>(
     let (work_tx, work_rx) = bounded::<Job>(capacities.work);
     let (done_tx, done_rx) = bounded::<Result<Finished, PageError>>(capacities.done);
 
-    // Created before any thread starts, so an existing output is refused without reading a
-    // single entry.
+    // Created before any worker or reader thread starts, so an existing output is refused
+    // before a single entry is *written* and, for every reader but one, before a single entry
+    // is read. The exception is 7z: `SevenzSource::new` spawns its decoder when the source is
+    // opened, and that thread reads its first entry before the rendezvous send, so by the time
+    // this line runs a page can already be in memory. Nothing is written either way; the claim
+    // is narrowed rather than dropped because the refusal's value is that it costs no work,
+    // and for 7z it costs one page.
     let mut sink = Sink::create(output)?;
 
     let outcome = thread::scope(|scope| {
@@ -572,6 +577,17 @@ pub enum RunError {
     /// resolved, so `.` is the directory the user is standing in rather than this case.
     #[error("{}: cannot name an output for a directory with no name of its own", path.display())]
     UnnamedInput { path: PathBuf },
+    /// `-o` named a directory to write into that is not there. Creating it is declined, and
+    /// the containment check below needs a path that canonicalises, which a directory that
+    /// does not exist has none of. Names the directory rather than the value, because the
+    /// value may have been a filename whose parent is the missing part.
+    #[error("{}: no such directory to write the output into", path.display())]
+    MissingOutputDirectory { path: PathBuf },
+    /// The resolved output would land inside a directory input, within the set of files the
+    /// input describes, where the next run would read it as a page. Reachable through both of
+    /// `-o`'s arms, so the bound is on the resolved path rather than on the value.
+    #[error("{}: would be written inside the input {}", path.display(), input.display())]
+    OutputInsideInput { path: PathBuf, input: PathBuf },
 }
 
 #[cfg(test)]
