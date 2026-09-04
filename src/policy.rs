@@ -319,12 +319,17 @@ mod tests {
     /// actually used and `1400 × 0.5` rounds to 700 from the source.
     ///
     /// Deliberate, and the dominant arm rather than the exotic one — but the census has to be
-    /// taken over the ratios the reference tool actually multiplies. Its `Resize` returns the
+    /// taken over ratios the reference tool actually multiplies. Its `Resize` returns the
     /// source at 100 per cent, and at exactly 70 it either passes the page through or replaces
     /// the ratio with `1280 / width`, so a figure that includes 70 describes arithmetic it
-    /// never performs. Over every integer width and height from 200 to 4,000 at 30 and 50 per
-    /// cent — 28,895,202 pages — the widths agree on **every one** and the heights differ on
-    /// **24.91%**. So on the ratios both builds compute, the whole divergence is the height.
+    /// never performs. Over every integer width and height from 200 to 4,000 **at 30 and 50
+    /// per cent** — 28,895,202 pages — the widths agree on every one and the heights differ on
+    /// **24.91%**, so at those two ratios the height is the whole of the divergence.
+    ///
+    /// That is a statement about those two ratios and not about every ratio the reference tool
+    /// multiplies: the width arm above is reachable at other non-special ratios, 1430 at 35
+    /// per cent and 875 at 58 being the recorded cases. 30 and 50 happen to be tie-free in
+    /// binary for every width in the grid, which is why the width column is clean there.
     ///
     /// One authoritative height is what the policy, the scaled decode and the resampler all
     /// read, and two independently rounded axes would be two chances to disagree about the
