@@ -1294,6 +1294,11 @@ fn a_removal_that_fails_names_the_output_and_the_surviving_input() {
     // fine; on Windows it is the file's own read-only attribute, and `DeleteFileW` fails
     // with access denied. Either way the archive stays readable, so the run reaches the
     // removal rather than failing earlier.
+    //
+    // Both arms restore a snapshot taken before the change rather than clearing the bit they
+    // set: `set_readonly(false)` is world-writable on unix and `clippy::all` refuses it even
+    // inside a `#[cfg(windows)]` block, and restoring what was there is the more honest
+    // teardown anyway — on Windows a file left read-only cannot be removed with the `TempDir`.
     let restore: Box<dyn FnOnce()> = {
         #[cfg(unix)]
         {
@@ -1308,14 +1313,13 @@ fn a_removal_that_fails_names_the_output_and_the_surviving_input() {
         }
         #[cfg(windows)]
         {
-            let mut locked = fs::metadata(&input).expect("reads").permissions();
+            let original = fs::metadata(&input).expect("reads").permissions();
+            let mut locked = original.clone();
             locked.set_readonly(true);
             fs::set_permissions(&input, locked).expect("locks the input");
             let input = input.clone();
             Box::new(move || {
-                let mut writable = fs::metadata(&input).expect("reads").permissions();
-                writable.set_readonly(false);
-                fs::set_permissions(&input, writable).expect("restores the input");
+                fs::set_permissions(&input, original).expect("restores the input");
             })
         }
     };
