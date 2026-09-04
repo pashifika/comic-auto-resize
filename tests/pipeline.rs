@@ -1289,16 +1289,15 @@ fn a_removal_that_fails_names_the_output_and_the_surviving_input() {
     write_pages(&input, 1, 320, 440);
     let requested = directory.join("out.zip");
 
-    // Two ways to deny an unlink, because the platforms do not share one. On unix the
-    // permission that matters is the *parent's* write bit, and a read-only file unlinks
-    // fine; on Windows it is the file's own read-only attribute, and `DeleteFileW` fails
-    // with access denied. Either way the archive stays readable, so the run reaches the
-    // removal rather than failing earlier.
+    // Two ways to deny an unlink, because the platforms do not share one.
     //
-    // Both arms restore a snapshot taken before the change rather than clearing the bit they
-    // set: `set_readonly(false)` is world-writable on unix and `clippy::all` refuses it even
-    // inside a `#[cfg(windows)]` block, and restoring what was there is the more honest
-    // teardown anyway — on Windows a file left read-only cannot be removed with the `TempDir`.
+    // On unix the permission that matters is the *parent's* write bit; a read-only file
+    // unlinks fine. On Windows the read-only attribute is not a denial either — `remove_file`
+    // clears it and retries, which is what makes the two platforms agree — so the denial there
+    // is a sharing violation: the fixture holds the input open with `share_mode` set to
+    // `FILE_SHARE_READ` alone, which still lets the run open and read the archive and refuses
+    // the delete, because that needs `FILE_SHARE_DELETE`. Either way the archive stays
+    // readable, so the run reaches the removal rather than failing earlier.
     let restore: Box<dyn FnOnce()> = {
         #[cfg(unix)]
         {
@@ -1313,14 +1312,14 @@ fn a_removal_that_fails_names_the_output_and_the_surviving_input() {
         }
         #[cfg(windows)]
         {
-            let original = fs::metadata(&input).expect("reads").permissions();
-            let mut locked = original.clone();
-            locked.set_readonly(true);
-            fs::set_permissions(&input, locked).expect("locks the input");
-            let input = input.clone();
-            Box::new(move || {
-                fs::set_permissions(&input, original).expect("restores the input");
-            })
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            let held_open = fs::OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ)
+                .open(&input)
+                .expect("holds the input open");
+            Box::new(move || drop(held_open))
         }
     };
     let output = Command::new(BINARY)
