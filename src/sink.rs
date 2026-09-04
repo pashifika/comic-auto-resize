@@ -540,14 +540,15 @@ mod tests {
         }
     }
 
-    /// The flush reports a failure rather than swallowing one.
+    /// The flush reports a failure rather than swallowing one, and the flush is what is tested.
     ///
-    /// This is the whole of what the caller needs: a run that is about to remove the user's
-    /// only other copy must not proceed on a barrier that quietly did nothing. `fsync` on a
-    /// healthy file cannot be made to fail portably, so the reachable half is the open, and
-    /// the two arms below are "the archive is there" and "it is not".
+    /// The first two arms only exercise the *open*, so a regression that deleted `sync_all`
+    /// outright would keep passing them — review found exactly that. The third arm closes it:
+    /// `/dev/null` opens and then refuses to be flushed, so it is the seam where the open
+    /// succeeds and only the barrier fails. Without the `sync_all` call this arm returns `Ok`
+    /// and the test goes red, which is the property the other two cannot have.
     #[test]
-    fn the_durability_barrier_succeeds_on_a_written_archive_and_fails_without_one() {
+    fn the_durability_barrier_flushes_and_reports_a_flush_that_fails() {
         let scratch = std::env::temp_dir().join(format!(
             "comic-auto-resize-durable-{}-{:?}",
             std::process::id(),
@@ -562,6 +563,19 @@ mod tests {
         let missing = scratch.join("gone.zip");
         let error = durable(&missing).expect_err("a path with no file must not report success");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+
+        // The barrier itself, isolated from the open. A character device accepts the open and
+        // rejects the flush, so this is the one arm a no-op barrier cannot pass.
+        #[cfg(unix)]
+        {
+            let unflushable = durable(Path::new("/dev/null"))
+                .expect_err("a barrier that cannot flush must not report success");
+            assert_ne!(
+                unflushable.kind(),
+                std::io::ErrorKind::NotFound,
+                "the failure came from the open rather than the flush: {unflushable}"
+            );
+        }
 
         std::fs::remove_dir_all(&scratch).expect("removes the scratch directory");
     }

@@ -337,8 +337,13 @@ pub fn run<S: Entries + Send>(
     let (work_tx, work_rx) = bounded::<Job>(capacities.work);
     let (done_tx, done_rx) = bounded::<Result<Finished, PageError>>(capacities.done);
 
-    // Created before any thread starts, so an existing output is refused without reading a
-    // single entry.
+    // Created before any worker or reader thread starts, so an existing output is refused
+    // before a single entry is *written* and, for every reader but one, before a single entry
+    // is read. The exception is 7z: `SevenzSource::new` spawns its decoder when the source is
+    // opened, and that thread reads its first entry before the rendezvous send, so by the time
+    // this line runs a page can already be in memory. Nothing is written either way; the claim
+    // is narrowed rather than dropped because the refusal's value is that it costs no work,
+    // and for 7z it costs one page.
     let mut sink = Sink::create(output)?;
 
     let outcome = thread::scope(|scope| {
