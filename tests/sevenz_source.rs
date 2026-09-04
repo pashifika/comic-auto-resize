@@ -576,7 +576,7 @@ fn a_7z_with_no_page_reports_that_rather_than_writing_an_empty_archive() {
 fn settings() -> pipeline::Settings {
     pipeline::Settings {
         jobs: std::num::NonZeroUsize::new(2).expect("non-zero"),
-        target_width: comic_auto_resize::policy::AUTO_WIDTH,
+        target: comic_auto_resize::policy::Target::Width(comic_auto_resize::policy::AUTO_WIDTH),
         filter: comic_auto_resize::page::Filter::default(),
         decode: comic_auto_resize::page::DecodeSettings::default(),
         encode: comic_auto_resize::page::EncodeSettings::default(),

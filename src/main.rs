@@ -2,12 +2,17 @@
 //!
 //! The surface contains exactly what is implemented. A flag may exist and be unimplemented,
 //! or not exist; it must not exist and silently do the wrong thing — so the flags Go had and
-//! this build does not (`-r/--ratio`, `--small-skip`, `--optimizer`, `--progressive`) are
-//! absent rather than accepted and ignored. Absence is the honest form of "not yet".
+//! this build does not (`--small-skip`, `--optimizer`, `--progressive`) are absent rather
+//! than accepted and ignored. Absence is the honest form of "not yet".
 //!
 //! `--fix-idx` was the first flag added since the rewrite began; `--charset` and `--pwd`
-//! joined it, and `-o/--out` and `--delete-org` join now, each in the Change that implements
-//! it — which is that rule read the other way round.
+//! joined it, then `-o/--out` and `--delete-org`, and `-r/--ratio` and `--jobs` join now,
+//! each in the Change that implements it — which is that rule read the other way round.
+//!
+//! `--jobs` is the one flag here with no reference-tool equivalent: the Go implementation
+//! derives its worker count from the host and offers no way to say otherwise. `-r/--ratio`
+//! is the one whose meaning deliberately diverges, and its help says so, because that is
+//! where the user who needs to know is looking.
 //!
 //! `--charset` is the first flag whose default is not "off", and the asymmetry is the point:
 //! `--fix-idx` defaults to off because the default path is *correct* and renaming is a
@@ -26,7 +31,7 @@ use std::thread;
 use clap::{Parser, builder::TypedValueParser};
 use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter};
 use comic_auto_resize::pipeline::{self, Report, Settings};
-use comic_auto_resize::policy::AUTO_WIDTH;
+use comic_auto_resize::policy::{AUTO_WIDTH, Target};
 use comic_auto_resize::sink::{InputKind, durable_directory_entry, resolve_output};
 use comic_auto_resize::source::{Charset, DEFAULT_LABELS, Naming, ReadOptions, Source};
 use thiserror::Error;
@@ -71,6 +76,20 @@ struct Cli {
     )]
     auto_width: u32,
 
+    /// Reduce every page to this percentage of its own width, 1 to 100; the height follows
+    /// the page's aspect ratio. Cannot be given with `--auto-width`, which names the same
+    /// quantity absolutely. The reference tool's `-r 70` does *not* mean seventy per cent —
+    /// it normalises to 1280 — and normalising to 1280 is what this tool does when told
+    /// nothing, so an invocation that carried `-r 70` wants no flag at all.
+    #[arg(
+        short,
+        long,
+        conflicts_with = "auto_width",
+        value_parser = clap::value_parser!(u8).range(1..=100),
+        value_name = "PERCENT",
+    )]
+    ratio: Option<u8>,
+
     /// Encoder quality, 1 to 100.
     #[arg(
         short,
@@ -112,6 +131,13 @@ struct Cli {
     /// `AES-256`, are refused by name rather than read.
     #[arg(long, value_name = "PASSWORD")]
     pwd: Option<String>,
+
+    /// How many pages are decoded, resized and encoded at once. Peak memory scales with
+    /// this: roughly the worker count times the largest page's decoded working set, which
+    /// measured 2.59 GB for nine workers on nine 4608x7281 webp pages. Lower it on a machine
+    /// that cannot spare that; the full term is in `src/pipeline.rs`.
+    #[arg(long, default_value_t = worker_count(), value_name = "COUNT")]
+    jobs: NonZeroUsize,
 }
 
 fn main() -> ExitCode {
@@ -119,13 +145,28 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok((report, output)) => {
             // One line for the run, and each extra clause only when the extra thing
-            // happened: a run that composited nothing and removed nothing prints exactly
-            // what it printed before either rule existed. A line per page would bury the
-            // page count on a real archive.
-            let composited = if report.composited > 0 {
-                format!(" ({} page(s) composited onto white)", report.composited)
-            } else {
+            // happened: a run that composited nothing, refused nothing and removed nothing
+            // prints exactly what it printed before any of those rules existed. A line per
+            // page would bury the page count on a real archive.
+            let mut notes = Vec::new();
+            if report.composited > 0 {
+                notes.push(format!(
+                    "{} page(s) composited onto white",
+                    report.composited
+                ));
+            }
+            // What happened, not a failure: the page is in the output at full size because
+            // the reduction asked for would have left an edge under the floor.
+            if report.below_floor > 0 {
+                notes.push(format!(
+                    "{} page(s) too small to shrink, kept at full size",
+                    report.below_floor
+                ));
+            }
+            let notes = if notes.is_empty() {
                 String::new()
+            } else {
+                format!(" ({})", notes.join(", "))
             };
             // `Ok` and `--delete-org` together mean the input is gone: a removal that failed
             // is an error, so there is no third state to report.
@@ -135,7 +176,7 @@ fn main() -> ExitCode {
                 String::new()
             };
             println!(
-                "{} page(s) written to {}{composited}{removed}",
+                "{} page(s) written to {}{notes}{removed}",
                 report.pages,
                 output.display()
             );
@@ -153,8 +194,13 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
     // Option values were range-checked by the parser, before this point and before the
     // input is opened. The remaining checks are on the input itself.
     let settings = Settings {
-        jobs: worker_count(),
-        target_width: cli.auto_width,
+        jobs: cli.jobs,
+        // The parser refused the two together, so this is a choice between them rather than
+        // a precedence nobody asked for.
+        target: match cli.ratio {
+            Some(percent) => Target::Ratio(percent),
+            None => Target::Width(cli.auto_width),
+        },
         filter: cli.resize_mode.parse().map_err(CliError::Filter)?,
         decode: DecodeSettings {
             dct_method: cli.dct.parse().map_err(CliError::Dct)?,
@@ -278,11 +324,12 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
     Ok((report, output))
 }
 
-/// How many pages are processed at once.
+/// How many pages are processed at once by default.
 ///
 /// Mirrors the Go implementation: all but one core once there are five, and four below that.
-/// Not a flag, because `--jobs` is out of this change's scope; the pipeline's peak memory is
-/// a function of this number, so it becomes an option only alongside a bound on it.
+/// `--jobs` overrides it and defaults to it, so the flag existing does not move the default:
+/// the pipeline's peak memory is a function of this number, and the flag's help is where the
+/// cost of raising it is stated.
 fn worker_count() -> NonZeroUsize {
     let cpus = thread::available_parallelism().map_or(4, NonZeroUsize::get);
     let jobs = if cpus >= 5 { cpus - 1 } else { 4 };

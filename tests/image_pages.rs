@@ -20,7 +20,7 @@ use comic_auto_resize::page::{
     Budget, Channels, DecodeSettings, EncodeSettings, Filter, Format, PageErrorKind, decode, header,
 };
 use comic_auto_resize::pipeline::{self, RunError, Settings};
-use comic_auto_resize::policy::AUTO_WIDTH;
+use comic_auto_resize::policy::{AUTO_WIDTH, Target};
 use comic_auto_resize::source::{ReadOptions, SourceError, ZipSource, probe};
 
 use support::{
@@ -41,7 +41,7 @@ const HEIGHT: u32 = 300;
 fn settings() -> Settings {
     Settings {
         jobs: NonZeroUsize::new(2).expect("non-zero"),
-        target_width: AUTO_WIDTH,
+        target: Target::Width(AUTO_WIDTH),
         filter: Filter::default(),
         decode: DecodeSettings::default(),
         encode: EncodeSettings::default(),
