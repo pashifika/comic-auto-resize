@@ -66,7 +66,13 @@ impl Sink {
     /// [`RunError::OutputExists`] when `path` is taken, [`RunError::PartialExists`] when the
     /// partial is, and [`RunError::Io`] when it cannot be created.
     pub fn create(path: &Path) -> Result<Self, RunError> {
-        if path.exists() {
+        // `symlink_metadata` rather than `Path::exists`, which follows the final link and so
+        // answers false for a dangling one: a broken symbolic link at the output path would
+        // pass the check and then be replaced by the rename, against a requirement that says
+        // the resolved path must not already exist. An entry is an entry, whatever it points
+        // at. This also strengthens the refusal `--delete-org` leans on, because the input is
+        // an entry under every spelling.
+        if fs::symlink_metadata(path).is_ok() {
             return Err(RunError::OutputExists {
                 path: path.to_path_buf(),
             });

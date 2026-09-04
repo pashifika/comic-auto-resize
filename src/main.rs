@@ -19,7 +19,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::thread;
 
@@ -197,14 +197,28 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
         Source::Directory(_) => InputKind::Directory,
         _ => InputKind::File,
     };
-    // Refused before a page is read, and before the output is even resolved: the pipeline
-    // reads the page files a directory holds and passes over everything else, so removing
-    // the input would take files it never looked at. Go attempts the removal, fails, logs,
-    // and exits zero — a flag accepted and then ignored.
-    if cli.delete_org && kind == InputKind::Directory {
-        return Err(CliError::DeleteDirectory {
-            path: cli.input.clone(),
-        });
+    // Both refusals fire before a page is read, and before the output is even resolved.
+    //
+    // A directory input: the pipeline reads the page files a directory holds and passes over
+    // everything else, so removing the input would take files it never looked at. Go attempts
+    // the removal, fails, logs, and exits zero — a flag accepted and then ignored.
+    //
+    // A symbolic link: `Source::open` follows it and reads the archive it points at, while
+    // `fs::remove_file` would unlink the link and leave that archive in place. The flag says
+    // it removes the input archive, so a spelling for which it cannot is refused rather than
+    // silently doing the other thing and reporting success. `symlink_metadata` is what asks,
+    // because every other call on this path follows links by design.
+    if cli.delete_org {
+        if kind == InputKind::Directory {
+            return Err(CliError::DeleteDirectory {
+                path: cli.input.clone(),
+            });
+        }
+        if fs::symlink_metadata(&cli.input).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(CliError::DeleteSymbolicLink {
+                path: cli.input.clone(),
+            });
+        }
     }
     let output = resolve_output(&cli.input, kind, cli.out.as_deref())?;
 
@@ -225,6 +239,16 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
     // Windows. Nothing is removed unless the output archive reached its final path, which is
     // what `Ok` here means.
     if cli.delete_org {
+        // The output is about to become the only copy, so it is made durable first. `rename`
+        // ordered the namespace change but nothing flushed the bytes, and a power loss in
+        // between would leave the input gone and the output absent or truncated. Only on this
+        // path: a run that keeps its input has nothing to lose to that window, and charging
+        // every run a flush to close it would be the wrong trade.
+        durable(&output).map_err(|source| CliError::OutputNotDurable {
+            output: output.clone(),
+            path: cli.input.clone(),
+            source,
+        })?;
         fs::remove_file(&cli.input).map_err(|source| CliError::InputNotRemoved {
             output: output.clone(),
             path: cli.input.clone(),
@@ -267,6 +291,33 @@ fn output(value: OsString) -> Result<PathBuf, &'static str> {
     Ok(PathBuf::from(value))
 }
 
+/// Flushes `output`, and the directory entry naming it where the platform allows it.
+///
+/// Only called before the input is removed, which is the one moment the output is about to
+/// become the only copy. `fs::rename` publishes the name; it does not promise the bytes
+/// beneath it have left the page cache, and APFS and NTFS both journal the namespace change
+/// without ordering the data before it.
+///
+/// Opened for writing because Windows' `FlushFileBuffers` needs write access. The parent is
+/// synchronised only on unix: `File::open` on a directory fails on Windows, so the rename's
+/// own durability there rests on NTFS's metadata journal rather than on a call this crate can
+/// make without `unsafe`.
+fn durable(output: &Path) -> std::io::Result<()> {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(output)?
+        .sync_all()?;
+    #[cfg(unix)]
+    {
+        let parent = output
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 enum CliError {
     /// `NotAFile` and `Input` are gone with the `metadata` call that raised them: the input's
@@ -305,6 +356,29 @@ enum CliError {
     /// down.
     #[error("{}: written, but the input {} could not be removed: {source}", output.display(), path.display())]
     InputNotRemoved {
+        output: PathBuf,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    /// `--delete-org` with a symbolic link as the input. `Source::open` follows the link and
+    /// reads the archive it points at, while `fs::remove_file` unlinks the link itself, so the
+    /// flag would report that it removed the input archive and leave that archive in place.
+    /// Refused rather than silently doing the other thing, and rather than removing the
+    /// target, which is a file the user did not name.
+    #[error(
+        "{}: is a symbolic link; --delete-org would remove the link and leave the archive it points at",
+        path.display()
+    )]
+    DeleteSymbolicLink { path: PathBuf },
+    /// The output could not be flushed to disk, so nothing was removed. Fails closed: the
+    /// alternative is unlinking the only other copy of the book while the replacement may not
+    /// survive a power loss.
+    #[error(
+        "{}: could not be flushed to disk, so the input {} was not removed: {source}",
+        output.display(),
+        path.display()
+    )]
+    OutputNotDurable {
         output: PathBuf,
         path: PathBuf,
         source: std::io::Error,

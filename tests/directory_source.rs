@@ -416,6 +416,10 @@ fn the_output_is_named_after_the_directory_and_written_beside_it() {
 /// `-o vol1/` names a location that joins to one — so the bound is on the resolved path. The
 /// comparison is canonical rather than lexical, which is what catches the `..` detour and a
 /// symbolic link pointing into the tree.
+///
+/// The link arm is unix-only for the reason this file already records above: creating one on
+/// Windows needs a privilege an ordinary test run does not have. The rule is not
+/// platform-specific; the fixture is, and the three link-free spellings still run there.
 #[test]
 fn no_explicit_output_is_written_inside_a_directory_input() {
     let files = [("page1.jpg", page(400))];
@@ -423,8 +427,6 @@ fn no_explicit_output_is_written_inside_a_directory_input() {
         let link = scratch.join("link");
         #[cfg(unix)]
         std::os::unix::fs::symlink(root, &link).expect("links");
-        #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(root, &link).expect("links");
 
         let mut requested = vec![
             // The filename arm, reaching straight in.
