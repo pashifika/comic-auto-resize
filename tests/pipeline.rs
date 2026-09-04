@@ -531,31 +531,83 @@ fn write_memory_fixtures() {
     }
 }
 
-/// An existing partial is refused rather than opened.
+/// A planted file beside the output does not become the output.
 ///
-/// The partial's name is derived from the output's, so it is predictable. Without exclusive
-/// creation, anyone able to write the output directory could pre-place it as a link and have
-/// this process truncate and overwrite the link's target, then rename the link into place.
+/// This replaces a test that pinned the partial file the sink used to build in. There is no
+/// partial any more — the archive is built in the file it will be delivered as — so the name
+/// that used to be predictable and worth protecting simply does not exist, and a file sitting
+/// at it is an ordinary bystander.
 #[test]
-fn an_existing_partial_file_is_refused_without_being_written() {
+fn a_file_beside_the_output_is_left_alone() {
     let input = archive_bytes(&[("page.jpg".to_owned(), page_bytes(320, 440))]);
 
-    let directory = TempDir::new("partial");
+    let directory = TempDir::new("bystander");
     let output = directory.join("out.zip");
-    let partial = directory.join("out.zip.part");
-    fs::write(&partial, b"planted").expect("plants the partial");
+    let bystander = directory.join("out.zip.part");
+    fs::write(&bystander, b"planted").expect("plants the bystander");
 
-    let error = run(&input, &output, 2).expect_err("an existing partial is refused");
-    assert!(
-        matches!(&error, RunError::PartialExists { .. }),
-        "expected a partial refusal, got {error}"
-    );
+    assert_eq!(run(&input, &output, 2).expect("the run succeeds"), 1);
     assert_eq!(
-        fs::read(&partial).expect("reads the plant"),
+        fs::read(&bystander).expect("reads the plant"),
         b"planted",
-        "the planted file was written to"
+        "the bystander was written to"
     );
-    assert!(!output.exists());
+    assert_eq!(read_archive(&output).len(), 1);
+}
+
+/// A failed run that cannot remove its own output reports both facts.
+///
+/// The archive is built in the file it would have been delivered as, so every exit that is not
+/// a clean finish has to take it away again. `Sink::drop` discards a cleanup error on purpose —
+/// it must not replace the failure that caused it — so the explicit path is what makes a stray
+/// visible. Without it the run reports only its original error and leaves an incomplete archive
+/// under the output's own name, which the next run then refuses for a reason the user has no
+/// way to connect to this one.
+///
+/// `finish` failing is the case that is easy to leave out, because it sits on the *success*
+/// arm: an archive with no pages reaches it. The directory is made unwritable after the sink
+/// claimed its name, which is a window only a library caller can sit inside.
+#[cfg(unix)]
+#[test]
+fn a_failed_run_that_cannot_remove_its_output_reports_both() {
+    use comic_auto_resize::sink::Sink;
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new("stray-output");
+    let held = directory.join("held");
+    fs::create_dir(&held).expect("creates the output's directory");
+    let output = held.join("out.zip");
+
+    let mut sink = Sink::create(&output).expect("claims the name");
+    let original = fs::metadata(&held).expect("reads").permissions();
+    fs::set_permissions(&held, PermissionsExt::from_mode(0o500)).expect("locks the directory");
+
+    // No page was accepted, so this is `RunError::Empty` — a `finish` failure rather than a
+    // pipeline one, which is the arm that used to fall through to `Drop`.
+    let failure = sink
+        .finish()
+        .expect_err("an archive with no pages is refused");
+    assert!(matches!(failure, RunError::Empty), "{failure}");
+
+    let cleanup = sink
+        .abort()
+        .expect_err("removing from an unwritable directory must fail");
+    fs::set_permissions(&held, original).expect("restores the directory");
+
+    assert_eq!(cleanup.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(output.exists(), "the stray this test is about is not there");
+
+    // And the shape `pipeline::run` builds from the two: both the cause and the stray.
+    let reported = RunError::StrayOutput {
+        path: output.clone(),
+        source: Box::new(failure),
+        cleanup,
+    };
+    let message = reported.to_string();
+    assert!(
+        message.contains("no pages to process") && message.contains("could not be removed"),
+        "the report names only one of the two facts: {message}"
+    );
 }
 
 /// An archive with no pages produces no archive, rather than an empty one.
@@ -1417,18 +1469,25 @@ fn a_removal_that_fails_names_the_output_and_the_surviving_input() {
     assert!(input.exists(), "the input is gone after a failed removal");
 }
 
-/// A flush that fails abandons the removal, and the input survives.
+/// The archive is durable before it takes its final name, so a mode the *creator* cannot
+/// reopen does not fail the run.
 ///
-/// This is the guard between a power loss and the total loss of the book, so it is asserted
-/// rather than reasoned about. `fsync` on a healthy file cannot be made to fail, but the open
-/// in front of it can: the archive is created with mode `0o666` before the umask, so a run
-/// under `umask 0777` produces a mode `0o000` file that its own creator cannot reopen. The
-/// umask is set by the shell rather than by this process, because it is per-process state and
-/// the test harness is threaded.
+/// This supersedes a test that pinned the opposite. The flush used to happen after the rename,
+/// by reopening the final path, so an output the process could not reopen was reported as
+/// unflushable — and `umask 0777` produces exactly that, a mode `0o000` archive its own creator
+/// cannot open. That refusal was an artefact of the reopen rather than a durability failure:
+/// the bytes were written through a handle that was still open and perfectly flushable.
+///
+/// Flushing through that handle before the rename fixes both halves. The final name is never
+/// published over unflushed data, and a file mode has nothing to do with whether the data
+/// reached the disk. The umask is set by the shell because it is per-process state and the
+/// harness is threaded.
 #[cfg(unix)]
 #[test]
-fn a_flush_that_fails_abandons_the_removal() {
-    let directory = TempDir::new("delete-org-undurable");
+fn an_output_its_creator_cannot_reopen_is_still_durable() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new("delete-org-unreopenable");
     let input = valid_input(&directory);
     let requested = directory.join("out.zip");
     let script = format!(
@@ -1444,21 +1503,73 @@ fn a_flush_that_fails_abandons_the_removal() {
         .expect("runs the binary through a shell");
 
     assert!(
-        !output.status.success(),
-        "an unflushable output reported success"
+        output.status.success(),
+        "a mode the creator cannot reopen was reported as a durability failure: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(requested.exists(), "the output was not written");
+    assert_eq!(
+        fs::metadata(&requested)
+            .expect("reads")
+            .permissions()
+            .mode()
+            & 0o777,
+        0,
+        "the umask did not take, so this asserts nothing"
+    );
+    assert!(!input.exists(), "the input survived a successful run");
     assert!(
-        message.contains("could not be flushed to disk")
-            && message.contains("out.zip")
-            && message.contains("in.zip"),
-        "the refusal does not name the flush and both paths: {message}"
+        !directory.join("out.zip.part").exists(),
+        "the partial survived a successful run"
     );
+}
+
+/// The output is claimed at its final name, atomically, before a page is written.
+///
+/// Creating the final name with `create_new` *is* the existing-path refusal: there is no
+/// separate check to race, and nothing arriving later can be overwritten because the name is
+/// already taken by this process. It also means there is no second predictable name — the
+/// partial file the sink used to build in was one, and a name an attacker can guess is a name
+/// they can pre-place a link at.
+///
+/// What it costs is that a run killed outright leaves an incomplete archive under the final
+/// name rather than under a `.part` one. The recovery is identical either way — the next run
+/// refuses and the user removes the stray — and what is bought is that the tool never renames,
+/// so it never depends on a rename being persisted.
+///
+/// Driven through the library because the state it asserts exists only between two calls.
+#[test]
+fn the_output_is_claimed_at_its_final_name_before_anything_is_written() {
+    use comic_auto_resize::sink::Sink;
+
+    let directory = TempDir::new("final-name-claim");
+    let output = directory.join("out.zip");
+
+    let sink = Sink::create(&output).expect("the path is free");
     assert!(
-        input.exists(),
-        "the input was removed although the output was never flushed"
+        output.exists(),
+        "the final name was not claimed when the sink was created"
     );
-    assert!(requested.exists(), "the output was not written at all");
+    assert_eq!(
+        fs::read_dir(directory.path())
+            .expect("reads")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect::<Vec<_>>(),
+        vec![std::ffi::OsString::from("out.zip")],
+        "the sink built somewhere other than the final name"
+    );
+
+    // A second sink cannot take it, because the claim is the exclusive creation itself.
+    assert!(
+        matches!(Sink::create(&output), Err(RunError::OutputExists { .. })),
+        "the claim did not refuse a second sink"
+    );
+
+    drop(sink);
+    assert!(
+        !output.exists(),
+        "an abandoned claim left the final name occupied"
+    );
 }
 
 /// An input whose own entry cannot be queried is not deleted.

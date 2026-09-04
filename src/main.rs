@@ -27,7 +27,7 @@ use clap::{Parser, builder::TypedValueParser};
 use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter};
 use comic_auto_resize::pipeline::{self, Report, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
-use comic_auto_resize::sink::{InputKind, durable, resolve_output};
+use comic_auto_resize::sink::{InputKind, durable_directory_entry, resolve_output};
 use comic_auto_resize::source::{Charset, DEFAULT_LABELS, Naming, ReadOptions, Source};
 use thiserror::Error;
 
@@ -253,16 +253,18 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
     })?;
 
     // `pipeline::run` took the source by value and dropped it before returning, so this
-    // process holds no handle to the input — which is what makes the removal safe on
-    // Windows. Nothing is removed unless the output archive reached its final path, which is
-    // what `Ok` here means.
+    // process holds no handle to the input — which is what makes the removal safe on Windows.
+    // Nothing is removed unless `Ok` came back, which means the archive was written and
+    // flushed in the file it will be delivered as.
     if cli.delete_org {
-        // The output is about to become the only copy, so it is made durable first. `rename`
-        // ordered the namespace change but nothing flushed the bytes, and a power loss in
-        // between would leave the input gone and the output absent or truncated. Only on this
-        // path: a run that keeps its input has nothing to lose to that window, and charging
-        // every run a flush to close it would be the wrong trade.
-        durable(&output).map_err(|source| CliError::OutputNotDurable {
+        // The bytes are durable — `Sink::finish` flushed them through the handle that wrote
+        // them — but on unix the *entry naming them* is not, because `fsync` on a file says
+        // nothing about its parent directory. The name was created before the whole
+        // conversion rather than a moment ago, which makes the window a different shape from
+        // the rename this replaced, but it is still an unflushed entry and the input is about
+        // to become unrecoverable. So the parent is flushed here, on the one path that has
+        // something to lose.
+        durable_directory_entry(&output).map_err(|source| CliError::OutputNotDurable {
             output: output.clone(),
             path: cli.input.clone(),
             source,

@@ -40,82 +40,68 @@ pub struct Sink {
     pending: BTreeMap<PageKey, Page>,
     next_index: u32,
     written: u32,
-    /// Where the archive is being built. Renamed onto the final path only on success, so a
-    /// failed run leaves nothing at the destination.
-    partial: PathBuf,
-    final_path: PathBuf,
+    /// The output's own path, claimed at creation and built in place.
+    path: PathBuf,
     /// Every name written, so a collision created by extension rewriting is reported as
     /// itself rather than as `zip`'s "Duplicate filename".
     names: HashSet<String>,
-    /// Set once the rename succeeded. Until then [`Sink::drop`] removes the partial, so no
-    /// error path can leave a full-size stray file beside the destination.
-    installed: bool,
+    /// Set once the archive was closed and flushed. Until then [`Sink::drop`] removes the
+    /// file, so no error path can leave a half-written archive at the destination.
+    finished: bool,
 }
 
 impl Sink {
-    /// Creates the output archive, refusing to disturb anything already at `path`.
+    /// Creates the output archive at `path`, refusing to disturb anything already there.
     ///
-    /// The partial file is created with `create_new`, so an existing path fails instead of
-    /// being opened. That matters because the partial's name is derived from the output's and
-    /// is therefore predictable: without exclusive creation, anyone able to write the output
-    /// directory could pre-place `<output>.part` as a symbolic or hard link and have this
-    /// process truncate and overwrite the link's target, then rename the link into place.
+    /// **The exclusive creation of `path` is itself the refusal.** There is no separate
+    /// existence check to race and no temporary name to rename from, because there is no
+    /// rename: the archive is built in the file it will be delivered as. That closes three
+    /// things at once.
+    ///
+    /// A check followed by a rename has a window — anything arriving at the destination in
+    /// between was replaced, because `fs::rename` overwrites its destination by contract.
+    /// `create_new` has no such window: the claim and the check are one operation the
+    /// filesystem serialises.
+    ///
+    /// A second predictable name is a second thing to attack. Building in `<path>.part` meant
+    /// anyone able to write the output directory could pre-place that name as a link and have
+    /// this process write through it. One name is one surface.
+    ///
+    /// And a rename has to be *persisted* to be worth anything to `--delete-org`, which
+    /// removes the input once the output is in place. No portable call makes a directory entry
+    /// durable — on Windows `std::fs::rename` reaches `MoveFileExW` without
+    /// `MOVEFILE_WRITE_THROUGH`, and `FlushFileBuffers` guarantees nothing for a directory
+    /// handle — so a rename immediately before the unlink was a step whose durability could
+    /// not be established. Claiming the name at the start does not *prove* the entry is
+    /// durable either, and this is not claimed: what changes is that the entry is written
+    /// before the whole conversion rather than microseconds before the input is removed.
+    ///
+    /// What it costs is that a run killed outright — power loss, `SIGKILL` — leaves an
+    /// incomplete archive under the final name instead of under a `.part` one. The recovery is
+    /// the same either way, since the next run refuses a name that is taken and the user
+    /// removes the stray; what is lost is only that the stray no longer announces itself as
+    /// incomplete.
     ///
     /// # Errors
     ///
-    /// [`RunError::OutputExists`] when `path` is taken, [`RunError::PartialExists`] when the
-    /// partial is, and [`RunError::Io`] when the partial cannot be created or when `path`
-    /// cannot be queried at all.
+    /// [`RunError::OutputExists`] when `path` is taken, and [`RunError::Io`] when it cannot be
+    /// created for any other reason.
     pub fn create(path: &Path) -> Result<Self, RunError> {
-        // `symlink_metadata` rather than `Path::exists`, which follows the final link and so
-        // answers false for a dangling one: a broken symbolic link at the output path would
-        // pass the check and then be replaced by the rename, against a requirement that says
-        // the resolved path must not already exist. An entry is an entry, whatever it points
-        // at. This also strengthens the refusal `--delete-org` leans on, because the input is
-        // an entry under every spelling.
-        //
-        // Three arms rather than `is_ok()`, because "cannot tell" is not "not there" and the
-        // two are one mistake apart. `create_new` below acts on `<output>.part`, a *different*
-        // entry needing a *different* right — adding a child to the directory, where this
-        // needs read-attributes on the output itself — so a directory ACL can permit the
-        // creation while refusing the query, and a Windows sharing violation on an output
-        // another process holds open does exactly that. Treating that as absence would let the
-        // run create the partial, succeed, and then `rename` over the very file this refusal
-        // exists to protect, because rename replaces its destination by contract. So anything
-        // but a plain absence stops the run with the error the query gave.
-        match fs::symlink_metadata(path) {
-            Ok(_) => {
+        // `create_new` maps to `O_EXCL` and to `CREATE_NEW`, both of which fail on an existing
+        // entry whatever it points at — including a dangling symbolic link, which
+        // `Path::exists` used to answer `false` for by following it. The refusal is therefore
+        // about the name, which is what the requirement is about, and it needs no separate
+        // query whose failure would have to be interpreted.
+        let file = match OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
                 return Err(RunError::OutputExists {
                     path: path.to_path_buf(),
                 });
             }
-            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(RunError::Io {
                     path: path.to_path_buf(),
-                    source,
-                });
-            }
-        }
-
-        // Beside the destination, so the rename is within one directory and therefore
-        // atomic on both release targets.
-        let mut partial = path.as_os_str().to_os_string();
-        partial.push(".part");
-        let partial = PathBuf::from(partial);
-
-        let file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&partial)
-        {
-            Ok(file) => file,
-            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(RunError::PartialExists { path: partial });
-            }
-            Err(source) => {
-                return Err(RunError::Io {
-                    path: partial,
                     source,
                 });
             }
@@ -127,9 +113,8 @@ impl Sink {
             next_index: 0,
             written: 0,
             names: HashSet::new(),
-            partial,
-            installed: false,
-            final_path: path.to_path_buf(),
+            path: path.to_path_buf(),
+            finished: false,
         })
     }
 
@@ -155,18 +140,29 @@ impl Sink {
         Ok(flushed)
     }
 
-    /// Finishes the archive and moves it onto the final path.
+    /// Closes the archive and makes it durable, in the file it was built in.
     ///
-    /// Every failure here leaves the partial for [`Sink::drop`] to remove, including a full
-    /// disk while the central directory is written — which is exactly when leaving a
-    /// full-size stray file would hurt most.
+    /// The flush is here rather than at the caller, and it is unconditional. Its cost is one
+    /// `fsync` on a file this run just wrote, against a conversion measured in seconds to
+    /// minutes; what it buys is that a successful return means the bytes are on the disk and
+    /// not merely in the page cache, which is what `--delete-org` needs before it unlinks the
+    /// only other copy — and what any consumer of a "written" message is entitled to assume.
+    ///
+    /// An earlier shape flushed only on the `--delete-org` path and did it by reopening the
+    /// finished file. That charged nothing to other runs but made durability depend on the
+    /// output being reopenable by its own creator, which a restrictive `umask` denies, and it
+    /// left every other run's success line making a promise nothing had checked.
+    ///
+    /// Every failure here leaves the file for [`Sink::drop`] to remove, including a full disk
+    /// while the central directory is written — which is exactly when leaving a full-size
+    /// stray would hurt most.
     ///
     /// # Errors
     ///
     /// [`RunError::Empty`] when no page was written, [`RunError::Incomplete`] if a page never
-    /// arrived, and [`RunError::Archive`] or [`RunError::Io`] if the archive cannot be closed
-    /// or renamed.
-    pub fn finish(mut self) -> Result<u32, RunError> {
+    /// arrived, [`RunError::Archive`] if the archive cannot be closed, and [`RunError::Io`] if
+    /// it cannot be flushed.
+    pub fn finish(&mut self) -> Result<u32, RunError> {
         if let Some(key) = self.pending.keys().next().copied() {
             // Every page that was read is accounted for by the time the workers are joined,
             // so a leftover here means the ordering invariant broke rather than that a page
@@ -177,21 +173,48 @@ impl Sink {
             });
         }
         if self.written == 0 {
-            // An archive with no pages in it is not an output worth installing: it would
-            // report success, and then make the next run fail with "already exists".
+            // An archive with no pages in it is not an output worth keeping: it would report
+            // success, and then make the next run fail with "already exists".
             return Err(RunError::Empty);
         }
 
         let archive = self.archive.take().ok_or(RunError::StagePanicked {
             stage: "the writer",
         })?;
-        archive.finish().map_err(RunError::Archive)?;
-        fs::rename(&self.partial, &self.final_path).map_err(|source| RunError::Io {
-            path: self.final_path.clone(),
-            source,
-        })?;
-        self.installed = true;
+        // `ZipWriter::finish` writes the central directory and hands back the file it was
+        // writing through, so the flush goes through the descriptor that produced the bytes.
+        // No reopen, and therefore no dependence on the file's own mode.
+        archive
+            .finish()
+            .map_err(RunError::Archive)?
+            .sync_all()
+            .map_err(|source| RunError::Io {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.finished = true;
         Ok(self.written)
+    }
+
+    /// Removes the unfinished archive, reporting a failure to do so.
+    ///
+    /// The failure path's counterpart to [`Sink::finish`]. [`Sink::drop`] does the same
+    /// removal and discards its error on purpose — a cleanup failure must not replace the
+    /// failure that caused it — which is right for a panic and wrong for an ordinary error,
+    /// because the archive is built under the output's own name and a stray one left there is
+    /// what the next run will meet.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the removal returned. The caller pairs it with the error that led here.
+    pub fn abort(mut self) -> Result<(), std::io::Error> {
+        // Taken so `Drop` does not try the removal a second time and swallow a second error.
+        self.finished = true;
+        drop(self.archive.take());
+        match fs::remove_file(&self.path) {
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
     }
 
     fn write(&mut self, page: &Page) -> Result<(), RunError> {
@@ -219,7 +242,7 @@ impl Sink {
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Stored)
             .large_file(false);
-        let partial = self.partial.clone();
+        let path = self.path.clone();
         let archive = self.archive.as_mut().ok_or(RunError::StagePanicked {
             stage: "the writer",
         })?;
@@ -228,27 +251,30 @@ impl Sink {
             .map_err(RunError::Archive)?;
         archive
             .write_all(&page.bytes)
-            .map_err(|source| RunError::Io {
-                path: partial,
-                source,
-            })?;
+            .map_err(|source| RunError::Io { path, source })?;
         self.written += 1;
         Ok(())
     }
 }
 
 impl Drop for Sink {
-    /// Removes the partial unless it was installed.
+    /// Removes the archive unless it was finished.
     ///
-    /// This is the single cleanup path, rather than each exit doing its own: `finish`
-    /// consumes the sink, so a failure inside it leaves the caller nothing to call, and a
-    /// panic in the pipeline skips the caller entirely.
+    /// This is the single cleanup path, rather than each exit doing its own: `finish` consumes
+    /// the sink, so a failure inside it leaves the caller nothing to call, and a panic in the
+    /// pipeline skips the caller entirely.
+    ///
+    /// It runs for an ordinary failure and for an unwind, and it cannot run for a process that
+    /// is killed outright. That is the trade the in-place build accepts: a power loss or a
+    /// `SIGKILL` leaves an incomplete archive under the output's own name, which the next run
+    /// refuses as taken. Before, the same event left `<output>.part` and the next run refused
+    /// that instead — the same recovery, a differently named stray.
     fn drop(&mut self) {
-        if self.installed {
+        if self.finished {
             return;
         }
         // The run is already failing; a failure to clean up must not replace its error.
-        let _ = fs::remove_file(&self.partial);
+        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -398,34 +424,30 @@ fn output_directory(output: &Path) -> &Path {
     }
 }
 
-/// Flushes the archive at `output`, and the directory entry naming it where that is a barrier.
+/// Flushes the directory entry naming `output`, where the platform offers a way to.
 ///
-/// Called only where the input is about to be removed, which is the one moment the output
-/// becomes the only copy. [`Sink::finish`] renames the partial onto `output`, which publishes
-/// the name and promises nothing about the bytes beneath it: neither APFS nor NTFS orders the
-/// data before the namespace change, so a power loss in between can leave a truncated or
-/// absent archive where a run has already reported success.
+/// [`Sink::finish`] flushes the archive's bytes through the handle that wrote them. That says
+/// nothing about the entry that names them: on unix `fsync` on a file does not persist its
+/// parent directory, so the name can still be lost to a crash while the data survives. Called
+/// only before the input is removed, which is the one moment losing the name would leave
+/// nothing to find the data by.
 ///
-/// Opened for reading on unix, where `fsync` accepts a read-only descriptor, and for writing on
-/// Windows, where `FlushFileBuffers` does not. The parent is synchronised only on unix. A
-/// directory handle can be opened on Windows without `unsafe` — `OpenOptionsExt::custom_flags`
-/// with `FILE_FLAG_BACKUP_SEMANTICS` is safe, stable `std` — but `FlushFileBuffers` on one is
-/// not a documented durability barrier there, and NTFS journals the rename, so the guarantee
-/// does not rest on a call this code declined to make.
+/// Unix only, and the gap is stated rather than papered over. `std::fs::rename` is not
+/// involved any more — the name was claimed by the creation, long before this — but a Windows
+/// directory handle still has no documented flush: `FlushFileBuffers` is specified for file
+/// and volume handles and guarantees nothing for a directory one. What changed is that the
+/// unflushed entry is now minutes old rather than microseconds old, which is a different
+/// exposure, not a closed one.
 ///
 /// # Errors
 ///
-/// Whatever the open or the flush returned. The caller's business is that a failure here means
-/// nothing may be removed, not what went wrong.
-pub fn durable(output: &Path) -> io::Result<()> {
-    let mut options = fs::OpenOptions::new();
-    #[cfg(unix)]
-    options.read(true);
-    #[cfg(windows)]
-    options.write(true);
-    options.open(output)?.sync_all()?;
+/// Whatever opening or flushing the directory returned. A failure means nothing may be
+/// removed.
+pub fn durable_directory_entry(output: &Path) -> io::Result<()> {
     #[cfg(unix)]
     File::open(output_directory(output))?.sync_all()?;
+    #[cfg(not(unix))]
+    let _ = output;
     Ok(())
 }
 
@@ -468,7 +490,7 @@ fn resolved(input: &Path) -> Result<PathBuf, RunError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputKind, default_output, durable, output_directory};
+    use super::{InputKind, default_output, durable_directory_entry, output_directory};
     use std::path::{Path, PathBuf};
 
     fn file(input: &str) -> PathBuf {
@@ -540,15 +562,14 @@ mod tests {
         }
     }
 
-    /// The flush reports a failure rather than swallowing one, and the flush is what is tested.
+    /// The directory barrier reports a failure rather than swallowing one.
     ///
-    /// The first two arms only exercise the *open*, so a regression that deleted `sync_all`
-    /// outright would keep passing them — review found exactly that. The third arm closes it:
-    /// `/dev/null` opens and then refuses to be flushed, so it is the seam where the open
-    /// succeeds and only the barrier fails. Without the `sync_all` call this arm returns `Ok`
-    /// and the test goes red, which is the property the other two cannot have.
+    /// It is the half of durability the file's own flush cannot supply: `fsync` on a file says
+    /// nothing about the entry naming it. A directory that is not there is the reachable
+    /// failure, and it must come back as one — a barrier that quietly returns `Ok` is worse
+    /// than none, because `--delete-org` unlinks the only other copy on the strength of it.
     #[test]
-    fn the_durability_barrier_flushes_and_reports_a_flush_that_fails() {
+    fn the_directory_barrier_reports_a_failure_rather_than_swallowing_it() {
         let scratch = std::env::temp_dir().join(format!(
             "comic-auto-resize-durable-{}-{:?}",
             std::process::id(),
@@ -558,23 +579,16 @@ mod tests {
 
         let written = scratch.join("out.zip");
         std::fs::write(&written, b"PK\x05\x06").expect("writes an archive");
-        durable(&written).expect("an existing archive is flushed");
+        durable_directory_entry(&written).expect("an existing directory is flushed");
 
-        let missing = scratch.join("gone.zip");
-        let error = durable(&missing).expect_err("a path with no file must not report success");
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
-
-        // The barrier itself, isolated from the open. A character device accepts the open and
-        // rejects the flush, so this is the one arm a no-op barrier cannot pass.
+        // Unix only, because that is where the call exists at all; elsewhere the function is
+        // documented as a no-op and there is nothing to fail.
         #[cfg(unix)]
         {
-            let unflushable = durable(Path::new("/dev/null"))
-                .expect_err("a barrier that cannot flush must not report success");
-            assert_ne!(
-                unflushable.kind(),
-                std::io::ErrorKind::NotFound,
-                "the failure came from the open rather than the flush: {unflushable}"
-            );
+            let nowhere = scratch.join("gone").join("out.zip");
+            let error = durable_directory_entry(&nowhere)
+                .expect_err("a directory that is not there must not report success");
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
         }
 
         std::fs::remove_dir_all(&scratch).expect("removes the scratch directory");
