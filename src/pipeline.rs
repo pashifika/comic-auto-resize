@@ -428,14 +428,30 @@ pub fn run<S: Entries + Send>(
         }
     });
 
-    match outcome {
-        Ok(composited) => Ok(Report {
-            pages: sink.finish()?,
-            composited,
-        }),
-        // The sink's `Drop` removes the partial; there is nothing else to undo.
-        Err(error) => Err(error),
-    }
+    // Every exit that is not a clean `finish` must take the output away again, because it is
+    // built in the file it would have been delivered as. `Sink::drop` does the same removal
+    // and discards its error on purpose — a cleanup failure must not replace the failure that
+    // caused it — which is right for a panic and wrong here, where the stray is what the next
+    // run will meet. So both arms below clean up explicitly and report both facts.
+    //
+    // `finish` is one of the failures, not a step past them: an empty archive, a stranded
+    // page, a central directory that will not write, and a flush that will not complete all
+    // leave a file to remove.
+    let failure = match outcome {
+        Ok(composited) => match sink.finish() {
+            Ok(pages) => return Ok(Report { pages, composited }),
+            Err(error) => error,
+        },
+        Err(error) => error,
+    };
+    Err(match sink.abort() {
+        Ok(()) => failure,
+        Err(cleanup) => RunError::StrayOutput {
+            path: output.to_path_buf(),
+            source: Box::new(failure),
+            cleanup,
+        },
+    })
 }
 
 /// One entry on its way to a worker.
@@ -537,13 +553,28 @@ pub enum RunError {
     Source(#[from] SourceError),
     #[error(transparent)]
     Page(#[from] PageError),
+    /// The output's name is taken. Raised by the exclusive creation itself rather than by a
+    /// check in front of it, so it covers every entry — including a dangling symbolic link,
+    /// and including one that appeared a moment ago — and there is no window between deciding
+    /// the name is free and taking it.
+    ///
+    /// A run killed outright leaves its incomplete archive here, because nothing can run to
+    /// remove it. That is the one case where this error names a file the tool wrote: the
+    /// remedy is the same as for any other occupant, which is to remove it or write elsewhere.
     #[error("{}: already exists", path.display())]
     OutputExists { path: PathBuf },
-    /// The partial file was already there. It is created with `create_new`, so this is
-    /// either a leftover from a run that died, or something placed there deliberately —
-    /// possibly a link pointing somewhere else. Either way it is not overwritten.
-    #[error("{}: already exists; remove it or move it aside", path.display())]
-    PartialExists { path: PathBuf },
+    /// The run failed *and* its incomplete archive could not be removed, so a stray is sitting
+    /// under the output's own name. Both are reported: the cause is what the user needs to
+    /// fix, and the stray is what the next run will refuse.
+    #[error(
+        "{}: the run failed ({source}), and the incomplete output could not be removed: {cleanup}",
+        path.display()
+    )]
+    StrayOutput {
+        path: PathBuf,
+        source: Box<RunError>,
+        cleanup: std::io::Error,
+    },
     #[error("{}: {source}", path.display())]
     Io {
         path: PathBuf,
