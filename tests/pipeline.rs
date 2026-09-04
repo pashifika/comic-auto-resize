@@ -697,20 +697,18 @@ fn valid_input(directory: &TempDir) -> std::path::PathBuf {
 /// accepted and ignored.
 ///
 /// `--charset` and `--pwd` were here until they were implemented, and moved into the list
-/// below in the same Change — the movement `--fix-idx` made before them.
+/// below in the same Change — the movement `--fix-idx` made before them, and the one
+/// `-o/--out` and `--delete-org` make now.
 #[test]
 fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
     let directory = TempDir::new("unknown-flags");
     let input = valid_input(&directory);
 
     for flag in [
-        "--delete-org",
         "--jobs",
         "-r",
         "--ratio",
         "--split",
-        "-o",
-        "--out",
         "--small-skip",
         "--optimizer",
         "--progressive",
@@ -739,13 +737,15 @@ fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
 /// `--help` lists exactly what exists, in both directions.
 #[test]
 fn help_lists_every_implemented_option_and_nothing_else() {
-    // The seven the tool implements, plus what clap adds for free.
+    // The nine the tool implements, plus what clap adds for free.
     let mut expected = vec![
         "auto-width".to_owned(),
         "charset".to_owned(),
         "dct".to_owned(),
+        "delete-org".to_owned(),
         "fix-idx".to_owned(),
         "help".to_owned(),
+        "out".to_owned(),
         "pwd".to_owned(),
         "quality".to_owned(),
         "resize-mode".to_owned(),
@@ -866,5 +866,299 @@ fn every_accepted_flag_changes_the_output() {
             "{args:?} changed the geometry"
         );
         assert_ne!(changed, baseline, "{args:?} did not change the output");
+    }
+}
+
+// ---------------------------------------------------------------- the output path
+
+/// A value naming a location is joined with the default name; a value naming anything else
+/// is the output path exactly.
+///
+/// The two arms are the boundary of what the tool takes responsibility for, so both are
+/// asserted against the file that appears rather than against the message. A fresh input per
+/// case, because a case that succeeds leaves an output behind.
+#[test]
+fn an_output_value_resolves_as_a_location_or_as_a_filename() {
+    // A trailing separator selects the location arm, and it has to be read before the value
+    // becomes a `Path`, which normalises it away.
+    let separators = TempDir::new("out-location");
+    let input = valid_input(&separators);
+    let destination = separators.join("dest");
+    fs::create_dir(&destination).expect("creates the destination");
+    let mut trailing = destination.clone().into_os_string();
+    trailing.push(std::path::MAIN_SEPARATOR_STR);
+    let status = Command::new(BINARY)
+        .arg("-o")
+        .arg(&trailing)
+        .arg(&input)
+        .status()
+        .expect("runs the binary");
+    assert!(status.success(), "a trailing separator was refused");
+    assert!(
+        destination.join("in_resize.zip").exists(),
+        "a location did not get the default name joined to it"
+    );
+
+    // An existing directory is a location without one.
+    let existing = TempDir::new("out-existing-dir");
+    let input = valid_input(&existing);
+    let destination = existing.join("dest");
+    fs::create_dir(&destination).expect("creates the destination");
+    let status = Command::new(BINARY)
+        .arg("-o")
+        .arg(&destination)
+        .arg(&input)
+        .status()
+        .expect("runs the binary");
+    assert!(status.success(), "an existing directory was refused");
+    assert!(
+        destination.join("in_resize.zip").exists(),
+        "an existing directory did not get the default name joined to it"
+    );
+
+    // The name joined to a location is the *default* name, so the input's extension is gone
+    // rather than preserved or re-appended. This is the one regression the new resolution
+    // code can cause: the reference tool writes `in.cbz` as `in_resize.cbz.zip`, and an
+    // implementation that reached for `file_name` instead of `file_stem` would too.
+    let carried = TempDir::new("out-location-stem");
+    let input = carried.join("in.cbz");
+    write_pages(&input, 1, 320, 440);
+    let destination = carried.join("dest");
+    fs::create_dir(&destination).expect("creates the destination");
+    let status = Command::new(BINARY)
+        .arg("-o")
+        .arg(&destination)
+        .arg(&input)
+        .status()
+        .expect("runs the binary");
+    assert!(status.success(), "a `.cbz` input was refused");
+    assert_eq!(
+        fs::read_dir(&destination)
+            .expect("reads")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect::<Vec<_>>(),
+        vec![std::ffi::OsString::from("in_resize.zip")],
+        "the location arm did not drop the input's extension"
+    );
+
+    // Anything else is a filename, verbatim: no extension appended, replaced or validated.
+    // `out.cbz` is a zip archive called `out.cbz`, and `out` has no extension at all.
+    for name in ["out.cbz", "out"] {
+        let directory = TempDir::new("out-verbatim");
+        let input = valid_input(&directory);
+        let requested = directory.join(name);
+        let status = Command::new(BINARY)
+            .arg("-o")
+            .arg(&requested)
+            .arg(&input)
+            .status()
+            .expect("runs the binary");
+        assert!(status.success(), "-o {name} was refused");
+        assert_eq!(
+            read_archive(&requested).len(),
+            1,
+            "-o {name} is not a one-page zip"
+        );
+        assert!(
+            !directory.join(&format!("{name}.zip")).exists(),
+            "-o {name} had `.zip` appended, which is the reference tool's behaviour"
+        );
+        assert!(
+            !default_output(&input).exists(),
+            "-o {name} wrote the default name as well"
+        );
+    }
+}
+
+/// The directory to write into must already exist, through either arm, and the refusal names
+/// the directory rather than the value.
+///
+/// Creating it is declined, and the containment check needs a path that canonicalises, which
+/// a directory that is not there has none of.
+#[test]
+fn a_missing_output_directory_is_refused_and_named() {
+    for (label, file) in [("missing-filename", "out.zip"), ("missing-location", "")] {
+        let directory = TempDir::new(label);
+        let input = valid_input(&directory);
+        // `nowhere/out.zip` for the filename arm, and `nowhere/` for the location arm.
+        let mut requested = directory.join("nowhere").into_os_string();
+        requested.push(std::path::MAIN_SEPARATOR_STR);
+        requested.push(file);
+        let output = Command::new(BINARY)
+            .arg("-o")
+            .arg(&requested)
+            .arg(&input)
+            .output()
+            .expect("runs the binary");
+        assert!(!output.status.success(), "{label} was accepted");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            message.contains("nowhere") && message.contains("no such directory"),
+            "{label} did not name the missing directory: {message}"
+        );
+        assert!(
+            !directory.join("nowhere").exists(),
+            "{label} created the directory"
+        );
+        assert!(
+            !default_output(&input).exists(),
+            "{label} fell back to the default name"
+        );
+    }
+
+    // An empty value is neither arm: it names no directory to join a default name to and no
+    // file to use verbatim, so it is refused rather than resolved to something unprintable.
+    let directory = TempDir::new("empty-out");
+    let input = valid_input(&directory);
+    let output = Command::new(BINARY)
+        .arg("-o")
+        .arg("")
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(!output.status.success(), "an empty -o was accepted");
+    assert!(
+        !default_output(&input).exists(),
+        "an empty -o wrote an output"
+    );
+}
+
+/// The existing-path refusal follows the resolved path, not the default one.
+///
+/// Go tests the raw `-o` value in its flag parser, so `-o out` passes its check and then
+/// truncates an existing `out.zip`. Here the path that gets written is the path that is
+/// checked — and the check runs before a thread starts, so the file it refused is untouched.
+#[test]
+fn the_existing_path_refusal_follows_the_resolved_path() {
+    // The filename arm, against a file the default name would never have collided with.
+    let directory = TempDir::new("resolved-exists");
+    let input = valid_input(&directory);
+    let taken = directory.join("out");
+    fs::write(&taken, b"not an archive").expect("writes the obstacle");
+    let output = Command::new(BINARY)
+        .arg("-o")
+        .arg(&taken)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(!output.status.success(), "an existing -o path was accepted");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("already exists"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(&taken).expect("reads"),
+        b"not an archive",
+        "the existing file was disturbed"
+    );
+
+    // The location arm resolves to the default name inside the destination, so that is the
+    // path the refusal is about.
+    let destination = directory.join("dest");
+    fs::create_dir(&destination).expect("creates the destination");
+    let occupied = destination.join("in_resize.zip");
+    fs::write(&occupied, b"already here").expect("writes the obstacle");
+    let output = Command::new(BINARY)
+        .arg("-o")
+        .arg(&destination)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(!output.status.success());
+    assert_eq!(fs::read(&occupied).expect("reads"), b"already here");
+}
+
+/// The input is removed once the output is in place, and not before.
+#[test]
+fn the_input_is_removed_only_after_the_output_is_in_place() {
+    let directory = TempDir::new("delete-org");
+    let input = valid_input(&directory);
+    let output = Command::new(BINARY)
+        .arg("--delete-org")
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(default_output(&input).exists(), "no output was written");
+    assert!(!input.exists(), "the input survived --delete-org");
+
+    // One line, and the removal named on it: a run without the flag prints what it always
+    // printed, so the clause only appears when the removal happened.
+    let line = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(line.lines().count(), 1, "still one line: {line}");
+    assert!(
+        line.contains("removed"),
+        "the removal is not reported: {line}"
+    );
+
+    // A run that fails after the source was opened leaves the input alone. An archive
+    // holding no page this build can read reaches that state: the source opened, the entries
+    // were walked, and there was nothing to write.
+    let directory = TempDir::new("delete-org-failed");
+    let empty = directory.join("empty.zip");
+    write_archive(
+        &empty,
+        &[("ComicInfo.xml".to_owned(), b"<ComicInfo/>".to_vec())],
+    );
+    let output = Command::new(BINARY)
+        .arg("--delete-org")
+        .arg(&empty)
+        .output()
+        .expect("runs the binary");
+    assert!(
+        !output.status.success(),
+        "a page-less archive reported success"
+    );
+    assert!(empty.exists(), "a failed run removed the input");
+}
+
+/// An output resolving onto the input is refused by *existence*, not by an equality test.
+///
+/// The input necessarily exists by the time the output is resolved, because `Source::open`
+/// succeeded first, so `path.exists()` catches every spelling of it. Two spellings equality
+/// would miss are asserted here: a relative path, and — where the filesystem is
+/// case-insensitive, which both release targets default to — a case variant.
+#[test]
+fn an_output_equal_to_the_input_is_refused_however_it_is_spelled() {
+    let directory = TempDir::new("self-destruct");
+    let input = valid_input(&directory);
+    let name = input
+        .file_name()
+        .expect("a name")
+        .to_str()
+        .expect("ASCII")
+        .to_owned();
+
+    let mut spellings = vec![format!(".{}{name}", std::path::MAIN_SEPARATOR)];
+    // Probed rather than assumed: a case-sensitive volume exists on both platforms, and the
+    // claim is about the filesystem the run is on.
+    let probe = directory.join("Probe");
+    fs::write(&probe, b"").expect("writes the probe");
+    if directory.join("probe").exists() {
+        spellings.push(name.to_uppercase());
+    }
+    fs::remove_file(&probe).expect("removes the probe");
+
+    for spelling in spellings {
+        let output = Command::new(BINARY)
+            .current_dir(directory.path())
+            .arg("--delete-org")
+            .arg("-o")
+            .arg(&spelling)
+            .arg(&name)
+            .output()
+            .expect("runs the binary");
+        assert!(!output.status.success(), "-o {spelling} was accepted");
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            message.contains("already exists"),
+            "-o {spelling} was refused for the wrong reason: {message}"
+        );
+        assert!(input.exists(), "-o {spelling} destroyed the input");
     }
 }

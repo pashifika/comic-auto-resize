@@ -2,29 +2,32 @@
 //!
 //! The surface contains exactly what is implemented. A flag may exist and be unimplemented,
 //! or not exist; it must not exist and silently do the wrong thing — so the flags Go had and
-//! this build does not (`--delete-org`, `-o/--out`, `-r/--ratio`, `--small-skip`,
-//! `--optimizer`, `--progressive`) are absent rather than accepted and ignored. Absence is the
-//! honest form of "not yet".
+//! this build does not (`-r/--ratio`, `--small-skip`, `--optimizer`, `--progressive`) are
+//! absent rather than accepted and ignored. Absence is the honest form of "not yet".
 //!
-//! `--fix-idx` was the first flag added since the rewrite began, and `--charset` and `--pwd`
-//! join it in the Change that implements them, which is that rule read the other way round.
+//! `--fix-idx` was the first flag added since the rewrite began; `--charset` and `--pwd`
+//! joined it, and `-o/--out` and `--delete-org` join now, each in the Change that implements
+//! it — which is that rule read the other way round.
 //!
 //! `--charset` is the first flag whose default is not "off", and the asymmetry is the point:
 //! `--fix-idx` defaults to off because the default path is *correct* and renaming is a
 //! preference, while here the default path is wrong — it decodes a Japanese archive's names as
 //! CP437 and turns a page into a subdirectory. A flag defaults to off when what it changes is
-//! a choice, and to on when what it changes is a defect.
+//! a choice, and to on when what it changes is a defect. `--delete-org` removes the user's
+//! input, which is the most destructive choice on the surface, so it is off.
 
+use std::ffi::OsString;
+use std::fs;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
 
-use clap::Parser;
+use clap::{Parser, builder::TypedValueParser};
 use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter};
 use comic_auto_resize::pipeline::{self, Report, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
-use comic_auto_resize::sink::{InputKind, default_output};
+use comic_auto_resize::sink::{InputKind, resolve_output};
 use comic_auto_resize::source::{Charset, DEFAULT_LABELS, Naming, ReadOptions, Source};
 use thiserror::Error;
 
@@ -35,9 +38,28 @@ const MAX_WIDTH: i64 = 65535;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// The comic archive or directory of pages to shrink. A new archive is written beside
-    /// it, with `_resize` appended to the name.
+    /// The comic archive or directory of pages to shrink. The output is written beside it as
+    /// `<stem>_resize.zip` unless `-o` names somewhere else.
     input: PathBuf,
+
+    /// Where to write the output archive. A value naming a location — it ends with a path
+    /// separator, or it is an existing directory — has the default name `<stem>_resize.zip`
+    /// joined to it; any other value is used as the filename verbatim, with no extension
+    /// appended, so `-o out.cbz` writes a zip archive called `out.cbz`. The directory must
+    /// already exist. The reference tool appends `.zip` to this value; this one does not.
+    #[arg(
+        short,
+        long,
+        value_name = "PATH",
+        value_parser = clap::builder::OsStringValueParser::new().try_map(output),
+    )]
+    out: Option<PathBuf>,
+
+    /// Remove the input archive once the output archive is in place. Nothing is removed if
+    /// the run failed. Refused when the input is a directory: this removes the archive it
+    /// read, not a tree.
+    #[arg(long)]
+    delete_org: bool,
 
     /// Normalise every page to this width in pixels; the height follows the page's aspect
     /// ratio.
@@ -96,16 +118,24 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match run(&cli) {
         Ok((report, output)) => {
-            // One line for the run, and the compositing note only when something was
-            // composited: a run that composited nothing prints exactly what it printed before
-            // the rule existed. A line per page would bury the page count on a real archive.
+            // One line for the run, and each extra clause only when the extra thing
+            // happened: a run that composited nothing and removed nothing prints exactly
+            // what it printed before either rule existed. A line per page would bury the
+            // page count on a real archive.
             let composited = if report.composited > 0 {
                 format!(" ({} page(s) composited onto white)", report.composited)
             } else {
                 String::new()
             };
+            // `Ok` and `--delete-org` together mean the input is gone: a removal that failed
+            // is an error, so there is no third state to report.
+            let removed = if cli.delete_org {
+                format!("; {} removed", cli.input.display())
+            } else {
+                String::new()
+            };
             println!(
-                "{} page(s) written to {}{composited}",
+                "{} page(s) written to {}{composited}{removed}",
                 report.pages,
                 output.display()
             );
@@ -167,7 +197,16 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
         Source::Directory(_) => InputKind::Directory,
         _ => InputKind::File,
     };
-    let output = default_output(&cli.input, kind)?;
+    // Refused before a page is read, and before the output is even resolved: the pipeline
+    // reads the page files a directory holds and passes over everything else, so removing
+    // the input would take files it never looked at. Go attempts the removal, fails, logs,
+    // and exits zero — a flag accepted and then ignored.
+    if cli.delete_org && kind == InputKind::Directory {
+        return Err(CliError::DeleteDirectory {
+            path: cli.input.clone(),
+        });
+    }
+    let output = resolve_output(&cli.input, kind, cli.out.as_deref())?;
 
     // A `SourceError` raised during iteration would otherwise reach the user through two
     // transparent wrappers with no path at all, while the same error raised inside
@@ -180,6 +219,18 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
         },
         other => CliError::Run(other),
     })?;
+
+    // `pipeline::run` took the source by value and dropped it before returning, so this
+    // process holds no handle to the input — which is what makes the removal safe on
+    // Windows. Nothing is removed unless the output archive reached its final path, which is
+    // what `Ok` here means.
+    if cli.delete_org {
+        fs::remove_file(&cli.input).map_err(|source| CliError::InputNotRemoved {
+            output: output.clone(),
+            path: cli.input.clone(),
+            source,
+        })?;
+    }
     Ok((report, output))
 }
 
@@ -200,6 +251,20 @@ fn worker_count() -> NonZeroUsize {
 /// belongs to the reader's rule rather than to the parser: `main` supplies only the default.
 fn charset(labels: &str) -> Result<Charset, comic_auto_resize::source::BadLabel> {
     Charset::resolve(labels)
+}
+
+/// Refuses an empty `-o`, so no value reaching resolution names a path that cannot be
+/// printed.
+///
+/// An empty value is neither arm of the resolution: it names no directory to join a default
+/// name to and no file to use verbatim, and every later refusal would have to describe a path
+/// with nothing to display. `OsString` rather than `String`, because an output path is not
+/// required to be UTF-8 on either release target.
+fn output(value: OsString) -> Result<PathBuf, &'static str> {
+    if value.is_empty() {
+        return Err("an empty value names no path to write");
+    }
+    Ok(PathBuf::from(value))
 }
 
 #[derive(Debug, Error)]
@@ -224,4 +289,24 @@ enum CliError {
     Dct(comic_auto_resize::page::UnknownDctMethod),
     #[error(transparent)]
     Run(#[from] pipeline::RunError),
+    /// `--delete-org` with a directory input. The pipeline reads the page files a directory
+    /// holds and passes over everything else, so removing the input would take files it never
+    /// read; widening it to a recursive delete would promise more than "delete the original".
+    /// The reference tool attempts the removal, fails, logs, and exits zero.
+    ///
+    /// `CliError`'s rather than `RunError`'s because deleting the input is not something the
+    /// pipeline does: `main` does it after `pipeline::run` has returned and dropped the
+    /// source.
+    #[error("{}: is a directory; --delete-org removes the input archive, not a tree", path.display())]
+    DeleteDirectory { path: PathBuf },
+    /// The output is in place and the input is still there. Both facts are named because the
+    /// obvious retry would otherwise meet the existing-output refusal and report a second,
+    /// unrelated failure; exiting zero would repeat the accepted-and-ignored shape one level
+    /// down.
+    #[error("{}: written, but the input {} could not be removed: {source}", output.display(), path.display())]
+    InputNotRemoved {
+        output: PathBuf,
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }

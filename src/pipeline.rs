@@ -572,6 +572,17 @@ pub enum RunError {
     /// resolved, so `.` is the directory the user is standing in rather than this case.
     #[error("{}: cannot name an output for a directory with no name of its own", path.display())]
     UnnamedInput { path: PathBuf },
+    /// `-o` named a directory to write into that is not there. Creating it is declined, and
+    /// the containment check below needs a path that canonicalises, which a directory that
+    /// does not exist has none of. Names the directory rather than the value, because the
+    /// value may have been a filename whose parent is the missing part.
+    #[error("{}: no such directory to write the output into", path.display())]
+    MissingOutputDirectory { path: PathBuf },
+    /// The resolved output would land inside a directory input, within the set of files the
+    /// input describes, where the next run would read it as a page. Reachable through both of
+    /// `-o`'s arms, so the bound is on the resolved path rather than on the value.
+    #[error("{}: would be written inside the input {}", path.display(), input.display())]
+    OutputInsideInput { path: PathBuf, input: PathBuf },
 }
 
 #[cfg(test)]
