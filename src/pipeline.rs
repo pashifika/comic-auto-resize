@@ -256,11 +256,13 @@ pub struct Capacities {
 }
 
 impl Capacities {
-    /// The window is saturated rather than wrapped: `--jobs` is a caller's number with no
-    /// upper bound, and `usize::MAX / WINDOW_PER_JOB` workers wrapping to a zero-capacity
-    /// window would turn `credits` into a rendezvous — the one shape the bound above argues
-    /// against — instead of failing. A count that large fails when the channel is allocated
-    /// or when the threads are spawned, which is the caller's answer either way.
+    /// The window is saturated rather than wrapped, for the caller the flag does not reach.
+    /// `--jobs` is bounded by a host-derived ceiling before it gets here, but [`Settings`] is
+    /// public: a library caller may pass any `NonZeroUsize`, and one above
+    /// `usize::MAX / WINDOW_PER_JOB` wrapping to a zero-capacity window would turn `credits`
+    /// into a rendezvous — the one shape the bound above argues against — and report it as a
+    /// window rather than as a failure. Saturated, such a count fails where it should: at the
+    /// allocation.
     #[must_use]
     pub const fn for_jobs(jobs: NonZeroUsize) -> Self {
         let jobs = jobs.get();

@@ -1138,12 +1138,19 @@ fn a_worker_count_above_the_hosts_ceiling_is_refused_before_any_work() {
         );
     }
 
-    // The number is the host's, so the help states the rule rather than the number.
+    // The number is the host's, so the help states the rule rather than the number — and both
+    // arms of it, because on a host of one or two cores the four-worker floor is the arm that
+    // decides and a help naming only the doubling would understate the accepted range.
     let help = help_for("--jobs");
-    assert!(
-        help.contains("twice this host's core count"),
-        "`--jobs`'s help does not state the ceiling: {help}"
-    );
+    for arm in [
+        "twice this host's available parallelism",
+        "never fewer than four",
+    ] {
+        assert!(
+            help.contains(arm),
+            "`--jobs`'s help does not state `{arm}`: {help}"
+        );
+    }
 }
 
 /// The two facts a reader cannot infer from the flag's name, in the flag's own help.

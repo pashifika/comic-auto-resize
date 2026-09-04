@@ -284,9 +284,12 @@ mod tests {
     ///
     /// Go computes `math.Round(width × float64(percent)/100)`, and `percent/100` is inexact
     /// in binary: `1430 × 0.35` evaluates to `500.49999999999994`, which rounds *down* to
-    /// 500 where the exact half rounds up to 501. Go's floor is `reW <= 500` and inclusive,
-    /// so that one pixel is the difference between a resize and a pass-through there. Here
-    /// the value is exact and the page is resized.
+    /// 500 where the exact half rounds up to 501. Go's `reW <= 500` is inclusive, so on a
+    /// page whose height clears both builds' floors that one pixel is the difference between
+    /// a resize there and a pass-through: 1430×2000 resizes here and is refused there.
+    ///
+    /// Crossing that width predicate is not by itself a different outcome for the page —
+    /// both builds test two axes — which is why the short-page case is pinned below too.
     ///
     /// Enumerated over widths 1..=65,535 and percentages 1..=100, the two rules disagree on
     /// 3,293 pairs, always by one pixel and always with this rule the higher; exactly two of
@@ -299,5 +302,8 @@ mod tests {
         assert_eq!(plan(1430, 2000, 501), Plan::Resize { width: 501 });
         // The less dramatic form of the same disagreement: one pixel, both tools resizing.
         assert_eq!(Target::Ratio(58).width_for(875), 508);
+        // A short page at the same width is not a divergence: 501 wide makes a 70-pixel
+        // height, under this floor, and 500 is not above Go's, so both pass it through.
+        assert_eq!(plan(1430, 200, 501), Plan::BelowFloor);
     }
 }

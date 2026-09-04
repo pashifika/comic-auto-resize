@@ -26,6 +26,7 @@ use std::fs;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::LazyLock;
 use std::thread;
 
 use clap::{Parser, builder::TypedValueParser};
@@ -133,10 +134,11 @@ struct Cli {
     pwd: Option<String>,
 
     /// How many pages are decoded, resized and encoded at once, at most twice this host's
-    /// core count. Peak memory scales with this: roughly the worker count times the largest
-    /// page's decoded working set, which measured 2.59 GB for nine workers on nine 4608x7281
-    /// webp pages. Lower it on a machine that cannot spare that; the full term is in
-    /// `src/pipeline.rs`. The reference tool derives this number and offers no way to set it.
+    /// available parallelism and never fewer than four. Peak memory scales with this: roughly
+    /// the worker count times the largest page's decoded working set, which measured 2.59 GB
+    /// for nine workers on nine 4608x7281 webp pages. Lower it on a machine that cannot spare
+    /// that; the full term is in `src/pipeline.rs`. The reference tool derives this number and
+    /// offers no way to set it.
     #[arg(long, default_value_t = worker_count(), value_parser = jobs, value_name = "COUNT")]
     jobs: NonZeroUsize,
 }
@@ -327,6 +329,22 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
     Ok((report, output))
 }
 
+/// What the reference tool assumes when it cannot read the host: the count it falls back to
+/// below five cores.
+const DEFAULT_CORES: NonZeroUsize = NonZeroUsize::new(4).expect("four is not zero");
+
+/// What the host says it can run in parallel, or [`DEFAULT_CORES`] when it will not say.
+///
+/// One answer to one question, and taken **once**: both the default and the ceiling derive
+/// from this, `available_parallelism` is documented to track limits that can change while the
+/// process runs, and `clap` re-parses the default it published through the same value parser.
+/// Two readings could therefore straddle a cgroup or affinity change and leave the parser
+/// refusing its own default — on the bare invocation, which is the path that must never fail.
+/// An earlier form read it twice with two different fallbacks, which agreed only by arithmetic
+/// accident.
+static HOST_CORES: LazyLock<NonZeroUsize> =
+    LazyLock::new(|| thread::available_parallelism().unwrap_or(DEFAULT_CORES));
+
 /// How many pages are processed at once by default.
 ///
 /// Mirrors the Go implementation: all but one core once there are five, and four below that.
@@ -334,13 +352,11 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
 /// the pipeline's peak memory is a function of this number, and the flag's help is where the
 /// cost of raising it is stated.
 fn worker_count() -> NonZeroUsize {
-    let cpus = thread::available_parallelism().map_or(4, NonZeroUsize::get);
-    let jobs = if cpus >= 5 { cpus - 1 } else { 4 };
-    NonZeroUsize::new(jobs).unwrap_or(NonZeroUsize::MIN)
+    worker_count_for(*HOST_CORES)
 }
 
-/// The largest worker count worth accepting: twice the host's parallelism, and never below
-/// the default.
+/// The largest worker count worth accepting: twice the host's available parallelism, and
+/// never below the default.
 ///
 /// Bounded rather than open. Each page is decoded, resized and encoded on its worker, so past
 /// the host's own parallelism another worker buys no throughput and costs its whole
@@ -352,12 +368,29 @@ fn worker_count() -> NonZeroUsize {
 /// The reference tool has no ceiling because it has no flag: `errgroup.WithContext(ctx, cpus)`
 /// bounds its own concurrency at the same derived count and there is no way to ask for more.
 /// So every count this accepts above the default is already more than that build could run.
-///
-/// Never below [`worker_count`], because a host reporting fewer than two cores still gets the
-/// reference tool's floor of four workers and a default the parser refuses is not a default.
 fn max_jobs() -> NonZeroUsize {
-    let cores = thread::available_parallelism().map_or(1, NonZeroUsize::get);
-    let ceiling = cores.saturating_mul(2).max(worker_count().get());
+    max_jobs_for(*HOST_CORES)
+}
+
+/// The default for a host of `cores`, split out so the invariant below can be tested.
+fn worker_count_for(cores: NonZeroUsize) -> NonZeroUsize {
+    let cores = cores.get();
+    let jobs = if cores >= 5 { cores - 1 } else { 4 };
+    NonZeroUsize::new(jobs).unwrap_or(NonZeroUsize::MIN)
+}
+
+/// The ceiling for a host of `cores`.
+///
+/// **Never below [`worker_count_for`] of the same host**, and that is load-bearing rather than
+/// tidy: `default_value_t` is re-parsed through the same `value_parser`, so a default above
+/// the ceiling would make the parser refuse its own default and every bare invocation would
+/// exit non-zero. A host of two cores is where the two meet — four either way — because the
+/// reference tool's floor of four workers applies below five cores whatever the host reports.
+fn max_jobs_for(cores: NonZeroUsize) -> NonZeroUsize {
+    let ceiling = cores
+        .get()
+        .saturating_mul(2)
+        .max(worker_count_for(cores).get());
     NonZeroUsize::new(ceiling).unwrap_or(NonZeroUsize::MIN)
 }
 
@@ -475,4 +508,43 @@ enum CliError {
         path: PathBuf,
         source: std::io::Error,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_CORES, max_jobs_for, worker_count_for};
+    use std::num::NonZeroUsize;
+
+    /// The default is never above the ceiling, on any host.
+    ///
+    /// `default_value_t` is re-parsed through the same `value_parser` the flag uses, so a
+    /// host where the default exceeded the ceiling would make `clap` refuse its own default
+    /// and every bare invocation would exit non-zero. The ceiling's `.max()` is what
+    /// guarantees it, and one and two cores are the only rows where that clause is what
+    /// decides — twice one core is 2 and twice two is 4 against the reference tool's floor of
+    /// four workers.
+    #[test]
+    fn the_default_worker_count_is_inside_the_ceiling_on_every_host() {
+        for cores in [1usize, 2, 3, 4, 5, 6, 9, 10, 64, 256, usize::MAX] {
+            let cores = NonZeroUsize::new(cores).expect("non-zero");
+            let default = worker_count_for(cores);
+            let ceiling = max_jobs_for(cores);
+            assert!(
+                default <= ceiling,
+                "{cores} core(s): default {default} is above the ceiling {ceiling}"
+            );
+        }
+    }
+
+    /// The derivation the reference tool uses, at the boundary it turns on.
+    #[test]
+    fn the_default_mirrors_the_reference_tools_derivation() {
+        for (cores, expected) in [(1, 4), (2, 4), (4, 4), (5, 4), (6, 5), (10, 9)] {
+            let cores = NonZeroUsize::new(cores).expect("non-zero");
+            assert_eq!(worker_count_for(cores).get(), expected, "{cores} core(s)");
+        }
+        // A host that cannot be read is treated as the count the reference tool falls back
+        // to, so the default is the same four workers either way.
+        assert_eq!(worker_count_for(DEFAULT_CORES).get(), 4);
+    }
 }
