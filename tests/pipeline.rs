@@ -1168,9 +1168,9 @@ fn a_worker_count_above_the_hosts_ceiling_is_refused_before_any_work() {
     );
 
     // The number is the host's, so the help states the rule rather than the number — and both
-    // arms of it, because on a host of one or two cores the four-worker floor is the arm that
-    // decides and a help naming only the doubling would understate the accepted range.
-    let help = help_for("--jobs");
+    // arms of it: on a single-core host the four-worker floor is what decides, at two cores
+    // the arms meet at four, and a help naming only the doubling would understate the
+    // accepted range on the first of those.
     for arm in [
         "twice this host's available parallelism",
         "never fewer than four",
