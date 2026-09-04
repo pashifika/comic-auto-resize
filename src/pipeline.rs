@@ -181,11 +181,12 @@
 //! predict the peak; the deciding term is which decoder read the archive, and for one format it
 //! is now bounded rather than merely large.
 //!
-//! **`J` is deliberately not bounded here.** It is the largest single factor, it is
-//! `worker_count()`'s to pick, and choosing it belongs to whoever owns the command-line surface
-//! — there is no `--jobs` yet, and adding one is where a default gets argued. What this module
-//! owes that decision is the per-worker term above, which is why it is stated as a product
-//! rather than as a number.
+//! **`J` is the caller's, and deliberately not bounded here.** It is the largest single
+//! factor, and `--jobs` now sets it — defaulting to the same host-derived count this pipeline
+//! has always used, so a bare invocation is unchanged. What this module owes that flag is the
+//! per-worker term above rather than a ceiling: the deciding term is the page and its format,
+//! neither of which the caller knows when they pick the number, so the product is the honest
+//! thing to hand them.
 //!
 //! # Working memory a decoder sizes from the input
 //!
@@ -232,7 +233,7 @@ use thiserror::Error;
 use crate::page::{
     DecodeSettings, EncodeSettings, Filter, Format, PageError, Resampler, decode, encode, header,
 };
-use crate::policy::{self, Plan};
+use crate::policy::{self, Plan, Target};
 use crate::sink::{Page, PageKey, Sink};
 use crate::source::{Entries, SourceError};
 
@@ -255,11 +256,18 @@ pub struct Capacities {
 }
 
 impl Capacities {
+    /// The window is saturated rather than wrapped, for the caller the flag does not reach.
+    /// `--jobs` is bounded by a host-derived ceiling before it gets here, but [`Settings`] is
+    /// public: a library caller may pass any `NonZeroUsize`, and one above
+    /// `usize::MAX / WINDOW_PER_JOB` wrapping to a zero-capacity window would turn `credits`
+    /// into a rendezvous — the one shape the bound above argues against — and report it as a
+    /// window rather than as a failure. Saturated, such a count fails where it should: at the
+    /// allocation.
     #[must_use]
     pub const fn for_jobs(jobs: NonZeroUsize) -> Self {
         let jobs = jobs.get();
         Self {
-            credits: jobs * WINDOW_PER_JOB,
+            credits: jobs.saturating_mul(WINDOW_PER_JOB),
             work: jobs,
             done: jobs,
         }
@@ -270,8 +278,8 @@ impl Capacities {
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     pub jobs: NonZeroUsize,
-    /// Target width for normalisation. The height follows from each page's aspect ratio.
-    pub target_width: u32,
+    /// How each page's target width is chosen. The height follows from its aspect ratio.
+    pub target: Target,
     pub filter: Filter,
     /// `scale_to` is ignored: the resize policy decides it per page.
     pub decode: DecodeSettings,
@@ -301,6 +309,17 @@ pub struct Report {
     /// still ends the run, and only a page the tool processed and took a decision about is
     /// counted here.
     pub composited: u32,
+    /// How many pages the floor refused a reduction for, passing them through whole.
+    ///
+    /// [`composited`](Self::composited)'s shape and for its reasons: one count for the run
+    /// rather than a line per page, and zero means the caller says nothing about it.
+    ///
+    /// What it counts is [`Plan::BelowFloor`] — a page the caller asked to shrink and the
+    /// floor sent through at source size. A page already at or below the target passes
+    /// through too, and always has; counting that one would report the normal case as an
+    /// event. The distinction is [`policy::plan`]'s rather than this module's, so a count
+    /// and a decision cannot drift apart.
+    pub below_floor: u32,
 }
 
 /// Processes every page of `source` into a new archive at `output`.
@@ -386,11 +405,13 @@ pub fn run<S: Entries + Send>(
         // where the composited pages are counted, because it is the one stage that sees every
         // page exactly once and in one thread.
         let mut composited = 0;
+        let mut below_floor = 0;
         let mut failure = None;
         while let Ok(finished) = done_rx.recv() {
             match finished {
                 Ok(finished) => {
                     composited += u32::from(finished.composited);
+                    below_floor += u32::from(finished.below_floor);
                     match sink.accept(finished.page) {
                         Ok(written) => {
                             for _ in 0..written {
@@ -424,7 +445,7 @@ pub fn run<S: Entries + Send>(
         // usually just the disconnect the failure caused.
         match (failure, read) {
             (Some(error), _) | (None, Err(error)) => Err(error),
-            (None, Ok(())) => Ok(composited),
+            (None, Ok(())) => Ok((composited, below_floor)),
         }
     });
 
@@ -438,8 +459,14 @@ pub fn run<S: Entries + Send>(
     // page, a central directory that will not write, and a flush that will not complete all
     // leave a file to remove.
     let failure = match outcome {
-        Ok(composited) => match sink.finish() {
-            Ok(pages) => return Ok(Report { pages, composited }),
+        Ok((composited, below_floor)) => match sink.finish() {
+            Ok(pages) => {
+                return Ok(Report {
+                    pages,
+                    composited,
+                    below_floor,
+                });
+            }
             Err(error) => error,
         },
         Err(error) => error,
@@ -472,6 +499,8 @@ struct Job {
 struct Finished {
     page: Page,
     composited: bool,
+    /// Whether the floor refused the reduction this page's target asked for.
+    below_floor: bool,
 }
 
 /// Reads the archive once, taking a credit before each entry.
@@ -521,7 +550,10 @@ fn process(
     // format, including the three whose decoder cannot scale. The budget is passed here
     // because reading a *png*'s header is itself an allocating operation.
     let (source_width, source_height) = header(&name, &bytes, format, settings.decode.budget)?;
-    let plan = policy::plan(source_width, source_height, settings.target_width);
+    // A ratio is a target width named relative to the page, so it is resolved here — where
+    // the page's own width is known — and `plan` takes the one number either way.
+    let target_width = settings.target.width_for(source_width);
+    let plan = policy::plan(source_width, source_height, target_width);
 
     let decoded = decode(
         &name,
@@ -532,16 +564,17 @@ fn process(
             ..settings.decode
         },
     )?;
-    // Pass-through skips the resize and nothing else.
+    // Pass-through skips the resize and nothing else, whichever of the two reasons it was.
     let page = match plan {
         Plan::Resize { width } => resampler.resize(&name, &decoded.page, width, settings.filter)?,
-        Plan::PassThrough => decoded.page,
+        Plan::PassThrough | Plan::BelowFloor => decoded.page,
     };
     let bytes = encode(&name, &page, settings.encode)?;
 
     Ok(Finished {
         page: Page { key, name, bytes },
         composited: decoded.composited,
+        below_floor: matches!(plan, Plan::BelowFloor),
     })
 }
 
@@ -646,5 +679,18 @@ mod tests {
             // of order without stalling the reader.
             assert!(capacities.credits > capacities.work);
         }
+    }
+
+    /// The window saturates instead of wrapping.
+    ///
+    /// A count this large cannot run — the channel allocation refuses it long before the
+    /// threads do — but wrapping would have made `credits` zero, which is the rendezvous the
+    /// test above exists to reject, and it would have been reported as a window rather than
+    /// as a failure.
+    #[test]
+    fn an_absurd_worker_count_saturates_the_window_rather_than_wrapping_it() {
+        let capacities = Capacities::for_jobs(NonZeroUsize::MAX);
+        assert_eq!(capacities.credits, usize::MAX);
+        assert!(capacities.credits >= capacities.work);
     }
 }

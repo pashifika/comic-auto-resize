@@ -18,7 +18,7 @@ use std::process::Command;
 
 use comic_auto_resize::page::{DecodeSettings, EncodeSettings, Filter};
 use comic_auto_resize::pipeline::{self, Settings};
-use comic_auto_resize::policy::AUTO_WIDTH;
+use comic_auto_resize::policy::{AUTO_WIDTH, Target};
 use comic_auto_resize::sink::{InputKind, default_output};
 use comic_auto_resize::source::{Charset, ReadOptions, Source, SourceError, ZipSource};
 use support::{Encoded, Encryption, TempDir, encoded_archive, page_bytes, read_archive};
@@ -49,7 +49,7 @@ fn page() -> Vec<u8> {
 fn settings() -> Settings {
     Settings {
         jobs: std::num::NonZeroUsize::new(2).expect("two"),
-        target_width: AUTO_WIDTH,
+        target: Target::Width(AUTO_WIDTH),
         filter: Filter::default(),
         decode: DecodeSettings::default(),
         encode: EncodeSettings::default(),

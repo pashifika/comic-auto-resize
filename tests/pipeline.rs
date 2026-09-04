@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use comic_auto_resize::page::{DecodeSettings, EncodeSettings, Filter, PageErrorKind};
-use comic_auto_resize::pipeline::{self, Capacities, RunError, Settings};
-use comic_auto_resize::policy::AUTO_WIDTH;
+use comic_auto_resize::pipeline::{self, Capacities, Report, RunError, Settings};
+use comic_auto_resize::policy::{AUTO_WIDTH, Target};
 use comic_auto_resize::sink::InputKind;
 use comic_auto_resize::source::{ReadOptions, SourceError, ZipSource};
 
@@ -41,7 +41,7 @@ fn default_output(input: &std::path::Path) -> std::path::PathBuf {
 fn settings(jobs: usize) -> Settings {
     Settings {
         jobs: NonZeroUsize::new(jobs).expect("non-zero"),
-        target_width: AUTO_WIDTH,
+        target: Target::Width(AUTO_WIDTH),
         filter: Filter::default(),
         decode: DecodeSettings::default(),
         encode: EncodeSettings::default(),
@@ -79,6 +79,25 @@ fn run(input: &[u8], output: &Path, jobs: usize) -> Result<u32, RunError> {
         &ReadOptions::default(),
     )?;
     pipeline::run(source, output, &settings(jobs)).map(|report| report.pages)
+}
+
+/// The same, with a target of the caller's choosing and the whole report rather than the
+/// page count.
+fn run_with_target(input: &[u8], output: &Path, target: Target) -> Report {
+    let source = ZipSource::new(
+        std::io::Cursor::new(input.to_vec()),
+        &ReadOptions::default(),
+    )
+    .expect("the fixture is a zip");
+    pipeline::run(
+        source,
+        output,
+        &Settings {
+            target,
+            ..settings(2)
+        },
+    )
+    .expect("the fixture runs")
 }
 
 fn archive_bytes(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
@@ -749,22 +768,15 @@ fn valid_input(directory: &TempDir) -> std::path::PathBuf {
 /// accepted and ignored.
 ///
 /// `--charset` and `--pwd` were here until they were implemented, and moved into the list
-/// below in the same Change — the movement `--fix-idx` made before them, and the one
-/// `-o/--out` and `--delete-org` make now.
+/// below in the same Change — the movement `--fix-idx` made before them, then `-o/--out` and
+/// `--delete-org`, and now `-r/--ratio` and `--jobs`. `--split` is the only one left, and it
+/// is here because `spread-split` has not implemented it yet.
 #[test]
 fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
     let directory = TempDir::new("unknown-flags");
     let input = valid_input(&directory);
 
-    for flag in [
-        "--jobs",
-        "-r",
-        "--ratio",
-        "--split",
-        "--small-skip",
-        "--optimizer",
-        "--progressive",
-    ] {
+    for flag in ["--split", "--small-skip", "--optimizer", "--progressive"] {
         let output = Command::new(BINARY)
             .arg(flag)
             .arg(&input)
@@ -789,7 +801,7 @@ fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
 /// `--help` lists exactly what exists, in both directions.
 #[test]
 fn help_lists_every_implemented_option_and_nothing_else() {
-    // The nine the tool implements, plus what clap adds for free.
+    // The eleven the tool implements, plus what clap adds for free.
     let mut expected = vec![
         "auto-width".to_owned(),
         "charset".to_owned(),
@@ -797,9 +809,11 @@ fn help_lists_every_implemented_option_and_nothing_else() {
         "delete-org".to_owned(),
         "fix-idx".to_owned(),
         "help".to_owned(),
+        "jobs".to_owned(),
         "out".to_owned(),
         "pwd".to_owned(),
         "quality".to_owned(),
+        "ratio".to_owned(),
         "resize-mode".to_owned(),
         "version".to_owned(),
     ];
@@ -823,7 +837,8 @@ fn no_option_sets_the_minimum_edge_or_a_budget() {
     }
 }
 
-/// An out-of-range value is refused by the parser, before the input is opened.
+/// An out-of-range value, or a combination that names one quantity twice, is refused by the
+/// parser before the input is opened.
 #[test]
 fn an_out_of_range_option_value_is_refused_before_any_work() {
     let directory = TempDir::new("bad-values");
@@ -836,6 +851,16 @@ fn an_out_of_range_option_value_is_refused_before_any_work() {
         vec!["--auto-width", "65536"],
         vec!["--resize-mode", "nearest"],
         vec!["--dct", "fast"],
+        vec!["--ratio", "0"],
+        vec!["--ratio", "101"],
+        // Zero workers is no pipeline at all, and the parser is where that is refused.
+        vec!["--jobs", "0"],
+        // Both name a target width, one relative and one absolute, so there is no precedence
+        // to pick. Both orders, because a conflict declared on one arm has to refuse from
+        // either side — and deleting the exclusivity would otherwise leave every other test
+        // passing while `-r` silently won.
+        vec!["--ratio", "30", "--auto-width", "1000"],
+        vec!["--auto-width", "1000", "--ratio", "30"],
     ] {
         let output = Command::new(BINARY)
             .args(&args)
@@ -861,6 +886,9 @@ fn an_out_of_range_option_value_is_refused_before_any_work() {
         vec!["--auto-width", "65535"],
         vec!["--resize-mode", "nearest-neighbor"],
         vec!["--dct", "islow"],
+        vec!["--ratio", "1"],
+        vec!["--ratio", "100"],
+        vec!["--jobs", "1"],
     ] {
         let scratch = TempDir::new("good-values");
         let good = valid_input(&scratch);
@@ -875,13 +903,18 @@ fn an_out_of_range_option_value_is_refused_before_any_work() {
 
 /// Each accepted flag that changes a page's *bytes* changes them in a way attributable to it.
 ///
-/// A flag that parses and then does nothing is the failure this guards against. Nine flags
-/// exist and four of them change page bytes, so the other five are asserted where their rules
+/// A flag that parses and then does nothing is the failure this guards against. Eleven flags
+/// exist and five of them change page bytes, so the other six are asserted where their rules
 /// live: `--fix-idx` in `tests/entry_naming.rs`, `--charset` and `--pwd` in
 /// `tests/entry_charset.rs`, and `-o`/`--delete-org` — which change neither page bytes nor
 /// entry names, only where the output goes and whether the input survives — in
 /// `an_output_value_resolves_as_a_location_or_as_a_filename` and
 /// `the_input_is_removed_only_after_the_output_is_in_place` below.
+///
+/// `--jobs` is the one accepted flag that must **not** change the output: it changes what the
+/// run costs, and the archive being identical at any worker count is the ordering writer's
+/// guarantee. That direction is asserted in
+/// `the_worker_count_is_the_hosts_by_default_and_does_not_reach_the_output`.
 #[test]
 fn every_accepted_flag_changes_the_output() {
     fn run_with(args: &[&str], label: &str) -> Vec<u8> {
@@ -903,10 +936,15 @@ fn every_accepted_flag_changes_the_output() {
 
     let baseline = run_with(&[], "flag-baseline");
 
-    // A different target width changes the dimensions.
+    // A different target width changes the dimensions, named absolutely or as a ratio. 70
+    // per cent of 1520 is 1064, and it is *not* 1280: the reference tool's `-r 70` produces
+    // 1280 because it discards the ratio, and this is the assertion that fails if that
+    // special case is ever reintroduced through the command line.
     let narrower = run_with(&["--auto-width", "1000"], "flag-width");
+    let ratioed = run_with(&["-r", "70"], "flag-ratio");
     assert_eq!(jpeg_size(&baseline), Some((1280, 1811)));
     assert_eq!(jpeg_size(&narrower), Some((1000, 1414)));
+    assert_eq!(jpeg_size(&ratioed), Some((1064, 1505)));
 
     // The other three change the bytes at the same dimensions.
     for (args, label) in [
@@ -922,6 +960,271 @@ fn every_accepted_flag_changes_the_output() {
         );
         assert_ne!(changed, baseline, "{args:?} did not change the output");
     }
+}
+
+/// The floor's count covers a reduction that was refused, and nothing else.
+///
+/// The same three pages under two targets is what separates the two pass-through cases: at
+/// 30 per cent every page is asked to shrink and two of them cannot, while at the default
+/// width the two small pages are already under the target and were never asked. A counter
+/// implemented as "passed through" rather than "refused" reports 2 in both runs.
+#[test]
+fn the_floor_counts_a_refused_reduction_and_not_a_page_already_small() {
+    let entries = vec![
+        ("large.jpg".to_owned(), page_bytes(1520, 2150)),
+        ("small.jpg".to_owned(), page_bytes(600, 850)),
+        ("smaller.jpg".to_owned(), page_bytes(400, 560)),
+    ];
+    let input = archive_bytes(&entries);
+    let directory = TempDir::new("floor-count");
+
+    // 30 per cent: 1520 becomes 456 and is resized; 600 becomes 180 and 400 becomes 120,
+    // both under the 250 floor, so both pass through at source size and are counted.
+    let ratio = run_with_target(&input, &directory.join("ratio.zip"), Target::Ratio(30));
+    assert_eq!(ratio.pages, 3);
+    assert_eq!(ratio.below_floor, 2);
+    let sizes: Vec<_> = read_archive(&directory.join("ratio.zip"))
+        .iter()
+        .map(|(_, bytes)| jpeg_size(bytes))
+        .collect();
+    assert_eq!(
+        sizes,
+        [Some((456, 645)), Some((600, 850)), Some((400, 560))],
+        "a refused page is in the output at source size, not missing from it"
+    );
+
+    // The same pages normalised to 1280: the two small ones are already narrower than the
+    // target, so nothing was asked of them and nothing is counted.
+    let width = run_with_target(
+        &input,
+        &directory.join("width.zip"),
+        Target::Width(AUTO_WIDTH),
+    );
+    assert_eq!(width.pages, 3);
+    assert_eq!(width.below_floor, 0);
+}
+
+/// A run that refused nothing prints what it printed before the count existed, and a run
+/// that refused something says so once. Through the binary, because the line is the
+/// binary's.
+#[test]
+fn the_summary_line_mentions_the_floor_only_when_it_refused_something() {
+    fn summary(args: &[&str], label: &str) -> String {
+        let directory = TempDir::new(label);
+        let input = directory.join("in.zip");
+        write_archive(
+            &input,
+            &[
+                ("large.jpg".to_owned(), page_bytes(1520, 2150)),
+                ("small.jpg".to_owned(), page_bytes(600, 850)),
+            ],
+        );
+        let output = Command::new(BINARY)
+            .args(args)
+            .arg(&input)
+            .output()
+            .expect("runs the binary");
+        assert!(output.status.success(), "{args:?} failed");
+        String::from_utf8(output.stdout).expect("stdout is UTF-8")
+    }
+
+    let bare = summary(&[], "floor-line-bare");
+    assert_eq!(
+        bare.lines().count(),
+        1,
+        "the success line is one line: {bare}"
+    );
+    assert!(bare.contains("2 page(s) written to"), "{bare}");
+    assert!(
+        !bare.contains("too small"),
+        "a run that refused nothing says nothing about the floor: {bare}"
+    );
+
+    let refused = summary(&["-r", "30"], "floor-line-ratio");
+    assert_eq!(
+        refused.lines().count(),
+        1,
+        "still one line for the run: {refused}"
+    );
+    assert!(refused.contains("2 page(s) written to"), "{refused}");
+    assert!(
+        refused.contains("1 page(s) too small to shrink, kept at full size"),
+        "the count reaches the user: {refused}"
+    );
+}
+
+/// `--jobs` is accepted, defaults to the count the binary derives from the host, and the
+/// archive does not depend on it.
+///
+/// What the value costs is memory and time rather than bytes, so the flag's effect on a run
+/// is measured in the Change's evidence rather than asserted here; what is asserted is that
+/// the number is the host's, that the output is invariant under it, and — below — that the
+/// help says what raising it costs.
+#[test]
+fn the_worker_count_is_the_hosts_by_default_and_does_not_reach_the_output() {
+    let cpus = std::thread::available_parallelism().map_or(4, NonZeroUsize::get);
+    let derived = if cpus >= 5 { cpus - 1 } else { 4 };
+    assert!(
+        help_for("--jobs").contains(&format!("[default: {derived}]")),
+        "the default is not the host-derived count: {}",
+        help_for("--jobs")
+    );
+
+    let directory = TempDir::new("jobs-invariant");
+    let input = directory.join("in.zip");
+    write_pages(&input, 4, 1520, 2150);
+    let mut archives = Vec::new();
+    for jobs in ["1", "3"] {
+        let status = Command::new(BINARY)
+            .args(["--jobs", jobs])
+            .arg(&input)
+            .status()
+            .expect("runs the binary");
+        assert!(status.success(), "--jobs {jobs} failed");
+        archives.push(fs::read(default_output(&input)).expect("reads the output"));
+        fs::remove_file(default_output(&input)).expect("clears the output");
+    }
+    assert_eq!(
+        archives[0], archives[1],
+        "the worker count changed the archive"
+    );
+}
+
+/// The worker count has a ceiling, and it is the host's rather than a constant.
+///
+/// Each page is decoded, resized and encoded on its worker, so past the host's own
+/// parallelism another worker buys no throughput and costs its whole per-worker term in
+/// memory. Refusing at the parser is also what keeps an absurd value away from the channel
+/// allocation and the thread spawn, where the machine answers with a panic rather than the
+/// tool answering with a refusal. The reference tool cannot be exceeded at all: its own
+/// `errgroup` is bounded at the same derived count.
+#[test]
+fn a_worker_count_above_the_hosts_ceiling_is_refused_before_any_work() {
+    // The same fallback the binary uses when the host will not answer — `DEFAULT_CORES`, the
+    // count the reference tool assumes — because a test that assumed a different one would
+    // compute a different ceiling and fail on exactly the error path the constant defines.
+    let cores = std::thread::available_parallelism().map_or(4, NonZeroUsize::get);
+    let derived = if cores >= 5 { cores - 1 } else { 4 };
+    let ceiling = (cores * 2).max(derived);
+
+    let directory = TempDir::new("jobs-ceiling");
+    let input = valid_input(&directory);
+
+    // The ceiling itself runs, so the refusals below are the ceiling and not a smaller
+    // accident.
+    let status = Command::new(BINARY)
+        .args(["--jobs", &ceiling.to_string()])
+        .arg(&input)
+        .status()
+        .expect("runs the binary");
+    assert!(status.success(), "--jobs {ceiling} was refused");
+    fs::remove_file(default_output(&input)).expect("clears the output");
+
+    for jobs in [ceiling + 1, 1_000_000, usize::MAX] {
+        let output = Command::new(BINARY)
+            .args(["--jobs", &jobs.to_string()])
+            .arg(&input)
+            .output()
+            .expect("runs the binary");
+        assert!(
+            !output.status.success(),
+            "--jobs {jobs} was accepted; the host cannot use it"
+        );
+        let message = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            message.contains(&ceiling.to_string()),
+            "the refusal does not name the ceiling: {message}"
+        );
+        assert!(
+            !default_output(&input).exists(),
+            "--jobs {jobs} produced an output archive"
+        );
+    }
+
+    // Refused *before the input is opened*, which the assertions above cannot tell from a
+    // refusal inside the run: against a path that does not exist, an over-ceiling count still
+    // reports the ceiling, while a legal one gets as far as opening and reports the missing
+    // file. A ceiling check moved out of the parser would swap those two messages.
+    let absent = directory.join("not-here.zip");
+    let refused = Command::new(BINARY)
+        .args(["--jobs", &(ceiling + 1).to_string()])
+        .arg(&absent)
+        .output()
+        .expect("runs the binary");
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains(&ceiling.to_string()),
+        "the count was not refused before the input was reached: {message}"
+    );
+    let opened = Command::new(BINARY)
+        .args(["--jobs", &ceiling.to_string()])
+        .arg(&absent)
+        .output()
+        .expect("runs the binary");
+    let message = String::from_utf8_lossy(&opened.stderr);
+    assert!(
+        !opened.status.success() && message.contains("not-here.zip"),
+        "a legal count should have reached the input: {message}"
+    );
+
+    // The number is the host's, so the help states the rule rather than the number — and both
+    // arms of it: on a single-core host the four-worker floor is what decides, at two cores
+    // the arms meet at four, and a help naming only the doubling would understate the
+    // accepted range on the first of those.
+    let help = help_for("--jobs");
+    for arm in [
+        "twice this host's available parallelism",
+        "never fewer than four",
+    ] {
+        assert!(
+            help.contains(arm),
+            "`--jobs`'s help does not state `{arm}`: {help}"
+        );
+    }
+}
+
+/// The two facts a reader cannot infer from the flag's name, in the flag's own help.
+///
+/// `-r`'s is the migration: the behaviour the reference tool's `-r 70` gave is this tool's
+/// default, so the answer for an invocation that carried it is to drop it. `--jobs`'s is the
+/// cost, and a measured figure rather than the four-line product the requirement carries.
+#[test]
+fn the_new_flags_state_what_a_reader_cannot_infer() {
+    let ratio = help_for("-r, --ratio");
+    assert!(
+        ratio.contains("1280"),
+        "`-r`'s help does not say what the default normalises to: {ratio}"
+    );
+    assert!(
+        ratio.contains("70"),
+        "`-r`'s help does not name the value that diverges: {ratio}"
+    );
+
+    let jobs = help_for("--jobs");
+    assert!(
+        jobs.contains("memory"),
+        "`--jobs`'s help does not say what the choice costs: {jobs}"
+    );
+    assert!(
+        jobs.contains("2.59 GB"),
+        "`--jobs`'s help does not carry the measured point: {jobs}"
+    );
+}
+
+/// The block of `--help` that belongs to one option: from its name to the next option's.
+fn help_for(flag: &str) -> String {
+    let output = Command::new(BINARY)
+        .arg("--help")
+        .output()
+        .expect("runs the binary");
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let start = text
+        .find(flag)
+        .unwrap_or_else(|| panic!("{flag} is not listed in --help:\n{text}"));
+    let rest = &text[start + flag.len()..];
+    let end = rest.find("\n  -").unwrap_or(rest.len());
+    rest[..end].to_owned()
 }
 
 // ---------------------------------------------------------------- the output path

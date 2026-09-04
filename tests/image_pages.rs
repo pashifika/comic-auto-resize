@@ -20,7 +20,7 @@ use comic_auto_resize::page::{
     Budget, Channels, DecodeSettings, EncodeSettings, Filter, Format, PageErrorKind, decode, header,
 };
 use comic_auto_resize::pipeline::{self, RunError, Settings};
-use comic_auto_resize::policy::AUTO_WIDTH;
+use comic_auto_resize::policy::{AUTO_WIDTH, Target};
 use comic_auto_resize::source::{ReadOptions, SourceError, ZipSource, probe};
 
 use support::{
@@ -41,7 +41,7 @@ const HEIGHT: u32 = 300;
 fn settings() -> Settings {
     Settings {
         jobs: NonZeroUsize::new(2).expect("non-zero"),
-        target_width: AUTO_WIDTH,
+        target: Target::Width(AUTO_WIDTH),
         filter: Filter::default(),
         decode: DecodeSettings::default(),
         encode: EncodeSettings::default(),
@@ -816,6 +816,46 @@ fn the_summary_line_mentions_compositing_only_when_it_happened() {
     assert!(
         output.contains("1 page(s) composited onto white"),
         "the count reaches the user: {output}"
+    );
+}
+
+/// Both clauses on one line, which is the case neither single-clause test covers.
+///
+/// The joining rule is the thing under test: the floor clause carries a comma of its own, so
+/// a comma-joined list would present two facts as three fragments. Two transparent pages at
+/// 30 per cent, one of which the floor refuses, produce both counts in one run.
+#[test]
+fn both_summary_clauses_read_as_two_facts_on_one_line() {
+    let directory = TempDir::new("image-pages-both");
+    let input = directory.path().join("both.zip");
+    write_archive(
+        &input,
+        &[
+            // 1520 wide at 30 per cent is 456, comfortably above the floor.
+            (
+                "page1.png".to_owned(),
+                png_half_transparent_page(1520, 2150),
+            ),
+            // 600 wide at 30 per cent is 180, which the floor refuses.
+            ("page2.png".to_owned(), png_half_transparent_page(600, 850)),
+        ],
+    );
+    let output = String::from_utf8(
+        Command::new(BINARY)
+            .args(["-r", "30"])
+            .arg(&input)
+            .output()
+            .expect("the binary runs")
+            .stdout,
+    )
+    .expect("stdout is UTF-8");
+
+    assert_eq!(output.lines().count(), 1, "still one line: {output}");
+    assert!(
+        output.contains(
+            "(2 page(s) composited onto white; 1 page(s) too small to shrink, kept at full size)"
+        ),
+        "the two clauses do not read as two facts: {output}"
     );
 }
 
