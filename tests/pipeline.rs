@@ -1082,6 +1082,77 @@ fn the_existing_path_refusal_follows_the_resolved_path() {
     assert_eq!(fs::read(&occupied).expect("reads"), b"already here");
 }
 
+/// An output path whose entry cannot be queried stops the run, naming that path.
+///
+/// "Cannot tell" is not "not there": the query needs read-attributes on the output, while the
+/// `create_new` that follows needs add-child on its *directory*, and those are distinct rights
+/// on both targets. Reading a query error as absence would let the run create the partial and
+/// then rename over the very entry the refusal protects, because rename replaces its
+/// destination.
+///
+/// The discriminator is which path the message names. Refusing on the query names the output;
+/// falling through to `create_new` would name `<output>.part`, an internal name no requirement
+/// mentions.
+#[cfg(unix)]
+#[test]
+fn an_output_path_that_cannot_be_queried_stops_the_run() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new("opaque-output");
+    let input = valid_input(&directory);
+    let opaque = directory.join("opaque");
+    fs::create_dir(&opaque).expect("creates the output's directory");
+    let requested = opaque.join("out.zip");
+
+    let original = fs::metadata(&opaque).expect("reads").permissions();
+    fs::set_permissions(&opaque, PermissionsExt::from_mode(0o644)).expect("drops the traverse bit");
+    let output = Command::new(BINARY)
+        .arg("-o")
+        .arg(&requested)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    fs::set_permissions(&opaque, original).expect("restores the directory");
+
+    assert!(
+        !output.status.success(),
+        "an unqueryable output was accepted"
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("out.zip") && !message.contains(".part"),
+        "the refusal did not come from the query on the output itself: {message}"
+    );
+    assert!(
+        !default_output(&input).exists(),
+        "the run fell back to the default name"
+    );
+}
+
+/// `--delete-org` on a path that is simply absent reports the missing input.
+///
+/// Absence is the one query failure that falls through, so that opening the input produces the
+/// error the user needs rather than a complaint about identifying a path that is not there.
+#[test]
+fn deleting_an_absent_input_reports_the_missing_input() {
+    let directory = TempDir::new("delete-org-absent-input");
+    let output = Command::new(BINARY)
+        .arg("--delete-org")
+        .arg(directory.join("nothing-here.zip"))
+        .output()
+        .expect("runs the binary");
+    assert!(!output.status.success());
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !message.contains("cannot be identified"),
+        "an absent input was reported as unidentifiable: {message}"
+    );
+    assert!(
+        message.contains("nothing-here.zip"),
+        "the missing input is not named: {message}"
+    );
+}
+
 /// The input is removed once the output is in place, and not before.
 #[test]
 fn the_input_is_removed_only_after_the_output_is_in_place() {
