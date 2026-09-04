@@ -328,8 +328,10 @@ mod tests {
     ///
     /// That is a statement about those two ratios and not about every ratio the reference tool
     /// multiplies: the width arm above is reachable at other non-special ratios, 1430 at 35
-    /// per cent and 875 at 58 being the recorded cases. 30 and 50 happen to be tie-free in
-    /// binary for every width in the grid, which is why the width column is clean there.
+    /// per cent and 875 at 58 being the recorded cases. What makes 30 and 50 clean is
+    /// measured, not a property of the ratios: enumeration finds 2,280 exact binary ties in
+    /// the grid at those two and zero disagreements, so ties occur and both rules resolve
+    /// them the same way — `205 × 0.3` is exactly `61.5`, and both round it to 62.
     ///
     /// One authoritative height is what the policy, the scaled decode and the resampler all
     /// read, and two independently rounded axes would be two chances to disagree about the
