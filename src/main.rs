@@ -19,7 +19,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::thread;
 
@@ -27,7 +27,7 @@ use clap::{Parser, builder::TypedValueParser};
 use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter};
 use comic_auto_resize::pipeline::{self, Report, Settings};
 use comic_auto_resize::policy::AUTO_WIDTH;
-use comic_auto_resize::sink::{InputKind, resolve_output};
+use comic_auto_resize::sink::{InputKind, durable, resolve_output};
 use comic_auto_resize::source::{Charset, DEFAULT_LABELS, Naming, ReadOptions, Source};
 use thiserror::Error;
 
@@ -189,6 +189,36 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
     // does the same. No `BufReader` for zip: `by_index` seeks to every entry and
     // `BufReader::seek` throws its buffer away, so a wrapper would be discarded once a page.
     // The table's own reads are small and unbuffered — measured at 2 ms for 1000 entries.
+    // The symbolic-link refusal comes *before* the open, and needs to. `Source::open` follows
+    // the link and reads the archive it points at, while `fs::remove_file` would unlink the
+    // link and leave that archive in place — the flag reporting that it removed the input
+    // archive while the archive is still there. Nothing about the source is needed to detect
+    // that, and opening first would not be free: the 7z reader spawns a decoder that reads its
+    // first page before the rendezvous send, so a refusal after the open is not a refusal
+    // before a page is read. `symlink_metadata` is what asks, because every other call on this
+    // path follows links by design.
+    //
+    // A query that fails for any reason other than absence is refused too: this is the one
+    // flag that destroys a file, and "cannot tell what this path is" is not a licence to
+    // delete it. Absence falls through so that `Source::open` below reports the missing input,
+    // which is the error the user needs.
+    if cli.delete_org {
+        match fs::symlink_metadata(&cli.input) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(CliError::DeleteSymbolicLink {
+                    path: cli.input.clone(),
+                });
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CliError::UnidentifiedInput {
+                    path: cli.input.clone(),
+                    source,
+                });
+            }
+        }
+    }
     let source = Source::open(&cli.input, &options).map_err(|source| CliError::Archive {
         path: cli.input.clone(),
         source,
@@ -197,28 +227,16 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
         Source::Directory(_) => InputKind::Directory,
         _ => InputKind::File,
     };
-    // Both refusals fire before a page is read, and before the output is even resolved.
-    //
-    // A directory input: the pipeline reads the page files a directory holds and passes over
-    // everything else, so removing the input would take files it never looked at. Go attempts
-    // the removal, fails, logs, and exits zero — a flag accepted and then ignored.
-    //
-    // A symbolic link: `Source::open` follows it and reads the archive it points at, while
-    // `fs::remove_file` would unlink the link and leave that archive in place. The flag says
-    // it removes the input archive, so a spelling for which it cannot is refused rather than
-    // silently doing the other thing and reporting success. `symlink_metadata` is what asks,
-    // because every other call on this path follows links by design.
-    if cli.delete_org {
-        if kind == InputKind::Directory {
-            return Err(CliError::DeleteDirectory {
-                path: cli.input.clone(),
-            });
-        }
-        if fs::symlink_metadata(&cli.input).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            return Err(CliError::DeleteSymbolicLink {
-                path: cli.input.clone(),
-            });
-        }
+    // Refused before the output is resolved and before the pipeline starts: the pipeline reads
+    // the page files a directory holds and passes over everything else, so removing the input
+    // would take files it never looked at. Go attempts the removal, fails, logs, and exits
+    // zero — a flag accepted and then ignored. The kind is the reader's answer, so unlike the
+    // link refusal above this one cannot precede the open; a directory input is never 7z, so
+    // the eager decoder is not in play here.
+    if cli.delete_org && kind == InputKind::Directory {
+        return Err(CliError::DeleteDirectory {
+            path: cli.input.clone(),
+        });
     }
     let output = resolve_output(&cli.input, kind, cli.out.as_deref())?;
 
@@ -291,33 +309,6 @@ fn output(value: OsString) -> Result<PathBuf, &'static str> {
     Ok(PathBuf::from(value))
 }
 
-/// Flushes `output`, and the directory entry naming it where the platform allows it.
-///
-/// Only called before the input is removed, which is the one moment the output is about to
-/// become the only copy. `fs::rename` publishes the name; it does not promise the bytes
-/// beneath it have left the page cache, and APFS and NTFS both journal the namespace change
-/// without ordering the data before it.
-///
-/// Opened for writing because Windows' `FlushFileBuffers` needs write access. The parent is
-/// synchronised only on unix: `File::open` on a directory fails on Windows, so the rename's
-/// own durability there rests on NTFS's metadata journal rather than on a call this crate can
-/// make without `unsafe`.
-fn durable(output: &Path) -> std::io::Result<()> {
-    fs::OpenOptions::new()
-        .write(true)
-        .open(output)?
-        .sync_all()?;
-    #[cfg(unix)]
-    {
-        let parent = output
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        fs::File::open(parent)?.sync_all()?;
-    }
-    Ok(())
-}
-
 #[derive(Debug, Error)]
 enum CliError {
     /// `NotAFile` and `Input` are gone with the `metadata` call that raised them: the input's
@@ -350,6 +341,15 @@ enum CliError {
     /// source.
     #[error("{}: is a directory; --delete-org removes the input archive, not a tree", path.display())]
     DeleteDirectory { path: PathBuf },
+    /// `--delete-org` where the input's own entry could not be queried for any reason other
+    /// than absence. This is the one flag that destroys a file, and a path whose kind cannot
+    /// be established is not one to delete: the query that failed is the one distinguishing a
+    /// symbolic link from the archive it points at.
+    #[error("{}: cannot be identified, so --delete-org will not remove it: {source}", path.display())]
+    UnidentifiedInput {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     /// The output is in place and the input is still there. Both facts are named because the
     /// obvious retry would otherwise meet the existing-output refusal and report a second,
     /// unrelated failure; exiting zero would repeat the accepted-and-ignored shape one level

@@ -64,7 +64,8 @@ impl Sink {
     /// # Errors
     ///
     /// [`RunError::OutputExists`] when `path` is taken, [`RunError::PartialExists`] when the
-    /// partial is, and [`RunError::Io`] when it cannot be created.
+    /// partial is, and [`RunError::Io`] when the partial cannot be created or when `path`
+    /// cannot be queried at all.
     pub fn create(path: &Path) -> Result<Self, RunError> {
         // `symlink_metadata` rather than `Path::exists`, which follows the final link and so
         // answers false for a dangling one: a broken symbolic link at the output path would
@@ -72,10 +73,29 @@ impl Sink {
         // the resolved path must not already exist. An entry is an entry, whatever it points
         // at. This also strengthens the refusal `--delete-org` leans on, because the input is
         // an entry under every spelling.
-        if fs::symlink_metadata(path).is_ok() {
-            return Err(RunError::OutputExists {
-                path: path.to_path_buf(),
-            });
+        //
+        // Three arms rather than `is_ok()`, because "cannot tell" is not "not there" and the
+        // two are one mistake apart. `create_new` below acts on `<output>.part`, a *different*
+        // entry needing a *different* right — adding a child to the directory, where this
+        // needs read-attributes on the output itself — so a directory ACL can permit the
+        // creation while refusing the query, and a Windows sharing violation on an output
+        // another process holds open does exactly that. Treating that as absence would let the
+        // run create the partial, succeed, and then `rename` over the very file this refusal
+        // exists to protect, because rename replaces its destination by contract. So anything
+        // but a plain absence stops the run with the error the query gave.
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                return Err(RunError::OutputExists {
+                    path: path.to_path_buf(),
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(RunError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
         }
 
         // Beside the destination, so the rename is within one directory and therefore
@@ -378,6 +398,37 @@ fn output_directory(output: &Path) -> &Path {
     }
 }
 
+/// Flushes the archive at `output`, and the directory entry naming it where that is a barrier.
+///
+/// Called only where the input is about to be removed, which is the one moment the output
+/// becomes the only copy. [`Sink::finish`] renames the partial onto `output`, which publishes
+/// the name and promises nothing about the bytes beneath it: neither APFS nor NTFS orders the
+/// data before the namespace change, so a power loss in between can leave a truncated or
+/// absent archive where a run has already reported success.
+///
+/// Opened for reading on unix, where `fsync` accepts a read-only descriptor, and for writing on
+/// Windows, where `FlushFileBuffers` does not. The parent is synchronised only on unix. A
+/// directory handle can be opened on Windows without `unsafe` — `OpenOptionsExt::custom_flags`
+/// with `FILE_FLAG_BACKUP_SEMANTICS` is safe, stable `std` — but `FlushFileBuffers` on one is
+/// not a documented durability barrier there, and NTFS journals the rename, so the guarantee
+/// does not rest on a call this code declined to make.
+///
+/// # Errors
+///
+/// Whatever the open or the flush returned. The caller's business is that a failure here means
+/// nothing may be removed, not what went wrong.
+pub fn durable(output: &Path) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    #[cfg(unix)]
+    options.read(true);
+    #[cfg(windows)]
+    options.write(true);
+    options.open(output)?.sync_all()?;
+    #[cfg(unix)]
+    File::open(output_directory(output))?.sync_all()?;
+    Ok(())
+}
+
 /// Refuses a resolved output inside a directory input.
 ///
 /// Canonical rather than lexical: `-o vol1/../vol1/out.zip` and a symbolic link into the tree
@@ -417,7 +468,7 @@ fn resolved(input: &Path) -> Result<PathBuf, RunError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputKind, default_output};
+    use super::{InputKind, default_output, durable, output_directory};
     use std::path::{Path, PathBuf};
 
     fn file(input: &str) -> PathBuf {
@@ -487,5 +538,46 @@ mod tests {
                 "{input} resolved to itself as a directory"
             );
         }
+    }
+
+    /// The flush reports a failure rather than swallowing one.
+    ///
+    /// This is the whole of what the caller needs: a run that is about to remove the user's
+    /// only other copy must not proceed on a barrier that quietly did nothing. `fsync` on a
+    /// healthy file cannot be made to fail portably, so the reachable half is the open, and
+    /// the two arms below are "the archive is there" and "it is not".
+    #[test]
+    fn the_durability_barrier_succeeds_on_a_written_archive_and_fails_without_one() {
+        let scratch = std::env::temp_dir().join(format!(
+            "comic-auto-resize-durable-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("creates the scratch directory");
+
+        let written = scratch.join("out.zip");
+        std::fs::write(&written, b"PK\x05\x06").expect("writes an archive");
+        durable(&written).expect("an existing archive is flushed");
+
+        let missing = scratch.join("gone.zip");
+        let error = durable(&missing).expect_err("a path with no file must not report success");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+
+        std::fs::remove_dir_all(&scratch).expect("removes the scratch directory");
+    }
+
+    /// The empty-parent rule has one implementation, and the barrier shares it.
+    ///
+    /// `Path::parent` of a bare file name is the empty path, which names the current directory
+    /// but answers neither `is_dir` nor `canonicalize`. Both the resolution and the flush need
+    /// that spelled `.`, and a second copy of the rule is a second thing to get wrong.
+    #[test]
+    fn a_bare_file_name_names_the_current_directory() {
+        assert_eq!(output_directory(Path::new("out.zip")), Path::new("."));
+        assert_eq!(
+            output_directory(Path::new("dest/out.zip")),
+            Path::new("dest")
+        );
+        assert_eq!(output_directory(Path::new("/out.zip")), Path::new("/"));
     }
 }

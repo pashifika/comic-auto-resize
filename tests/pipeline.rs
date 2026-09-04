@@ -1100,14 +1100,31 @@ fn the_input_is_removed_only_after_the_output_is_in_place() {
     assert!(default_output(&input).exists(), "no output was written");
     assert!(!input.exists(), "the input survived --delete-org");
 
-    // One line, and the removal named on it: a run without the flag prints what it always
-    // printed, so the clause only appears when the removal happened.
+    // One line, and the removal named on it.
     let line = String::from_utf8_lossy(&output.stdout);
     assert_eq!(line.lines().count(), 1, "still one line: {line}");
     assert!(
         line.contains("removed"),
         "the removal is not reported: {line}"
     );
+
+    // And the other direction, which is the half that makes "exactly when" a claim: a run
+    // without the flag prints what it always printed. The compositing note set this rule and
+    // is asserted both ways in `tests/image_pages.rs`; this clause follows it.
+    let kept = TempDir::new("delete-org-absent");
+    let input = valid_input(&kept);
+    let output = Command::new(BINARY)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(output.status.success());
+    let line = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(line.lines().count(), 1, "still one line: {line}");
+    assert!(
+        !line.contains("removed"),
+        "a run without the flag reported a removal: {line}"
+    );
+    assert!(input.exists(), "the input went without the flag");
 
     // A run that fails after the source was opened leaves the input alone. An archive
     // holding no page this build can read reaches that state: the source opened, the entries
@@ -1258,12 +1275,13 @@ fn deleting_the_original_is_refused_for_a_symbolic_link_input() {
 ///
 /// Without both facts the obvious retry meets the existing-output refusal and reports a
 /// second, unrelated failure. The output goes outside the input's directory, because the
-/// directory is made unwritable to make the removal fail.
-#[cfg(unix)]
+/// directory is what is made unwritable to deny the removal.
+///
+/// `written, but the input` is asserted rather than just the two paths, because the sibling
+/// variant `OutputNotDurable` also formats both of them; without a discriminating substring
+/// this would pass for either, and neither would be pinned.
 #[test]
 fn a_removal_that_fails_names_the_output_and_the_surviving_input() {
-    use std::os::unix::fs::PermissionsExt;
-
     let directory = TempDir::new("delete-org-denied");
     let held = directory.join("held");
     fs::create_dir(&held).expect("creates the input's directory");
@@ -1271,10 +1289,36 @@ fn a_removal_that_fails_names_the_output_and_the_surviving_input() {
     write_pages(&input, 1, 320, 440);
     let requested = directory.join("out.zip");
 
-    // Unlinking needs write permission on the *parent*, so this denies the removal while
-    // leaving the archive itself readable.
-    let original = fs::metadata(&held).expect("reads").permissions();
-    fs::set_permissions(&held, PermissionsExt::from_mode(0o500)).expect("locks the directory");
+    // Two ways to deny an unlink, because the platforms do not share one. On unix the
+    // permission that matters is the *parent's* write bit, and a read-only file unlinks
+    // fine; on Windows it is the file's own read-only attribute, and `DeleteFileW` fails
+    // with access denied. Either way the archive stays readable, so the run reaches the
+    // removal rather than failing earlier.
+    let restore: Box<dyn FnOnce()> = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let original = fs::metadata(&held).expect("reads").permissions();
+            fs::set_permissions(&held, PermissionsExt::from_mode(0o500))
+                .expect("locks the directory");
+            let held = held.clone();
+            Box::new(move || {
+                fs::set_permissions(&held, original).expect("restores the directory");
+            })
+        }
+        #[cfg(windows)]
+        {
+            let mut locked = fs::metadata(&input).expect("reads").permissions();
+            locked.set_readonly(true);
+            fs::set_permissions(&input, locked).expect("locks the input");
+            let input = input.clone();
+            Box::new(move || {
+                let mut writable = fs::metadata(&input).expect("reads").permissions();
+                writable.set_readonly(false);
+                fs::set_permissions(&input, writable).expect("restores the input");
+            })
+        }
+    };
     let output = Command::new(BINARY)
         .arg("--delete-org")
         .arg("-o")
@@ -1282,7 +1326,7 @@ fn a_removal_that_fails_names_the_output_and_the_surviving_input() {
         .arg(&input)
         .output()
         .expect("runs the binary");
-    fs::set_permissions(&held, original).expect("restores the directory");
+    restore();
 
     assert!(
         !output.status.success(),
@@ -1290,11 +1334,105 @@ fn a_removal_that_fails_names_the_output_and_the_surviving_input() {
     );
     let message = String::from_utf8_lossy(&output.stderr);
     assert!(
-        message.contains("out.zip") && message.contains("in.zip"),
-        "the refusal names only one of the two paths: {message}"
+        message.contains("written, but the input")
+            && message.contains("out.zip")
+            && message.contains("in.zip"),
+        "the refusal does not name both paths as a failed removal: {message}"
     );
     assert!(requested.exists(), "the output was not written");
     assert!(input.exists(), "the input is gone after a failed removal");
+}
+
+/// A flush that fails abandons the removal, and the input survives.
+///
+/// This is the guard between a power loss and the total loss of the book, so it is asserted
+/// rather than reasoned about. `fsync` on a healthy file cannot be made to fail, but the open
+/// in front of it can: the archive is created with mode `0o666` before the umask, so a run
+/// under `umask 0777` produces a mode `0o000` file that its own creator cannot reopen. The
+/// umask is set by the shell rather than by this process, because it is per-process state and
+/// the test harness is threaded.
+#[cfg(unix)]
+#[test]
+fn a_flush_that_fails_abandons_the_removal() {
+    let directory = TempDir::new("delete-org-undurable");
+    let input = valid_input(&directory);
+    let requested = directory.join("out.zip");
+    let script = format!(
+        "umask 0777; exec {} --delete-org -o {} {}",
+        BINARY,
+        requested.display(),
+        input.display()
+    );
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&script)
+        .output()
+        .expect("runs the binary through a shell");
+
+    assert!(
+        !output.status.success(),
+        "an unflushable output reported success"
+    );
+    let message = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        message.contains("could not be flushed to disk")
+            && message.contains("out.zip")
+            && message.contains("in.zip"),
+        "the refusal does not name the flush and both paths: {message}"
+    );
+    assert!(
+        input.exists(),
+        "the input was removed although the output was never flushed"
+    );
+    assert!(requested.exists(), "the output was not written at all");
+}
+
+/// An input whose own entry cannot be queried is not deleted.
+///
+/// The query that fails is the one distinguishing a symbolic link from the archive it points
+/// at, so treating its failure as "an ordinary file" would put the flag back where it started.
+/// A parent without the traverse bit is what denies it: `lstat` of a known child needs `x` on
+/// the directory, and the same run without the flag is asserted to show the refusal is the
+/// flag's rather than the permission's.
+#[cfg(unix)]
+#[test]
+fn an_input_whose_kind_cannot_be_established_is_not_deleted() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = TempDir::new("delete-org-opaque");
+    let held = directory.join("held");
+    fs::create_dir(&held).expect("creates the input's directory");
+    let input = held.join("in.zip");
+    write_pages(&input, 1, 320, 440);
+
+    let original = fs::metadata(&held).expect("reads").permissions();
+    fs::set_permissions(&held, PermissionsExt::from_mode(0o644)).expect("drops the traverse bit");
+    let refused = Command::new(BINARY)
+        .arg("--delete-org")
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    let without = Command::new(BINARY)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    fs::set_permissions(&held, original).expect("restores the directory");
+
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("cannot be identified"),
+        "the refusal is not the flag's: {message}"
+    );
+    assert!(input.exists(), "an unidentifiable input was removed");
+
+    // Without the flag the same permission reaches the user as an ordinary open failure, so
+    // the refusal above is attributable to `--delete-org` and not to the directory.
+    assert!(!without.status.success());
+    assert!(
+        !String::from_utf8_lossy(&without.stderr).contains("cannot be identified"),
+        "a run without the flag raised the flag's refusal"
+    );
 }
 
 /// Both new flags' help states what they resolve to rather than what they are called.
@@ -1313,18 +1451,35 @@ fn the_output_and_delete_flags_help_states_what_they_resolve_to() {
     )
     .expect("help is UTF-8");
 
+    // Split on the flag name first, as the three precedents do: asserting against the whole
+    // help output would pass if a clause migrated into another flag's description, into the
+    // positional's, or into the command's `about` line — and `error-presentation` rewriting
+    // this text in a later Change is exactly the edit that could move one without deleting it.
+    let description = |flag: &str| {
+        let at = help
+            .find(flag)
+            .unwrap_or_else(|| panic!("`{flag}` is not in the help: {help}"));
+        let rest = &help[at + flag.len()..];
+        // Every option's description ends where the next option's `      --` begins.
+        rest.find("\n      -")
+            .map_or(rest, |end| &rest[..end])
+            .to_owned()
+    };
+
     // `-o`: which value selects the location arm, and that a filename is not extended.
+    let out = description("-o, --out");
     for clause in ["path separator", "existing directory", "verbatim"] {
         assert!(
-            help.contains(clause),
-            "`-o`'s help does not say `{clause}`: {help}"
+            out.contains(clause),
+            "`-o`'s own description does not say `{clause}`: {out}"
         );
     }
     // `--delete-org`: that the removal happens only once the output is in place.
+    let delete = description("--delete-org ");
     for clause in ["once the output archive is in place", "if the run failed"] {
         assert!(
-            help.contains(clause),
-            "`--delete-org`'s help does not say `{clause}`: {help}"
+            delete.contains(clause),
+            "`--delete-org`'s own description does not say `{clause}`: {delete}"
         );
     }
 }
