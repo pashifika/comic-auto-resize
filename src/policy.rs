@@ -280,7 +280,8 @@ mod tests {
         assert_eq!(Target::Width(1000).width_for(400), 1000);
     }
 
-    /// The one place exact integer arithmetic is observably not the reference tool's.
+    /// The **target-width** arm of the arithmetic divergence: exact integers here, an inexact
+    /// float there. The height is the other arm, below.
     ///
     /// Go computes `math.Round(width × float64(percent)/100)`, and `percent/100` is inexact
     /// in binary: `1430 × 0.35` evaluates to `500.49999999999994`, which rounds *down* to
@@ -317,11 +318,24 @@ mod tests {
     /// 501×701 here and 501×700 there, because 700.699 rounds up from the width this build
     /// actually used and `1400 × 0.5` rounds to 700 from the source.
     ///
-    /// Deliberate, and the commoner case rather than the exotic one: sampling widths and
-    /// heights from 200 to 4000 at 30, 50 and 70 per cent, the widths agree and the heights
-    /// differ on 26.9% of pages. One authoritative height is what the policy, the scaled
-    /// decode and the resampler all read, and two independently rounded axes would be two
-    /// chances to disagree about the same page.
+    /// Deliberate, and the dominant arm rather than the exotic one — but the census has to be
+    /// taken over ratios the reference tool actually multiplies. Its `Resize` returns the
+    /// source at 100 per cent, and at exactly 70 it either passes the page through or replaces
+    /// the ratio with `1280 / width`, so a figure that includes 70 describes arithmetic it
+    /// never performs. Over every integer width and height from 200 to 4,000 **at 30 and 50
+    /// per cent** — 28,895,202 pages — the widths agree on every one and the heights differ on
+    /// **24.91%**, so at those two ratios the height is the whole of the divergence.
+    ///
+    /// That is a statement about those two ratios and not about every ratio the reference tool
+    /// multiplies: the width arm above is reachable at other non-special ratios, 1430 at 35
+    /// per cent and 875 at 58 being the recorded cases. What makes 30 and 50 clean is
+    /// measured, not a property of the ratios: enumeration finds 2,280 exact binary ties in
+    /// the grid at those two and zero disagreements, so ties occur and both rules resolve
+    /// them the same way — `205 × 0.3` is exactly `61.5`, and both round it to 62.
+    ///
+    /// One authoritative height is what the policy, the scaled decode and the resampler all
+    /// read, and two independently rounded axes would be two chances to disagree about the
+    /// same page.
     #[test]
     fn a_ratios_height_follows_the_width_this_build_chose() {
         let width = Target::Ratio(50).width_for(1001);
