@@ -41,19 +41,22 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io;
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 use std::thread;
 
-use clap::{ArgAction, Parser, builder::TypedValueParser};
+use clap::{ArgAction, CommandFactory, Parser, builder::TypedValueParser};
 use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter};
 use comic_auto_resize::pipeline::{self, Report, Settings};
 use comic_auto_resize::policy::{AUTO_WIDTH, Target};
 use comic_auto_resize::sink::{InputKind, durable_directory_entry, resolve_output};
 use comic_auto_resize::source::{Charset, DEFAULT_LABELS, Naming, ReadOptions, Source};
 use thiserror::Error;
+
+mod completion;
 
 /// The largest width a JPEG can express, so the largest worth accepting.
 const MAX_WIDTH: i64 = 65535;
@@ -75,7 +78,11 @@ const MAX_WIDTH: i64 = 65535;
 struct Cli {
     /// The comic archive or directory of pages to shrink. The output is written beside it as
     /// `<stem>_resize.zip` unless `-o` names somewhere else.
-    input: PathBuf,
+    //
+    // `Option` only so `--completions` can be given without one; every other invocation is
+    // refused by the parser before `main` sees it.
+    #[arg(required_unless_present = "completions")]
+    input: Option<PathBuf>,
 
     /// Where to write the output archive. A value naming a location — it ends with a path
     /// separator, or it is an existing directory — has the default name `<stem>_resize.zip`
@@ -202,11 +209,59 @@ struct Cli {
     /// offers no way to set it.
     #[arg(long, default_value_t = worker_count(), value_parser = jobs, value_name = "COUNT")]
     jobs: NonZeroUsize,
+
+    /// Write this shell's completion script to standard output and exit. Takes `bash`,
+    /// `zsh`, `fish` or `powershell`, and nothing else on the command line: no input is
+    /// opened and no filesystem state is read, because a script is generated while a shell
+    /// starts. The script comes from the same command graph `--help` does, so a flag cannot
+    /// be completed without existing.
+    //
+    // A flag rather than a subcommand, and the difference was measured rather than chosen
+    // on taste: a subcommand makes `clap_complete`'s fish generator guard every root option
+    // with `__fish_<name>_needs_command`, whose `argparse` run fails on the half-typed
+    // `--dct` it is being asked about — so fish silently offered filenames where `float`,
+    // `ifast` and `islow` belong. No subcommand, no guard, and the values come back.
+    //
+    // `exclusive` because a completion request accepts nothing else: `-q 80 --completions
+    // bash` names a quality no script has any use for, and the surface's founding rule is
+    // that a flag is not accepted and then ignored.
+    #[arg(long, value_name = "SHELL", exclusive = true)]
+    completions: Option<completion::Shell>,
+}
+
+/// The one command graph, reached by the parser and by the completion generator alike.
+///
+/// `clap`'s derive is the single definition of it: [`Parser::parse`] parses with exactly what
+/// [`CommandFactory::command`] returns here. That is the whole mechanism behind "a flag
+/// cannot appear in completion without existing" — there is no second list to keep in step.
+fn command() -> clap::Command {
+    Cli::command()
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match run(&cli) {
+    if let Some(shell) = cli.completions {
+        return match completion::write(shell, &mut io::stdout().lock()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("error: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let Some(input) = cli.input.as_deref() else {
+        // Unreachable through the parser: `required_unless_present` makes the positional
+        // required for every invocation that is not the one handled above. Routed through
+        // `clap`'s own error rather than a panic, so a surface change that made it reachable
+        // would tell the user what is missing instead of aborting.
+        command()
+            .error(
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "the following required arguments were not provided:\n  <INPUT>",
+            )
+            .exit()
+    };
+    match run(&cli, input) {
         Ok((report, output)) => {
             // One line for the run, and each extra clause only when the extra thing
             // happened: a run that composited nothing, refused nothing and removed nothing
@@ -237,7 +292,7 @@ fn main() -> ExitCode {
             // `Ok` and `--delete-org` together mean the input is gone: a removal that failed
             // is an error, so there is no third state to report.
             let removed = if cli.delete_org {
-                format!("; {} removed", cli.input.display())
+                format!("; {} removed", input.display())
             } else {
                 String::new()
             };
@@ -256,7 +311,9 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
+/// The resize run. `input` is the positional the parser required, passed separately because
+/// the completion entry point is the one arm of the surface that has none.
+fn run(cli: &Cli, input: &Path) -> Result<(Report, PathBuf), CliError> {
     // Option values were range-checked by the parser, before this point and before the
     // input is opened. The remaining checks are on the input itself.
     let settings = Settings {
@@ -319,24 +376,24 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
     // delete it. Absence falls through so that `Source::open` below reports the missing input,
     // which is the error the user needs.
     if cli.delete_org {
-        match fs::symlink_metadata(&cli.input) {
+        match fs::symlink_metadata(input) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(CliError::DeleteSymbolicLink {
-                    path: cli.input.clone(),
+                    path: input.to_path_buf(),
                 });
             }
             Ok(_) => {}
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(CliError::UnidentifiedInput {
-                    path: cli.input.clone(),
+                    path: input.to_path_buf(),
                     source,
                 });
             }
         }
     }
-    let source = Source::open(&cli.input, &options).map_err(|source| CliError::Archive {
-        path: cli.input.clone(),
+    let source = Source::open(input, &options).map_err(|source| CliError::Archive {
+        path: input.to_path_buf(),
         source,
     })?;
     let kind = match source {
@@ -351,10 +408,10 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
     // the eager decoder is not in play here.
     if cli.delete_org && kind == InputKind::Directory {
         return Err(CliError::DeleteDirectory {
-            path: cli.input.clone(),
+            path: input.to_path_buf(),
         });
     }
-    let output = resolve_output(&cli.input, kind, cli.out.as_deref())?;
+    let output = resolve_output(input, kind, cli.out.as_deref())?;
 
     // A `SourceError` raised during iteration would otherwise reach the user through two
     // transparent wrappers with no path at all, while the same error raised inside
@@ -362,7 +419,7 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
     // as it goes, so a damaged entry surfaces here rather than at open.
     let report = pipeline::run(source, &output, &settings).map_err(|error| match error {
         pipeline::RunError::Source(source) => CliError::Archive {
-            path: cli.input.clone(),
+            path: input.to_path_buf(),
             source,
         },
         other => CliError::Run(other),
@@ -382,12 +439,12 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
         // something to lose.
         durable_directory_entry(&output).map_err(|source| CliError::OutputNotDurable {
             output: output.clone(),
-            path: cli.input.clone(),
+            path: input.to_path_buf(),
             source,
         })?;
-        fs::remove_file(&cli.input).map_err(|source| CliError::InputNotRemoved {
+        fs::remove_file(input).map_err(|source| CliError::InputNotRemoved {
             output: output.clone(),
-            path: cli.input.clone(),
+            path: input.to_path_buf(),
             source,
         })?;
     }
