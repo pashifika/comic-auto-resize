@@ -737,8 +737,11 @@ fn the_output_holds_only_image_entries() {
 
 /// Every long option `--help` lists, without its `--`.
 ///
-/// Truncated at `=`, because a description that spells an option with its value —
-/// `--progressive=false` — is naming that option rather than a second one.
+/// An optional-value flag renders as `--progressive[=<BOOL>]`, so the name has to be cut at
+/// the `[` and at the `=` to come back as `progressive`. A description that spells an option
+/// with its value is not what forces this — every such mention in `--help` is backticked, so it
+/// never survives `strip_prefix("--")` — but it lands on the same name either way, which is
+/// what it should do.
 fn help_options() -> Vec<String> {
     let output = Command::new(BINARY)
         .arg("--help")
@@ -750,10 +753,10 @@ fn help_options() -> Vec<String> {
         .split_whitespace()
         .filter_map(|word| word.strip_prefix("--"))
         .map(|word| {
-            word.split('=')
+            word.split(['=', '['])
                 .next()
-                .unwrap_or(word)
-                .trim_end_matches([',', '.', '>', '['])
+                .expect("split always yields the head")
+                .trim_end_matches([',', '.', '>'])
                 .to_owned()
         })
         .filter(|word| !word.is_empty())
@@ -770,24 +773,29 @@ fn valid_input(directory: &TempDir) -> std::path::PathBuf {
     path
 }
 
-/// The flags the Go implementation had and this build does not exist with.
+/// Every flag that does not exist here, asserted absent rather than accepted and ignored.
 ///
 /// A flag may exist and be unimplemented, or not exist; it must not exist and silently do
-/// the wrong thing. This asserts the second half — that they are genuinely absent, not
-/// accepted and ignored.
+/// the wrong thing. This asserts the second half.
 ///
 /// `--charset` and `--pwd` were here until they were implemented, and moved into the list
 /// below in the same Change — the movement `--fix-idx` made before them, then `-o/--out` and
 /// `--delete-org`, then `-r/--ratio` and `--jobs`, and now `--progressive` and `--optimizer`.
-/// `--split` is here because `spread-split` has not implemented it yet; `--small-skip` is
-/// here permanently, because the reference tool's implementation of it disables resizing for
-/// every page rather than skipping the small ones its name promises.
+/// `--split` is the only one still waiting on a Change: `spread-split` has not implemented it.
+///
+/// The other three are Go's and stay absent. `--small-skip` because Go's implementation of it
+/// is `if !skipSmallSize && doResize` (`utils/images/images.go:140` on `master`), so it
+/// disables resizing for every page rather than skipping the small-ratio ones its name
+/// promises. `--show-time` and `--debug` because they are Go's `Developer Options` group
+/// (`utils/config/flags.go:66-68`) and instrument that build rather than describe an archive.
+/// Those three plus the ten Go flags this build implements are the whole of Go's thirteen, so a
+/// fourteenth appearing here would mean the reference was re-read.
 #[test]
 fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
     let directory = TempDir::new("unknown-flags");
     let input = valid_input(&directory);
 
-    for flag in ["--split", "--small-skip"] {
+    for flag in ["--split", "--small-skip", "--show-time", "--debug"] {
         let output = Command::new(BINARY)
             .arg(flag)
             .arg(&input)
@@ -1021,12 +1029,13 @@ fn the_encoder_switches_reach_the_encoder_except_where_libjpeg_overrides_one() {
         "the default is progressive"
     );
 
-    // The reference tool's spelling is bare, and it asserts the state its help promised
-    // rather than changing it. A no-op by design: an optional-value bool whose bare form
-    // means on.
+    // The reference tool's spelling is bare, and it asserts the state its help promised rather
+    // than changing it. `--progressive`'s bare form is pinned here — meaning off would give
+    // `SOF0` and a different archive — but `--optimizer`'s is **not**, because libjpeg forces
+    // optimisation on for a progressive file whatever value was parsed. Its bare form is pinned
+    // below, with progressive off, where the parsed value is the only thing deciding the bytes.
     for args in [
         &["--progressive"][..],
-        &["--optimizer"][..],
         &["--progressive", "--optimizer"][..],
     ] {
         assert_eq!(
@@ -1043,6 +1052,18 @@ fn the_encoder_switches_reach_the_encoder_except_where_libjpeg_overrides_one() {
         start_of_frame(&baseline),
         Some(0xC0),
         "`--progressive=false` must give baseline, never SOF1"
+    );
+
+    // `--optimizer`'s bare form, where the library is not overriding it: this is the assertion
+    // that fails if `default_missing_value` is ever "false", and the only place it can fail —
+    // under progressive every value of the setting produces the same bytes.
+    assert_eq!(
+        page_of(
+            &["--optimizer", "--progressive=false"],
+            "switch-bare-optimizer"
+        ),
+        baseline,
+        "bare `--optimizer` did not mean on"
     );
 
     // The override: the switch is accepted, delivered, and forced back on by the library.
@@ -1340,9 +1361,11 @@ fn a_worker_count_above_the_hosts_ceiling_is_refused_before_any_work() {
 /// `-r`'s is the migration: the behaviour the reference tool's `-r 70` gave is this tool's
 /// default, so the answer for an invocation that carried it is to drop it. `--jobs`'s is the
 /// cost, and a measured figure rather than the four-line product the requirement carries.
-/// `--optimizer`'s is that it is overridden in the default configuration — a flag that is
-/// accepted and then silently overridden is the same failure as one accepted and ignored, so
-/// the sentence saying so is normative rather than editorial.
+/// `--progressive`'s are both of its measured costs — the size it adds and the memory it
+/// saves — which `jpeg-codec` makes normative in two separate SHALLs, and which the shipped
+/// binary states nowhere else. `--optimizer`'s is that it is overridden in the default
+/// configuration: a flag accepted and then silently overridden is the same failure as one
+/// accepted and ignored, so the sentence saying so is normative rather than editorial.
 #[test]
 fn the_new_flags_state_what_a_reader_cannot_infer() {
     let ratio = help_for("-r, --ratio");
@@ -1365,6 +1388,16 @@ fn the_new_flags_state_what_a_reader_cannot_infer() {
         "`--jobs`'s help does not carry the measured point: {jobs}"
     );
 
+    let progressive = help_for("--progressive");
+    assert!(
+        progressive.contains("4.3x"),
+        "`--progressive`'s help does not carry the read-back cost: {progressive}"
+    );
+    assert!(
+        progressive.contains("1.8 to 5.4 per cent"),
+        "`--progressive`'s help does not carry the measured size cost: {progressive}"
+    );
+
     let optimizer = help_for("--optimizer");
     assert!(
         optimizer.contains("--progressive=false"),
@@ -1373,6 +1406,11 @@ fn the_new_flags_state_what_a_reader_cannot_infer() {
 }
 
 /// The block of `--help` that belongs to one option: from its name to the next option's.
+///
+/// Both option-line shapes end the block. `clap` indents a short-flag option by two spaces and
+/// a long-only one by six, so a boundary that knew only `\n  -` ran a long-only option's block
+/// through every long-only option after it — which made an assertion about `--optimizer`'s help
+/// satisfiable by `--progressive`'s text.
 fn help_for(flag: &str) -> String {
     let output = Command::new(BINARY)
         .arg("--help")
@@ -1384,7 +1422,12 @@ fn help_for(flag: &str) -> String {
         .find(flag)
         .unwrap_or_else(|| panic!("{flag} is not listed in --help:\n{text}"));
     let rest = &text[start + flag.len()..];
-    let end = rest.find("\n  -").unwrap_or(rest.len());
+    let end = rest
+        .find("\n  -")
+        .into_iter()
+        .chain(rest.find("\n      --"))
+        .min()
+        .unwrap_or(rest.len());
     rest[..end].to_owned()
 }
 

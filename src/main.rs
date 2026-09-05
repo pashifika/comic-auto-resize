@@ -1,9 +1,14 @@
 //! Command-line entry point.
 //!
 //! The surface contains exactly what is implemented. A flag may exist and be unimplemented,
-//! or not exist; it must not exist and silently do the wrong thing — so the one flag Go had
-//! and this build does not (`--small-skip`) is absent rather than accepted and ignored.
-//! Absence is the honest form of "not yet".
+//! or not exist; it must not exist and silently do the wrong thing — so the three flags Go had
+//! and this build does not are absent rather than accepted and ignored. `--small-skip` will
+//! stay absent: Go's implementation of it is `if !skipSmallSize && doResize`, so passing it
+//! disables resizing for every page rather than skipping the small-ratio ones its name
+//! promises, and the behaviour the name describes is what `policy.rs`'s `MIN_EDGE` floor does
+//! unconditionally. `--show-time` and `--debug` are Go's `Developer Options` group and measure
+//! or instrument that build rather than describe an archive. Absence is the honest form of
+//! "not yet", and for these three it is the honest form of "no".
 //!
 //! `--fix-idx` was the first flag added since the rewrite began; `--charset` and `--pwd`
 //! joined it, then `-o/--out` and `--delete-org`, then `-r/--ratio` and `--jobs`, and
@@ -27,6 +32,12 @@
 //! asserts the state its help promised, while `=false` is the switch. The value is attached
 //! with `=` because an optional value taken from the next argument would swallow the
 //! positional input path.
+//!
+//! Their polarity is a third case beside the two above, and it is why the rule does not settle
+//! it: neither is a defect correction — baseline output is a compatibility and memory trade,
+//! not a repair — and neither is an open choice this build gets to make freshly. They default
+//! to on because that is what the reference tool's help documented and what this build has
+//! written since `native-deps`, so the default is inherited rather than chosen.
 
 use std::ffi::OsString;
 use std::fs;
