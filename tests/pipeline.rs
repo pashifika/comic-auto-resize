@@ -820,10 +820,11 @@ fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
 /// `--help` lists exactly what exists, in both directions.
 #[test]
 fn help_lists_every_implemented_option_and_nothing_else() {
-    // The thirteen the tool implements, plus what clap adds for free.
+    // The fourteen the tool implements, plus what clap adds for free.
     let mut expected = vec![
         "auto-width".to_owned(),
         "charset".to_owned(),
+        "completions".to_owned(),
         "dct".to_owned(),
         "delete-org".to_owned(),
         "fix-idx".to_owned(),

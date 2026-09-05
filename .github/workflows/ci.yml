@@ -146,6 +146,14 @@ jobs:
         timeout-minutes: 5
         run: python3 -B .github/scripts/test_branch_policy.py
 
+      # Same reason as the check above, and a sharper version of it: the completion harness
+      # drives four shells over a pty and asserts what they offer, and a harness that stopped
+      # asserting would pass every run and prove nothing. Run here rather than in the two
+      # shell jobs because it needs no shell and no binary, only Python.
+      - name: Test the completion acceptance harness
+        timeout-minutes: 5
+        run: python3 -B .github/scripts/test_shell_completion_acceptance.py
+
       - name: Validate the pull-request branch flow
         if: github.event_name == 'pull_request'
         timeout-minutes: 5
@@ -416,6 +424,21 @@ jobs:
             echo "mozjpeg-sys: WITH_SIMD confirmed in ${config}"
           done
 
+      # Handed to `shell-completions-windows` rather than rebuilt there. Two reasons, and
+      # the second is the one that matters: a second build would need its own copy of the
+      # nasm provisioning above — fifty lines pinned by digest, in two places, bumped in
+      # step — and the completion job would then be proving a *different* binary. This way
+      # the shell exercises the bytes this job just asserted SIMD into. The cost is
+      # wall-clock: the completion job waits for this one instead of running beside it.
+      - name: Publish the release binary for the completion job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
+        with:
+          name: comic-auto-resize-x86_64-pc-windows-msvc
+          path: target/release/comic-auto-resize.exe
+          if-no-files-found: error
+          retention-days: 1
+
   macos:
     name: macos
     runs-on: macos-15
@@ -545,6 +568,121 @@ jobs:
             echo "mozjpeg-sys: WITH_SIMD confirmed in ${config}"
           done
 
+      # Same handover as the windows job, for the weaker half of its reason: aarch64 needs
+      # no nasm, so a second build here would only duplicate a toolchain block. What it
+      # would still cost is honesty — the shell would be exercising a binary that is not
+      # the one this job verified.
+      - name: Publish the release binary for the completion job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 5
+        with:
+          name: comic-auto-resize-aarch64-apple-darwin
+          path: target/release/comic-auto-resize
+          if-no-files-found: error
+          retention-days: 1
+
+  # A script this build generates for a shell is proved in that shell, on the target that
+  # ships it. A test over the generated text proves the generator ran; it does not prove the
+  # script parses, that the shell sources it, or that pressing Tab offers anything.
+  shell-completions-macos:
+    name: shell-completions-macos
+    runs-on: macos-15
+    timeout-minutes: 20
+    needs: macos
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Download the release binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
+        with:
+          name: comic-auto-resize-aarch64-apple-darwin
+          path: artifact
+
+      # An artifact is delivered as a zip and the executable bit does not survive the round
+      # trip, so it is restored rather than assumed. The run afterwards is what proves the
+      # file is the binary and not a stub.
+      - name: Restore the executable bit
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          chmod +x artifact/comic-auto-resize
+          artifact/comic-auto-resize --version
+
+      # macOS ships bash and zsh and not fish. Installed rather than recorded unavailable:
+      # the build advertises a fish script for this target, and a shell nobody exercised is
+      # an evidence gap wearing a skip's clothing.
+      - name: Provision fish
+        timeout-minutes: 10
+        env:
+          HOMEBREW_NO_ANALYTICS: "1"
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+        run: |
+          set -euo pipefail
+          brew install fish
+          for shell in bash zsh fish; do
+            printf '%s: %s\n' "${shell}" "$(command -v "${shell}")"
+          done
+
+      - name: Exercise the bash, zsh and fish completions
+        timeout-minutes: 10
+        run: >-
+          python3 .github/scripts/shell_completion_acceptance.py
+          --binary artifact/comic-auto-resize
+          --shell bash
+          --shell zsh
+          --shell fish
+
+      # The bash a macOS user actually has is 3.2 at /bin/bash, which predates most of what
+      # a generated script may assume. The run above uses whatever the image puts first on
+      # PATH, so this one pins the system copy and covers the difference.
+      - name: Exercise the system bash completions
+        timeout-minutes: 10
+        run: >-
+          env PATH="/bin:/usr/bin" "$(command -v python3)"
+          .github/scripts/shell_completion_acceptance.py
+          --binary "${PWD}/artifact/comic-auto-resize"
+          --shell bash
+
+  shell-completions-windows:
+    name: shell-completions-windows
+    runs-on: windows-2025
+    timeout-minutes: 20
+    needs: windows
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Download the release binary
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 5
+        with:
+          name: comic-auto-resize-x86_64-pc-windows-msvc
+          path: artifact
+
+      - name: Confirm the binary runs
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          artifact/comic-auto-resize.exe --version
+          pwsh --version
+
+      - name: Exercise the PowerShell completions
+        shell: bash
+        timeout-minutes: 10
+        run: >-
+          python .github/scripts/shell_completion_acceptance.py
+          --binary artifact/comic-auto-resize.exe
+          --shell powershell
+
   # The single required status context. Every ruleset names this job and no other, so a
   # change that adds a job extends the `needs` list below and touches no repository
   # setting.
@@ -552,7 +690,7 @@ jobs:
     name: ci
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    needs: [hygiene, windows, macos]
+    needs: [hygiene, windows, macos, shell-completions-macos, shell-completions-windows]
     # `always()` so the gate still reports when a predecessor failed; without it the gate
     # would be skipped, and a skipped required check blocks rather than fails.
     if: always()
@@ -562,6 +700,8 @@ jobs:
           HYGIENE_RESULT: ${{ needs.hygiene.result }}
           WINDOWS_RESULT: ${{ needs.windows.result }}
           MACOS_RESULT: ${{ needs.macos.result }}
+          COMPLETIONS_MACOS_RESULT: ${{ needs.shell-completions-macos.result }}
+          COMPLETIONS_WINDOWS_RESULT: ${{ needs.shell-completions-windows.result }}
         run: |
           set -euo pipefail
 
@@ -572,7 +712,9 @@ jobs:
           for pair in \
             "hygiene=${HYGIENE_RESULT}" \
             "windows=${WINDOWS_RESULT}" \
-            "macos=${MACOS_RESULT}"; do
+            "macos=${MACOS_RESULT}" \
+            "shell-completions-macos=${COMPLETIONS_MACOS_RESULT}" \
+            "shell-completions-windows=${COMPLETIONS_WINDOWS_RESULT}"; do
             name="${pair%%=*}"
             result="${pair#*=}"
             if [ "${result}" != "success" ]; then
@@ -582,8 +724,8 @@ jobs:
           done
 
           if [ -n "${failed}" ]; then
-            echo "::error::Required job results: hygiene=${HYGIENE_RESULT} windows=${WINDOWS_RESULT} macos=${MACOS_RESULT}"
+            echo "::error::Required job results: hygiene=${HYGIENE_RESULT} windows=${WINDOWS_RESULT} macos=${MACOS_RESULT} shell-completions-macos=${COMPLETIONS_MACOS_RESULT} shell-completions-windows=${COMPLETIONS_WINDOWS_RESULT}"
             exit 1
           fi
 
-          echo "ci: hygiene, windows, and macos all succeeded."
+          echo "ci: hygiene, windows, macos, and both shell-completion jobs all succeeded."

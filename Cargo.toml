@@ -29,6 +29,17 @@ pedantic = "deny"
 
 [dependencies]
 clap = { version = "=4.6.6", features = ["derive"] }
+# Static completion-script generation over the same `clap::Command` the parser is built from.
+# Exact, like every other pin here: a generated artifact that changes underneath a previously
+# green run is the hardest kind of failure to attribute.
+#
+# The feature set is stated rather than inherited, and the measurement is what makes the line
+# honest: this crate's default set is *empty* (`default = []`), so `default-features = false`
+# subtracts nothing today. It is written anyway because the one capability this binary cannot
+# use — the runtime completion engine, which completes from a live process rather than from a
+# script a shell sources at startup — sits behind `unstable-dynamic`, and writing the empty set
+# explicitly makes a version bump that adds a default a decision instead of an inheritance.
+clap_complete = { version = "=4.6.9", default-features = false }
 # The pipeline's queues. Bounded MPMC is the primitive it needs — many workers drawing
 # from one queue, with a declared capacity — and `std::sync::mpsc` is single-consumer, so
 # sharing a `Receiver` would mean holding a lock across a blocking `recv`. Chosen over
