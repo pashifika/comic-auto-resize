@@ -40,7 +40,14 @@ class HarnessTests(unittest.TestCase):
         """A dropped case would otherwise shrink the run and still report success."""
         self.assertEqual(tuple(case.name for case in completion_cases()), CASE_ORDER)
         for case in completion_cases():
-            self.assertTrue(case.expected, f"case {case.name!r} asserts nothing")
+            # A case asserts through candidates, through the resulting buffer, or through the
+            # set it forbids. `enum-no-match` and `after-terminator` expect nothing on
+            # purpose: what they prove is negative, and the companion test below makes sure no
+            # case is left with nothing to fail on.
+            self.assertTrue(
+                case.expected or case.completed or case.forbidden,
+                f"case {case.name!r} asserts nothing at all",
+            )
             self.assertTrue(case.line.startswith(PRODUCT), f"case {case.name!r} is off-product")
 
     def test_every_case_forbids_something(self) -> None:
@@ -102,6 +109,42 @@ class HarnessTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(AcceptanceError, "forbidden="):
             verify_case("bash", case, f"{PRODUCT} --progressive page\n\npage-one.zip  true\n")
+
+    def test_an_attached_value_must_carry_its_option_where_the_shell_replaces_the_word(
+        self,
+    ) -> None:
+        """`false` for `--progressive=` rewrites the line to `comic-auto-resize false`.
+
+        fish and PowerShell return the text that replaces the whole word, so a candidate
+        without the option is a different command. An earlier version of this harness stripped
+        the prefix when present and accepted its absence, which passed a PowerShell script
+        that had dropped it.
+        """
+        case = CompletionCase(
+            name="attached",
+            line=f"{PRODUCT} --progressive=",
+            expected=("true", "false"),
+            forbidden=("page-one.zip",),
+            attached="--progressive=",
+        )
+        self.assertEqual(
+            verify_case("powershell", case, "--progressive=true\n--progressive=false\n"),
+            ["false", "true"],
+        )
+        with self.assertRaisesRegex(AcceptanceError, "do not carry"):
+            verify_case("powershell", case, "true\nfalse\n")
+        # A terminal menu shows the value alone; carrying the option there would insert it
+        # twice.
+        self.assertEqual(
+            verify_case("bash", case, f"{PRODUCT} --progressive=\n\ntrue  false\n"),
+            ["false", "true"],
+        )
+        with self.assertRaisesRegex(AcceptanceError, "carry"):
+            verify_case(
+                "bash",
+                case,
+                f"{PRODUCT} --progressive=\n\n--progressive=true  --progressive=false\n",
+            )
 
     def test_a_shell_diagnostic_fails_a_case_that_otherwise_matched(self) -> None:
         case = CompletionCase(

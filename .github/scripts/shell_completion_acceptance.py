@@ -55,6 +55,10 @@ CASE_ORDER = (
     "positional-path",
     "out-path",
     "out-path-empty",
+    "enum-no-match",
+    "spaced-path",
+    "spaced-path-attached",
+    "after-terminator",
 )
 
 # Everything a shell writes to a terminal that is not a candidate.
@@ -80,7 +84,8 @@ RESIZE_MODES = (
 # is what makes an empty-prefix case assertable on a terminal shell: with a common prefix the
 # first Tab inserts it and the second prints no menu, so the case would read as silence.
 PATH_CANDIDATES = ("page-one.zip", "page-two.zip", "pages")
-ALL_ENTRIES = PATH_CANDIDATES + ("zzz.cbz",)
+ALL_ENTRIES = PATH_CANDIDATES + ("spaced", "zzz.cbz")
+
 
 class AcceptanceError(RuntimeError):
     """A required observation could not be proved."""
@@ -98,10 +103,21 @@ class CompletionCase:
     # a path case asserting only that files appear passes against a script that registers
     # nothing at all, because every shell completes files on its own.
     forbidden: tuple[str, ...] = field(default=())
-    # Removed from each candidate before comparing. The shells disagree about whether an
-    # attached value's completion carries the option back: fish and PowerShell answer
-    # `--progressive=false`, bash and zsh answer `false`. Both are correct for their shell.
-    strip: str = ""
+    # The option an attached value belongs to, when the case completes one. It is not simply
+    # stripped: what the shell must return differs, and the difference is the assertion.
+    # fish and PowerShell replace the whole word, so the candidate has to carry
+    # `--progressive=` back or accepting it would delete the option and leave `false` as the
+    # input path — measured. bash and zsh replace only the value and must not carry it. An
+    # optional-prefix rule passed a PowerShell script that had dropped it.
+    attached: str = ""
+    # The exact command line the shell must be left with, for a case whose completion is
+    # unique. Candidate sets cannot see this: `--out spaced/one<Tab>` offers the same one name
+    # whether the script escapes the space or hands the name back in pieces, and only the
+    # resulting buffer says which happened.
+    completed: str = ""
+    # How many tabs to send. Two lists a menu; one is right for a case whose completion is
+    # unique, where a second tab moves on to the next word and buries the result.
+    tabs: int = 2
 
 
 class Fixture:
@@ -120,6 +136,10 @@ class Fixture:
         (self.work / "page-two.zip").write_bytes(b"PK\x05\x06" + bytes(18))
         (self.work / "zzz.cbz").write_bytes(b"PK\x05\x06" + bytes(18))
         (self.work / "pages").mkdir()
+        # A name a shell has to quote, in its own directory so the empty-prefix cases still
+        # see one word. Every archive in this project's corpus has spaces and brackets.
+        (self.work / "spaced").mkdir()
+        (self.work / "spaced" / "one two.zip").write_bytes(b"PK\x05\x06" + bytes(18))
 
     def __enter__(self) -> Fixture:
         return self
@@ -171,8 +191,8 @@ def completion_cases() -> tuple[CompletionCase, ...]:
             name="attached-only-value",
             line=f"{PRODUCT} --progressive=",
             expected=("true", "false"),
-            forbidden=("page-one.zip", "--progressive"),
-            strip="--progressive=",
+            forbidden=("page-one.zip",),
+            attached="--progressive=",
         ),
         # A prefix a shell can filter on. What this proves is that the script does not
         # *hijack* a path position — path completion itself is the shell's own, so a case
@@ -198,6 +218,57 @@ def completion_cases() -> tuple[CompletionCase, ...]:
             line=f"{PRODUCT} --out ",
             expected=ALL_ENTRIES,
             forbidden=("--out", "--quality", "true"),
+        ),
+        # A value prefix no value matches. Returning nothing is not the same as declining:
+        # PowerShell ran its own file completion on the empty result and `--dct sr` became
+        # `./src`, and bash's `-o default` did the same, turning `--dct pa` into `--dct page`.
+        # `pa` is a prefix of three real entries here, so a shell that falls back has
+        # something to offer and the case sees it.
+        CompletionCase(
+            name="enum-no-match",
+            line=f"{PRODUCT} --dct pa",
+            expected=(),
+            forbidden=PATH_CANDIDATES,
+            completed=f"{PRODUCT} --dct pa",
+            tabs=1,
+        ),
+        # A name the shell has to quote. Only the resulting buffer distinguishes an escaped
+        # single argument from a name handed back in pieces: PowerShell emitted
+        # `--out=(一般コミック) [TEST] …` raw and the parenthesis was read as a subexpression,
+        # and bash's `compgen -f` split the name on its space.
+        CompletionCase(
+            name="spaced-path",
+            line=f"{PRODUCT} --out spaced/one",
+            expected=("one two.zip",),
+            forbidden=("--out", "true"),
+            completed=f"{PRODUCT} --out spaced/one\\ two.zip",
+            tabs=1,
+        ),
+        # The same name through the attached spelling, which is the branch this project writes
+        # rather than defers: PowerShell's own file completion cannot see past `--out=`, so the
+        # candidates are built here and have to come back as one argument. Emitted raw, a
+        # corpus name's `(一般コミック)` was read as a subexpression and PowerShell tried to run
+        # it.
+        CompletionCase(
+            name="spaced-path-attached",
+            line=f"{PRODUCT} --out=spaced/one",
+            expected=("one two.zip",),
+            forbidden=("--quality", "true"),
+            completed=f"{PRODUCT} --out=spaced/one\\ two.zip",
+            tabs=1,
+        ),
+        # After `--` every word is the input path, so no option name belongs there. bash and
+        # PowerShell both offered `--ratio` and `--resize-mode` until the guards landed.
+        #
+        # Two tabs and no buffer assertion, and the reason is the defect's own shape: the two
+        # options share the prefix `--r`, so a shell that wrongly offers them inserts nothing
+        # on the first tab and leaves the line looking untouched. Only the menu the second tab
+        # prints shows what happened.
+        CompletionCase(
+            name="after-terminator",
+            line=f"{PRODUCT} -- --r",
+            expected=(),
+            forbidden=("--ratio", "--resize-mode"),
         ),
     )
 
@@ -458,8 +529,10 @@ def _collect_completion(master: int) -> bytes:
     return bytes(observed)
 
 
-def interactive_completion(installation: Installation, fixture: Fixture, line: str) -> str:
-    """Types `line` and two tabs into a real terminal and reads back what appears.
+def interactive_completion(
+    installation: Installation, fixture: Fixture, line: str, tabs: int = 2
+) -> str:
+    """Types `line` and `tabs` tabs into a real terminal and reads back what appears.
 
     Two tabs rather than one: a shell completes the common prefix on the first and lists
     the candidates on the second, and it is the list this asserts against.
@@ -484,7 +557,7 @@ def interactive_completion(installation: Installation, fixture: Fixture, line: s
     os.close(slave)
     try:
         _wait_for_prompt(master, process)
-        os.write(master, line.encode() + b"\t\t")
+        os.write(master, line.encode() + b"\t" * tabs)
         return normalized_terminal_output(_collect_completion(master))
     finally:
         if process.poll() is None:
@@ -565,6 +638,10 @@ def normalize_candidate(value: str) -> str:
     one of them would compare a path against a filename.
     """
     candidate = value.split("\t", 1)[0].rstrip("\r\n").strip()
+    # A shell that had to quote a name returns it quoted; the name inside is the candidate.
+    for quote in ("'", '"'):
+        if len(candidate) > 1 and candidate.startswith(quote) and candidate.endswith(quote):
+            candidate = candidate[1:-1]
     candidate = candidate.removesuffix("*").rstrip("/\\")
     for separator in ("/", "\\"):
         if separator in candidate:
@@ -631,16 +708,34 @@ def verify_case(shell: str, case: CompletionCase, observed: str) -> list[str]:
 
     if shell in ("fish", "powershell"):
         actual = machine_candidates(observed)
+        # These two return the text that replaces the whole word, so an attached value has to
+        # carry its option back. Without it, accepting `false` for `--progressive=` rewrites
+        # the line to `comic-auto-resize false` and the option is gone.
+        if case.attached:
+            bare = sorted(c for c in actual if not c.startswith(case.attached))
+            if bare:
+                raise AcceptanceError(
+                    f"case {case.name!r} failed in {shell}: {bare!r} do not carry "
+                    f"{case.attached!r}, so accepting one would drop the option"
+                )
+            actual = {c.removeprefix(case.attached) for c in actual}
     else:
         actual = menu_candidates(observed)
-    if case.strip:
-        actual = {
-            candidate.removeprefix(case.strip) if candidate.startswith(case.strip) else candidate
-            for candidate in actual
-        }
+        # A terminal menu shows the value alone, because readline replaces only the value.
+        if case.attached:
+            prefixed = sorted(c for c in actual if c.startswith(case.attached))
+            if prefixed:
+                raise AcceptanceError(
+                    f"case {case.name!r} failed in {shell}: {prefixed!r} carry "
+                    f"{case.attached!r}, which this shell would insert a second time"
+                )
 
-    missing = sorted(expected - actual)
-    unexpected = sorted(actual - expected)
+    terminal_buffer_case = bool(case.completed) and shell not in ("fish", "powershell")
+    missing = [] if terminal_buffer_case else sorted(expected - actual)
+    # A case with nothing expected asserts only what must not appear: `--dct pa` legitimately
+    # answers with nothing on fish, with the typed word on PowerShell, and with the typed word
+    # plus a space on an old bash, and all three are the same verdict.
+    unexpected = sorted(actual - expected) if expected and not terminal_buffer_case else []
     # The raw scan catches a forbidden string the menu parser did not turn into a candidate.
     # It skips anything the case's own line contains, because a terminal echoes the line it
     # was given and `--dct <Tab>` would otherwise be forbidden from mentioning `--dct`.
@@ -648,11 +743,19 @@ def verify_case(shell: str, case: CompletionCase, observed: str) -> list[str]:
         (actual & forbidden)
         | {value for value in case.forbidden if value not in case.line and value in observed}
     )
-    if missing or unexpected or offered_forbidden or diagnostics:
+    # What the buffer became, which a candidate set cannot see. Only the terminal shells leave
+    # one; fish and PowerShell are asked for candidates and never insert anything.
+    buffer_error = ""
+    if terminal_buffer_case:
+        left = observed.strip().splitlines()[-1].strip() if observed.strip() else ""
+        if left != case.completed.strip():
+            buffer_error = f"buffer is {left!r}, not {case.completed.strip()!r}"
+    if missing or unexpected or offered_forbidden or diagnostics or buffer_error:
         raise AcceptanceError(
             f"case {case.name!r} failed in {shell}: missing={missing!r} "
             f"unexpected={unexpected!r} forbidden={offered_forbidden!r} "
-            f"diagnostics={diagnostics!r} actual={sorted(actual)!r} observed={observed!r}"
+            f"diagnostics={diagnostics!r} {buffer_error} "
+            f"actual={sorted(actual)!r} observed={observed!r}"
         )
     return sorted(actual)
 
@@ -675,7 +778,7 @@ def run_shell(binary: Path, shell: str) -> None:
             elif shell == "powershell":
                 observed = powershell_completion(installation, fixture, case.line)
             else:
-                observed = interactive_completion(installation, fixture, case.line)
+                observed = interactive_completion(installation, fixture, case.line, case.tabs)
             emit(observation_record(shell, case.name, verify_case(shell, case, observed)))
             observed_cases.append(case.name)
 

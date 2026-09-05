@@ -17,7 +17,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 
-use clap::{Arg, Command, ValueEnum};
+use clap::{Arg, Command, ValueEnum, ValueHint};
 use clap_complete::aot::{Bash, Fish, PowerShell, Zsh, generate};
 
 /// The shells the two release targets use: bash, zsh and fish for `aarch64-apple-darwin`,
@@ -115,75 +115,183 @@ fn equals_only_options(command: &Command) -> Vec<(String, BTreeSet<String>)> {
     options
 }
 
-/// Splits each attached-value option's two spellings, on both bashes macOS has.
+/// Options whose value is a path, sorted.
 ///
-/// The two disagree about `=`, and that is the whole difficulty. bash 5 has `=` in
-/// `COMP_WORDBREAKS`, so `--progressive ` and `--progressive=` both reach the generated `prev`
-/// arm and `${COMP_WORDS[COMP_CWORD]}` — `=` for the attached form — is what tells them apart.
-/// bash 3.2, which is what `/bin/bash` is on macOS, does not split on `=`: `--progressive=`
-/// arrives whole in `cur`, never reaches that arm, and is filtered against the option list as
-/// though it were an option name, so the attached spelling could not complete at all.
+/// `clap`'s question, not this module's: `Arg::get_value_hint` infers `AnyPath` from a
+/// `PathBuf` value parser, so `-o/--out` answers and `--ratio`, `--quality`, `--jobs`,
+/// `--charset` and `--pwd` do not. Reading "has no possible values" as "takes a path" was a
+/// review finding — it made `--ratio=sr` complete to `--ratio=src`, which the parser refuses.
+fn path_options(command: &Command) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for argument in command.get_opts().filter(|arg| !arg.is_hide_set()) {
+        if matches!(
+            argument.get_value_hint(),
+            ValueHint::AnyPath | ValueHint::FilePath | ValueHint::DirPath
+        ) {
+            names.extend(option_names(argument));
+        }
+    }
+    names
+}
+
+/// Repairs `clap_complete`'s bash output in three places, each one measured.
 ///
-/// So two edits. The arm keeps the values under `=` and offers files under a space; a block
-/// ahead of the option-name filter catches the whole-word form and completes it with the
-/// prefix restored, which is what bash 3.2 needs and bash 5 never reaches.
+/// - **Value arms** stop offering their values in the word after an attached-value option,
+///   and stop letting `-o default` answer a value prefix nothing matched.
+/// - **Path arms** hand the position back to readline instead of `compgen -f`.
+/// - **A prelude** stops at `--` and completes the attached spelling on a bash that does not
+///   split on `=`.
 fn guarded_bash(generated: &[u8], command: &Command) -> Vec<u8> {
     let mut script = utf8(generated).to_owned();
-    let mut attached = Vec::new();
-    for (option, values) in equals_only_options(command) {
-        // The emitted `COMPREPLY=` line is reused verbatim rather than rebuilt: it carries
-        // upstream's value order and quoting, and rebuilding it was how the first attempt at
-        // this guard broke — the graph's values are sorted and the generator's are not.
-        let header = format!("\n                {option})\n");
-        let start = script.find(&header).unwrap_or_else(|| {
-            panic!("clap_complete 4.6.9 no longer emits a bash value arm for `{option}`")
-        }) + header.len();
-        let line = script[start..]
-            .lines()
-            .next()
-            .filter(|line| line.trim_start().starts_with("COMPREPLY="))
-            .unwrap_or_else(|| {
-                panic!(
-                    "clap_complete 4.6.9's bash arm for `{option}` no longer opens with COMPREPLY"
-                )
-            })
-            .to_owned();
-        let guarded = format!(
-            "                    if [[ \"${{COMP_WORDS[COMP_CWORD]}}\" == \"=\" ]]; then\n\
-             \x20   {line}\n\
-             \x20                   else\n\
-             \x20                       COMPREPLY=($(compgen -f \"${{cur}}\"))\n\
-             \x20                   fi"
-        );
-        script.replace_range(start..start + line.len(), &guarded);
-        attached.push((option, values.iter().cloned().collect::<Vec<_>>().join(" ")));
-    }
+    let attached = bash_value_arms(&mut script, command);
+    bash_path_arms(&mut script, command);
+    let block = bash_prelude(&attached);
+    let anchor = "            if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then\n";
+    replace_once(
+        &script,
+        anchor,
+        &format!("{block}{anchor}"),
+        "bash option-name filter",
+        "the root command",
+    )
+    .into_bytes()
+}
 
+/// Rewrites every arm that offers a value set, and returns the attached-value options.
+///
+/// The two bashes disagree about `=`, and that is the difficulty. bash 5 has it in
+/// `COMP_WORDBREAKS`, so `--progressive ` and `--progressive=` both reach the generated `prev`
+/// arm and `${COMP_WORDS[COMP_CWORD]}` — `=` for the attached form — tells them apart. Under a
+/// space the arm returns an **empty** `COMPREPLY` rather than `compgen -f`: the script
+/// registers `-o bashdefault -o default`, so an empty reply hands the position to readline's
+/// own filename completion, which keeps a directory's trailing `/` and does not split a name
+/// on its spaces. `compgen -f` did both, and every archive in this project's corpus has
+/// spaces in its name.
+fn bash_value_arms(script: &mut String, command: &Command) -> Vec<(String, String)> {
+    let equals_only: BTreeSet<String> = equals_only_options(command)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let mut attached = Vec::new();
+    for argument in command.get_opts().filter(|arg| !arg.is_hide_set()) {
+        let values = possible_values(argument);
+        if values.is_empty() {
+            continue;
+        }
+        for option in option_names(argument) {
+            // The emitted `COMPREPLY=` line is reused verbatim rather than rebuilt: it
+            // carries upstream's value order and quoting, and rebuilding it was how the first
+            // attempt at this guard broke — the graph's values are sorted, the emitted ones
+            // are not.
+            let header = format!("\n                {option})\n");
+            let start = script.find(&header).unwrap_or_else(|| {
+                panic!("clap_complete 4.6.9 no longer emits a bash value arm for `{option}`")
+            }) + header.len();
+            let line = script[start..]
+                .lines()
+                .next()
+                .filter(|line| line.trim_start().starts_with("COMPREPLY="))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "clap_complete 4.6.9's arm for `{option}` no longer opens with COMPREPLY"
+                    )
+                })
+                .to_owned();
+            let guarded = if equals_only.contains(&option) {
+                attached.push((
+                    option.clone(),
+                    values.iter().cloned().collect::<Vec<_>>().join(" "),
+                ));
+                let nested = bash_no_match_guard("                        ");
+                format!(
+                    "                    if [[ \"${{COMP_WORDS[COMP_CWORD]}}\" == \"=\" ]]; then\n\
+                     \x20   {line}\n\
+                     {nested}\n\
+                     \x20                   else\n\
+                     \x20                       COMPREPLY=()\n\
+                     \x20                   fi"
+                )
+            } else {
+                format!("{line}\n{}", bash_no_match_guard("                    "))
+            };
+            script.replace_range(start..start + line.len(), &guarded);
+        }
+    }
+    attached
+}
+
+/// Declines readline's filename fallback when no value matched.
+///
+/// A prefix no value matches leaves the reply empty and `-o default` then fills it with
+/// filenames: `--dct pa` completed to `--dct page`, which the parser refuses. `compopt` says
+/// so directly but arrived in bash 4, so where it is missing the reply is the word the user
+/// already typed — a completion to itself, which is the old idiom for "nothing to offer" and
+/// leaves a trailing space where `compopt` leaves none.
+fn bash_no_match_guard(indent: &str) -> String {
+    format!(
+        "{indent}if [[ ${{#COMPREPLY[@]}} -eq 0 ]]; then\n\
+         {indent}    if [[ \"${{BASH_VERSINFO[0]}}\" -ge 4 ]]; then\n\
+         {indent}        compopt +o default +o bashdefault\n\
+         {indent}    else\n\
+         {indent}        COMPREPLY=(\"${{cur}}\")\n\
+         {indent}    fi\n\
+         {indent}fi"
+    )
+}
+
+/// Hands each path option's arm back to readline.
+///
+/// `compgen -f` splits a candidate on its spaces and drops a directory's trailing `/`, so
+/// `--out a<Tab>` against `a b.zip` offered `a` and `b.zip` as two names. zsh's `_files` and
+/// fish's native completion both get this right unaided; only bash's generated arm does not.
+fn bash_path_arms(script: &mut String, command: &Command) {
+    for option in path_options(command) {
+        let arm = format!(
+            "\n                {option})\n                    COMPREPLY=($(compgen -f \"${{cur}}\"))\n"
+        );
+        let replacement =
+            format!("\n                {option})\n                    COMPREPLY=()\n");
+        *script = replace_once(script, &arm, &replacement, "bash path arm", &option);
+    }
+}
+
+/// The block spliced ahead of the generated option-name filter.
+fn bash_prelude(attached: &[(String, String)]) -> String {
+    let mut block = String::from(
+        "            # Everything after `--` is the input path, so no option name belongs here.\n\
+         \x20           # An empty reply hands the position to readline's own file completion.\n\
+         \x20           for ((_car_i = 1; _car_i < COMP_CWORD; _car_i++)); do\n\
+         \x20               if [[ \"${COMP_WORDS[_car_i]}\" == \"--\" ]]; then\n\
+         \x20                   COMPREPLY=()\n\
+         \x20                   return 0\n\
+         \x20               fi\n\
+         \x20           done\n",
+    );
     if !attached.is_empty() {
-        let mut block = String::from(
-            "            # An attached value that reached `cur` whole, which is every bash without\n            # `=` in COMP_WORDBREAKS. Completed with its own prefix restored, because the\n            # candidate replaces the whole word there.\n            case \"${cur}\" in\n",
+        block.push_str(
+            "            # An attached value that reached `cur` whole, which is what happens\n\
+             \x20           # wherever `=` is not a word break. `$2` is the text readline will\n\
+             \x20           # replace: when it is the whole word the candidate has to carry the\n\
+             \x20           # option back, and when it is only the value it must not.\n\
+             \x20           case \"${cur}\" in\n",
         );
         for (option, values) in attached {
             write!(
                 block,
                 "                {option}=*)\n\
-                 \x20                   COMPREPLY=($(compgen -W \"{values}\" -- \"${{cur#*=}}\"))\n\
+                 \x20                   if [[ \"$2\" == \"${{cur}}\" ]]; then\n\
+                 \x20                       COMPREPLY=($(compgen -P \"${{cur%%=*}}=\" -W \"{values}\" -- \"${{cur#*=}}\"))\n\
+                 \x20                   else\n\
+                 \x20                       COMPREPLY=($(compgen -W \"{values}\" -- \"${{cur#*=}}\"))\n\
+                 \x20                   fi\n\
                  \x20                   return 0\n\
                  \x20                   ;;\n"
             )
             .expect("writing to a String cannot fail");
         }
         block.push_str("            esac\n");
-        let anchor = "            if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then\n";
-        script = replace_once(
-            &script,
-            anchor,
-            &format!("{block}{anchor}"),
-            "bash option-name filter",
-            "the root command",
-        );
     }
-    script.into_bytes()
+    block
 }
 
 /// Turns each attached-value option's `_arguments` spec from `=` into `=-`.
@@ -274,18 +382,22 @@ fn guarded_powershell(generated: &[u8], command: &Command) -> Vec<u8> {
 
     let mut guarded = String::with_capacity(generated.len() * 2);
     guarded.push_str(&generated[..split]);
-    powershell_tables(&mut guarded, command);
+    powershell_tables(&mut guarded, command, command.get_name());
     guarded.push_str(POWERSHELL_GUARD);
     guarded.push_str(&generated[split..]);
     guarded.into_bytes()
 }
 
-/// The three facts about the surface the guard dispatches on, emitted as PowerShell data.
+/// The facts about the surface the guard dispatches on, emitted as PowerShell data.
 ///
 /// Data rather than generated control flow, so the logic below is one readable block that
 /// does not grow with the flag list.
-fn powershell_tables(out: &mut String, command: &Command) {
+fn powershell_tables(out: &mut String, command: &Command, name: &str) {
     out.push_str("    # What this surface is, emitted from the command graph.\n");
+    out.push_str("    $carName = ");
+    write_powershell_literal(out, name);
+    out.push('\n');
+
     out.push_str("    $carValues = @{\n");
     for argument in command.get_opts().filter(|arg| !arg.is_hide_set()) {
         let values = possible_values(argument);
@@ -307,15 +419,7 @@ fn powershell_tables(out: &mut String, command: &Command) {
     }
     out.push_str("    }\n");
 
-    write_powershell_array(out, "$carPathOptions", &{
-        let mut names = BTreeSet::new();
-        for argument in command.get_opts().filter(|arg| !arg.is_hide_set()) {
-            if possible_values(argument).is_empty() {
-                names.extend(option_names(argument));
-            }
-        }
-        names
-    });
+    write_powershell_array(out, "$carPathOptions", &path_options(command));
     write_powershell_array(
         out,
         "$carEqualsOnly",
@@ -330,8 +434,10 @@ fn powershell_tables(out: &mut String, command: &Command) {
 const POWERSHELL_GUARD: &str = r#"
     # This surface has no subcommands, so the generated preamble's bareword walk can only be
     # wrong: `comic-auto-resize book.zip --r` makes $command 'comic-auto-resize;book.zip',
-    # which matches no arm below and loses option-name completion entirely.
-    $command = $commandAst.CommandElements[0].Value
+    # which matches no arm below and loses option-name completion entirely. Pinned to the
+    # registered name rather than to the typed one, because `./target/release/comic-auto-resize`
+    # is the same command and matches no arm either.
+    $command = $carName
 
     # Tokens before the cursor, with quoting resolved. `.Value` is the parsed string of a
     # StringConstantExpressionAst, so a quoted `"--dct"` reads as an option rather than as a
@@ -351,18 +457,19 @@ const POWERSHELL_GUARD: &str = r#"
     $carAttached = ''
     # Everything after `--` is the positional input, however it is spelled.
     $carTerminated = $carTokens -contains '--'
+    # A bare attached-value option does not consume the next word, so that word is the input
+    # path -- but it does not end option parsing either, so an option name may still follow.
+    $carPositional = $false
     if (-not $carTerminated) {
         if ($wordToComplete -match '^(--?[^=]+)=(.*)$') {
             $carOption = $Matches[1]
             $carPrefix = $Matches[2]
             $carAttached = "$($Matches[1])="
         } elseif ($carTokens.Count -gt 1 -and $carTokens[-1].StartsWith('-')) {
-            # An attached-value option is complete on its own, so the next word is the input
-            # path rather than its value.
             if ($carEqualsOnly -notcontains $carTokens[-1]) {
                 $carOption = $carTokens[-1]
-            } else {
-                $carTerminated = $true
+            } elseif (-not $wordToComplete.StartsWith('-')) {
+                $carPositional = $true
             }
         }
     }
@@ -376,18 +483,27 @@ const POWERSHELL_GUARD: &str = r#"
     }
 
     if ($null -ne $carOption -and $carValues.ContainsKey($carOption)) {
-        # A known value set answers alone. Falling through on a prefix nothing matches would
-        # offer files and option names the parser refuses -- `--dct sr` completed to `./src`.
-        @($carValues[$carOption]) |
+        $carMatches = @(@($carValues[$carOption]) |
             Where-Object { $_.StartsWith($carPrefix, [System.StringComparison]::OrdinalIgnoreCase) } |
-            Sort-Object |
-            ForEach-Object {
-                [CompletionResult]::new("$carAttached$_", $_, [CompletionResultType]::ParameterValue, $_)
+            Sort-Object)
+        if ($carMatches.Count -eq 0) {
+            # Returning nothing is not the same as suppressing completion: the engine runs its
+            # own file completion on an empty result, which is how `--dct sr` completed to
+            # `./src` and produced an argument the parser refuses. Handing back the word the
+            # user already typed is what makes a no-match a no-op.
+            if ($wordToComplete.Length -gt 0) {
+                [CompletionResult]::new($wordToComplete, $wordToComplete, [CompletionResultType]::Text, $wordToComplete)
             }
+            return
+        }
+        $carMatches | ForEach-Object {
+            [CompletionResult]::new("$carAttached$_", $_, [CompletionResultType]::ParameterValue, $_)
+        }
         return
     }
 
-    if ($carTerminated -or ($null -ne $carOption -and $carPathOptions -contains $carOption)) {
+    if ($carTerminated -or $carPositional -or
+        ($null -ne $carOption -and $carPathOptions -contains $carOption)) {
         # A path position. Returning nothing lets PowerShell's own file completion answer,
         # which is what should have happened before the stock body offered the option list --
         # but it cannot see past an attached `--out=`, so that spelling is completed here.
@@ -407,7 +523,13 @@ const POWERSHELL_GUARD: &str = r#"
             Where-Object { $_.Name.StartsWith($carLeaf, [System.StringComparison]::OrdinalIgnoreCase) } |
             Sort-Object -Property Name |
             ForEach-Object {
+                # Quoted as one argument. A filename is filesystem data, and this project's own
+                # corpus has names with spaces, brackets and parentheses: emitted raw, PowerShell
+                # read `(一般コミック)` as a subexpression and tried to run it.
                 $carText = "$carAttached$carParent$($_.Name)"
+                if ($carText -notmatch '^[A-Za-z0-9_./\\:=+-]+$') {
+                    $carText = "'" + $carText.Replace("'", "''") + "'"
+                }
                 [CompletionResult]::new($carText, $_.Name, [CompletionResultType]::ParameterValue, $carText)
             }
         return
