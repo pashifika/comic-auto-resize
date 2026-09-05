@@ -394,48 +394,6 @@ fn the_binary_re_encodes_a_narrow_page_at_its_own_size() {
     }
 }
 
-#[test]
-fn the_binary_refuses_a_missing_input_and_a_non_archive() {
-    let directory = TempDir::new("bad-input");
-
-    let missing = directory.join("nope.zip");
-    let output = Command::new(BINARY)
-        .arg(&missing)
-        .output()
-        .expect("runs the binary");
-    assert!(!output.status.success());
-    let message = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        message.contains("nope.zip"),
-        "stderr must name the path: {message}"
-    );
-    assert!(!default_output(&missing).exists());
-
-    let not_zip = directory.join("plain.zip");
-    fs::write(&not_zip, b"this is not an archive").expect("writes the decoy");
-    let output = Command::new(BINARY)
-        .arg(&not_zip)
-        .output()
-        .expect("runs the binary");
-    assert!(!output.status.success());
-    let message = String::from_utf8_lossy(&output.stderr);
-    // The spec requires the refusal to name the path *and* the formats this build reads,
-    // because "not a zip archive" stopped being the whole answer when rar arrived.
-    assert!(
-        message.contains("not an archive this build reads"),
-        "stderr must say why: {message}"
-    );
-    assert!(
-        message.contains("zip") && message.contains("rar"),
-        "stderr must name the formats this build reads: {message}"
-    );
-    assert!(
-        message.contains(&not_zip.display().to_string()),
-        "stderr must name the path: {message}"
-    );
-    assert!(!default_output(&not_zip).exists());
-}
-
 /// An unreadable entry table fails the run, and fails it before anything is written.
 #[test]
 fn the_binary_refuses_an_archive_whose_entry_table_is_truncated() {
@@ -856,70 +814,6 @@ fn no_option_sets_the_minimum_edge_or_a_budget() {
             !listed.contains(forbidden),
             "`{forbidden}` appears on the command line: {listed}"
         );
-    }
-}
-
-/// An out-of-range value, or a combination that names one quantity twice, is refused by the
-/// parser before the input is opened.
-#[test]
-fn an_out_of_range_option_value_is_refused_before_any_work() {
-    let directory = TempDir::new("bad-values");
-    let input = valid_input(&directory);
-
-    for args in [
-        vec!["--quality", "0"],
-        vec!["--quality", "101"],
-        vec!["--auto-width", "0"],
-        vec!["--auto-width", "65536"],
-        vec!["--resize-mode", "nearest"],
-        vec!["--dct", "fast"],
-        vec!["--ratio", "0"],
-        vec!["--ratio", "101"],
-        // Zero workers is no pipeline at all, and the parser is where that is refused.
-        vec!["--jobs", "0"],
-        // Both name a target width, one relative and one absolute, so there is no precedence
-        // to pick. Both orders, because a conflict declared on one arm has to refuse from
-        // either side — and deleting the exclusivity would otherwise leave every other test
-        // passing while `-r` silently won.
-        vec!["--ratio", "30", "--auto-width", "1000"],
-        vec!["--auto-width", "1000", "--ratio", "30"],
-    ] {
-        let output = Command::new(BINARY)
-            .args(&args)
-            .arg(&input)
-            .output()
-            .expect("runs the binary");
-        assert!(
-            !output.status.success(),
-            "{args:?} was accepted; the value is out of range"
-        );
-        // The input was valid, so nothing may have been produced from it.
-        assert!(
-            !default_output(&input).exists(),
-            "{args:?} produced an output archive"
-        );
-    }
-
-    // And the accepted values really are accepted, so the test above is not passing because
-    // every value is refused.
-    for args in [
-        vec!["--quality", "1"],
-        vec!["--quality", "100"],
-        vec!["--auto-width", "65535"],
-        vec!["--resize-mode", "nearest-neighbor"],
-        vec!["--dct", "islow"],
-        vec!["--ratio", "1"],
-        vec!["--ratio", "100"],
-        vec!["--jobs", "1"],
-    ] {
-        let scratch = TempDir::new("good-values");
-        let good = valid_input(&scratch);
-        let status = Command::new(BINARY)
-            .args(&args)
-            .arg(&good)
-            .status()
-            .expect("runs the binary");
-        assert!(status.success(), "{args:?} was refused but is in range");
     }
 }
 

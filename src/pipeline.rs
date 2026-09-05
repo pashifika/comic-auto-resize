@@ -613,8 +613,13 @@ pub enum RunError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("cannot write the archive: {0}")]
-    Archive(::zip::result::ZipError),
+    /// The zip writer refused. Names the **output**, which is the archive being written: the
+    /// dependency's own message describes the operation and not the file it was on.
+    #[error("{}: cannot write the archive: {source}", path.display())]
+    Archive {
+        path: PathBuf,
+        source: ::zip::result::ZipError,
+    },
     /// A stage panicked. Caught rather than left to unwind out of `thread::scope`, which
     /// would discard the payload and skip the cleanup path.
     #[error("{stage} stopped unexpectedly")]
@@ -654,10 +659,49 @@ pub enum RunError {
     OutputInsideInput { path: PathBuf, input: PathBuf },
 }
 
+impl RunError {
+    /// Whether this failure is about the input, which a run cannot name for itself.
+    ///
+    /// [`run`] is handed a source rather than a path — a `Cursor` is a source, and six of this
+    /// repository's test files hand it one — so a failure about the input names what the run
+    /// knows, which is the entry or nothing at all. The caller holding the input's path is the
+    /// one that can name it, and this says which failures to name it on. Every other variant
+    /// carries the path it is about, and prefixing the input onto those would print two paths
+    /// in a line whose subject was never the input.
+    ///
+    /// So the invariant is: **a failure either names the path it is about, or it is about the
+    /// input.** [`StrayOutput`](RunError::StrayOutput) is on the naming side rather than
+    /// delegating to the cause it quotes: what it names is the stray file the next run will
+    /// refuse, which is the fact the user has to act on.
+    ///
+    /// The match is exhaustive deliberately. A variant added to [`RunError`] does not compile
+    /// until it is classified here, and the enumeration test below wants it constructed too.
+    #[must_use]
+    pub fn concerns_input(&self) -> bool {
+        match self {
+            Self::Source(_)
+            | Self::Page(_)
+            | Self::StagePanicked { .. }
+            | Self::Empty
+            | Self::NameCollision { .. }
+            | Self::Incomplete { .. } => true,
+            Self::OutputExists { .. }
+            | Self::StrayOutput { .. }
+            | Self::Io { .. }
+            | Self::Archive { .. }
+            | Self::UnnamedInput { .. }
+            | Self::MissingOutputDirectory { .. }
+            | Self::OutputInsideInput { .. } => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Capacities, WINDOW_PER_JOB};
+    use super::{Capacities, PageError, RunError, SourceError, WINDOW_PER_JOB};
+    use std::io;
     use std::num::NonZeroUsize;
+    use std::path::PathBuf;
 
     #[test]
     fn every_channel_has_a_finite_capacity_that_scales_with_the_worker_count() {
@@ -692,5 +736,89 @@ mod tests {
         let capacities = Capacities::for_jobs(NonZeroUsize::MAX);
         assert_eq!(capacities.credits, usize::MAX);
         assert!(capacities.credits >= capacities.work);
+    }
+
+    /// Every failure either names the path it is about, or is about the input.
+    ///
+    /// This is what "a refusal names the thing that is wrong" rests on, and it is a test
+    /// rather than a prefix applied centrally because seven of these variants are about the
+    /// output: prefixing the input onto `{output}: already exists` would print two unlabelled
+    /// paths in a sentence whose subject was never the input.
+    ///
+    /// It is *here* rather than in `tests/` because [`RunError`] is `#[non_exhaustive]`, so a
+    /// match outside this crate needs a wildcard and a variant added later would fall through
+    /// it in silence. In this crate the match below is exhaustive, so a new variant does not
+    /// compile until someone has built one and classified it.
+    #[test]
+    fn every_failure_names_its_own_path_or_is_about_the_input() {
+        const SENTINEL: &str = "sentinel-subject.zip";
+        let path = PathBuf::from(SENTINEL);
+        let failures = [
+            RunError::Source(SourceError::RepeatedName {
+                recorded: 2,
+                kept: 1,
+            }),
+            RunError::Page(PageError::stage_panicked("a page worker")),
+            RunError::OutputExists { path: path.clone() },
+            RunError::StrayOutput {
+                path: path.clone(),
+                source: Box::new(RunError::Empty),
+                cleanup: io::Error::other("the stray could not be removed"),
+            },
+            RunError::Io {
+                path: path.clone(),
+                source: io::Error::other("the write failed"),
+            },
+            RunError::Archive {
+                path: path.clone(),
+                source: ::zip::result::ZipError::FileNotFound,
+            },
+            RunError::StagePanicked {
+                stage: "the archive reader",
+            },
+            RunError::Empty,
+            RunError::NameCollision {
+                name: "001.jpg".to_owned(),
+            },
+            RunError::Incomplete {
+                expected: 7,
+                stranded: 9,
+            },
+            RunError::UnnamedInput { path: path.clone() },
+            RunError::MissingOutputDirectory { path: path.clone() },
+            RunError::OutputInsideInput {
+                path: path.clone(),
+                input: path.clone(),
+            },
+        ];
+
+        for failure in failures {
+            // Exhaustive so the list above cannot be left short: a variant added to `RunError`
+            // has no arm here until someone writes one, and writing one is where they find
+            // out it needs constructing above.
+            match &failure {
+                RunError::Source(_)
+                | RunError::Page(_)
+                | RunError::OutputExists { .. }
+                | RunError::StrayOutput { .. }
+                | RunError::Io { .. }
+                | RunError::Archive { .. }
+                | RunError::StagePanicked { .. }
+                | RunError::Empty
+                | RunError::NameCollision { .. }
+                | RunError::Incomplete { .. }
+                | RunError::UnnamedInput { .. }
+                | RunError::MissingOutputDirectory { .. }
+                | RunError::OutputInsideInput { .. } => {}
+            }
+
+            let line = failure.to_string();
+            assert_eq!(
+                failure.concerns_input(),
+                !line.contains(SENTINEL),
+                "a failure names the path it is about or is classified as being about the \
+                 input, and this one does both or neither: {line}"
+            );
+        }
     }
 }
