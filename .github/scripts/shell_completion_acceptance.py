@@ -50,8 +50,11 @@ CASE_ORDER = (
     "option-prefix",
     "dct-values",
     "resize-mode-values",
+    "attached-only-space",
+    "attached-only-value",
     "positional-path",
     "out-path",
+    "out-path-empty",
 )
 
 # Everything a shell writes to a terminal that is not a candidate.
@@ -72,11 +75,12 @@ RESIZE_MODES = (
     "lanczos2",
     "lanczos3",
 )
-# What the fixture's working directory holds, and therefore what a path completion of `page`
-# must offer. Chosen so all three share the prefix, which stops a shell from silently
-# completing the common part and showing no menu at all.
-PATH_CANDIDATES = ("page-one.zip", "page-two.zip", "pages")
 
+# What the fixture's working directory holds. `zzz.cbz` shares no prefix with the rest, which
+# is what makes an empty-prefix case assertable on a terminal shell: with a common prefix the
+# first Tab inserts it and the second prints no menu, so the case would read as silence.
+PATH_CANDIDATES = ("page-one.zip", "page-two.zip", "pages")
+ALL_ENTRIES = PATH_CANDIDATES + ("zzz.cbz",)
 
 class AcceptanceError(RuntimeError):
     """A required observation could not be proved."""
@@ -87,9 +91,17 @@ class CompletionCase:
     name: str
     line: str
     expected: tuple[str, ...]
-    # Candidates that must not appear. A value enum offering the option list back is the
-    # failure this catches, and it is the one clap_complete's stock PowerShell output has.
+    # Candidates that must not appear. Every case carries some, because most of the defects
+    # this harness exists to catch show up as the *wrong* candidates rather than as missing
+    # ones — a value position answered with the option list, a path position answered with
+    # `true`/`false`. A case with an empty forbidden set is usually a case that cannot fail:
+    # a path case asserting only that files appear passes against a script that registers
+    # nothing at all, because every shell completes files on its own.
     forbidden: tuple[str, ...] = field(default=())
+    # Removed from each candidate before comparing. The shells disagree about whether an
+    # attached value's completion carries the option back: fish and PowerShell answer
+    # `--progressive=false`, bash and zsh answer `false`. Both are correct for their shell.
+    strip: str = ""
 
 
 class Fixture:
@@ -106,6 +118,7 @@ class Fixture:
         self.work.mkdir()
         (self.work / "page-one.zip").write_bytes(b"PK\x05\x06" + bytes(18))
         (self.work / "page-two.zip").write_bytes(b"PK\x05\x06" + bytes(18))
+        (self.work / "zzz.cbz").write_bytes(b"PK\x05\x06" + bytes(18))
         (self.work / "pages").mkdir()
 
     def __enter__(self) -> Fixture:
@@ -116,34 +129,75 @@ class Fixture:
 
 
 def completion_cases() -> tuple[CompletionCase, ...]:
-    """The same five rows for every shell: one surface, one set of promises."""
+    """The same rows for every shell: one surface, one set of promises.
+
+    Uniform on purpose. Where the shells disagreed it was because the generated script was
+    wrong for one of them, so a per-shell expectation would have recorded the defect as the
+    contract rather than caught it.
+    """
     return (
         CompletionCase(
             name="option-prefix",
             line=f"{PRODUCT} --r",
             expected=("--ratio", "--resize-mode"),
+            forbidden=("--dct", "page-one.zip"),
         ),
         CompletionCase(
             name="dct-values",
             line=f"{PRODUCT} --dct ",
             expected=DCT_METHODS,
-            forbidden=("--dct", "--quality"),
+            forbidden=("--dct", "--quality", "page-one.zip"),
         ),
         CompletionCase(
             name="resize-mode-values",
             line=f"{PRODUCT} --resize-mode ",
             expected=RESIZE_MODES,
-            forbidden=("--resize-mode", "--quality"),
+            forbidden=("--resize-mode", "--quality", "page-one.zip"),
         ),
+        # `--progressive` takes its value only when attached, so the next word is the input
+        # path. Every shell offered `true`/`false` there until the guards landed, and picking
+        # one produced `error: false: No such file or directory`.
+        #
+        # The empty prefix is load-bearing: with `--progressive page` a shell that still
+        # thinks the next word is the value filters `true`/`false` away against `page` and
+        # falls through to files, so the case passes on the defect it exists to catch.
+        CompletionCase(
+            name="attached-only-space",
+            line=f"{PRODUCT} --progressive ",
+            expected=ALL_ENTRIES,
+            forbidden=("true", "false"),
+        ),
+        CompletionCase(
+            name="attached-only-value",
+            line=f"{PRODUCT} --progressive=",
+            expected=("true", "false"),
+            forbidden=("page-one.zip", "--progressive"),
+            strip="--progressive=",
+        ),
+        # A prefix a shell can filter on. What this proves is that the script does not
+        # *hijack* a path position — path completion itself is the shell's own, so a case
+        # asserting only that filenames appear would pass against a script that registered
+        # nothing at all. The forbidden sets are what carry the assertion.
         CompletionCase(
             name="positional-path",
             line=f"{PRODUCT} page",
             expected=PATH_CANDIDATES,
+            forbidden=("--out", "--quality", "true"),
         ),
         CompletionCase(
             name="out-path",
             line=f"{PRODUCT} --out page",
             expected=PATH_CANDIDATES,
+            forbidden=("--out", "--quality", "true"),
+        ),
+        # The empty prefix, which is where a value position is easiest to answer wrongly and
+        # where the stock PowerShell body did: `--out <Tab>` returned every option name,
+        # `--out` among them, because it filters names by a prefix that matches everything.
+        CompletionCase(
+            name="out-path-empty",
+            line=f"{PRODUCT} --out ",
+            expected=ALL_ENTRIES,
+            forbidden=("--out", "--quality", "true"),
         ),
     )
 
@@ -219,13 +273,27 @@ def isolated_environment(fixture: Fixture, binary_directory: Path) -> dict[str, 
 
     On PATH because a completion is registered against a command name: a shell that cannot
     resolve the name may decline to complete for it at all.
+
+    Every XDG root is redirected, not only the config one. Measured on a developer machine
+    with the rest pointing elsewhere, a run created `fish` and `powershell` state under the
+    ambient cache and data roots — so the fixture's promise held for what the harness writes
+    and not for what the shells write. `BASH_ENV` is removed for a sharper reason: `bash -n`
+    sources it before declining to run the script under test, so an ambient one executes
+    inside what is supposed to be a syntax check.
     """
     environment = os.environ.copy()
+    for leak in ("BASH_ENV", "ENV", "HISTFILE", "SHELLOPTS", "PYTHONSTARTUP"):
+        environment.pop(leak, None)
+    state = fixture.home / "state"
+    state.mkdir(exist_ok=True)
     environment.update(
         {
             "HOME": str(fixture.home),
             "USERPROFILE": str(fixture.home),
             "XDG_CONFIG_HOME": str(fixture.home),
+            "XDG_DATA_HOME": str(state),
+            "XDG_CACHE_HOME": str(state),
+            "XDG_STATE_HOME": str(state),
             "ZDOTDIR": str(fixture.home),
             "TERM": "xterm-256color",
             "PATH": str(binary_directory) + os.pathsep + environment.get("PATH", ""),
@@ -546,8 +614,16 @@ def menu_candidates(observed: str) -> set[str]:
 def verify_case(shell: str, case: CompletionCase, observed: str) -> list[str]:
     """Compares what the shell offered against what the case requires.
 
-    Missing and forbidden are both failures, and so is a shell diagnostic: a completion
-    function that errors mid-way can still leave the expected candidates on screen.
+    Three ways to fail, and the third is the one worth spelling out. Missing candidates are
+    obvious. Forbidden candidates catch a value position answered with the option list.
+    **Unexpected** candidates catch the shape neither of those sees: a value option that
+    stopped being exclusive, so the shell offers its values *and* the directory listing.
+    Dropping that check let a fish `--dct <Tab>` answering
+    `float ifast islow page-one.zip page-two.zip pages` pass.
+
+    A shell diagnostic fails the case too: a completion function that errored mid-way can
+    still leave the expected candidates on screen, and its message would otherwise be
+    recorded in the evidence as though the words of it were candidates.
     """
     expected = {normalize_candidate(value) for value in case.expected}
     forbidden = {normalize_candidate(value) for value in case.forbidden}
@@ -557,14 +633,26 @@ def verify_case(shell: str, case: CompletionCase, observed: str) -> list[str]:
         actual = machine_candidates(observed)
     else:
         actual = menu_candidates(observed)
+    if case.strip:
+        actual = {
+            candidate.removeprefix(case.strip) if candidate.startswith(case.strip) else candidate
+            for candidate in actual
+        }
 
     missing = sorted(expected - actual)
-    offered_forbidden = sorted(actual & forbidden)
-    if missing or offered_forbidden or diagnostics:
+    unexpected = sorted(actual - expected)
+    # The raw scan catches a forbidden string the menu parser did not turn into a candidate.
+    # It skips anything the case's own line contains, because a terminal echoes the line it
+    # was given and `--dct <Tab>` would otherwise be forbidden from mentioning `--dct`.
+    offered_forbidden = sorted(
+        (actual & forbidden)
+        | {value for value in case.forbidden if value not in case.line and value in observed}
+    )
+    if missing or unexpected or offered_forbidden or diagnostics:
         raise AcceptanceError(
             f"case {case.name!r} failed in {shell}: missing={missing!r} "
-            f"forbidden={offered_forbidden!r} diagnostics={diagnostics!r} "
-            f"actual={sorted(actual)!r} observed={observed!r}"
+            f"unexpected={unexpected!r} forbidden={offered_forbidden!r} "
+            f"diagnostics={diagnostics!r} actual={sorted(actual)!r} observed={observed!r}"
         )
     return sorted(actual)
 
@@ -574,10 +662,12 @@ def run_shell(binary: Path, shell: str) -> None:
     script = generate_script(binary, shell)
     emit({"shell": shell, "interpreter": interpreter, "version": version, "bytes": len(script)})
 
+    observed_cases: list[str] = []
     with Fixture(shell) as fixture:
         installation = install_completion(shell, script, fixture, interpreter, binary.parent)
         syntax_check(shell, installation)
         emit({"shell": shell, "case": "syntax", "candidates": []})
+        observed_cases.append("syntax")
 
         for case in completion_cases():
             if shell == "fish":
@@ -587,6 +677,22 @@ def run_shell(binary: Path, shell: str) -> None:
             else:
                 observed = interactive_completion(installation, fixture, case.line)
             emit(observation_record(shell, case.name, verify_case(shell, case, observed)))
+            observed_cases.append(case.name)
+
+    assert_ran(shell, observed_cases)
+
+
+def assert_ran(shell: str, observed_cases: Sequence[str]) -> None:
+    """The exit status is all CI reads, so a harness that ran no case would report success.
+
+    Comparing what was emitted against the declared list is what makes running nothing a
+    failure rather than a fast green.
+    """
+    if tuple(observed_cases) != ("syntax", *CASE_ORDER):
+        raise AcceptanceError(
+            f"{shell}: ran {list(observed_cases)!r}, which is not the declared case list "
+            f"{['syntax', *CASE_ORDER]!r}"
+        )
 
 
 def verify_binary(binary: Path) -> Path:

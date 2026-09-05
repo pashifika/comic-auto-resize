@@ -3,7 +3,8 @@
 
 A harness that stopped asserting would pass every run and prove nothing, which is a worse
 failure than a red job because nobody looks at it. These are the assertions that would go
-quiet: the case list, the verdict, and the isolation the fixtures promise.
+quiet: the case list and its data, the verdict, the ran-everything check, and the isolation
+the fixtures promise.
 
 Runs in `hygiene`, on a host with none of the four shells installed, so nothing here may
 start one.
@@ -23,8 +24,10 @@ from shell_completion_acceptance import (
     AcceptanceError,
     CompletionCase,
     Fixture,
+    assert_ran,
     completion_cases,
     install_completion,
+    isolated_environment,
     main,
     menu_candidates,
     require_interpreter,
@@ -40,10 +43,43 @@ class HarnessTests(unittest.TestCase):
             self.assertTrue(case.expected, f"case {case.name!r} asserts nothing")
             self.assertTrue(case.line.startswith(PRODUCT), f"case {case.name!r} is off-product")
 
+    def test_every_case_forbids_something(self) -> None:
+        """The forbidden sets are the data half of this harness and are easy to delete.
+
+        Without them a path case passes against a script that registers nothing at all,
+        because every shell completes filenames on its own — so the case that looks like it
+        proves `--out` completes a path proves only that the shell has a filesystem.
+        """
+        for case in completion_cases():
+            self.assertTrue(
+                case.forbidden,
+                f"case {case.name!r} forbids nothing, so it cannot fail on a wrong candidate",
+            )
+
     def test_a_missing_candidate_fails(self) -> None:
-        case = CompletionCase(name="dct", line=f"{PRODUCT} --dct ", expected=("float", "ifast"))
-        with self.assertRaisesRegex(AcceptanceError, "missing=\\['ifast'\\]"):
+        case = CompletionCase(
+            name="dct",
+            line=f"{PRODUCT} --dct ",
+            expected=("float", "ifast"),
+            forbidden=("--quality",),
+        )
+        with self.assertRaisesRegex(AcceptanceError, r"missing=\['ifast'\]"):
             verify_case("fish", case, "float\n")
+
+    def test_an_unexpected_candidate_fails(self) -> None:
+        """A value option that stopped being exclusive offers its values *and* the directory.
+
+        Neither `missing` nor `forbidden` sees that: the expected values are all there and
+        the extras are filenames nobody thought to forbid.
+        """
+        case = CompletionCase(
+            name="dct",
+            line=f"{PRODUCT} --dct ",
+            expected=("float", "ifast", "islow"),
+            forbidden=("--quality",),
+        )
+        with self.assertRaisesRegex(AcceptanceError, r"unexpected=\['page-one.zip'\]"):
+            verify_case("fish", case, "float\nifast\nislow\npage-one.zip\n")
 
     def test_a_forbidden_candidate_fails_even_when_the_expected_ones_are_there(self) -> None:
         """The stock PowerShell regression: a value position offering the option list back."""
@@ -51,13 +87,29 @@ class HarnessTests(unittest.TestCase):
             name="dct",
             line=f"{PRODUCT} --dct ",
             expected=("float", "ifast", "islow"),
-            forbidden=("--dct",),
+            forbidden=("--quality",),
         )
-        with self.assertRaisesRegex(AcceptanceError, "forbidden=\\['--dct'\\]"):
-            verify_case("powershell", case, "float\nifast\nislow\n--dct\n")
+        with self.assertRaisesRegex(AcceptanceError, r"forbidden=\['--quality'\]"):
+            verify_case("powershell", case, "float\nifast\nislow\n--quality\n")
+
+    def test_a_forbidden_string_outside_the_menu_still_fails(self) -> None:
+        """`--progressive <Tab>` offering `true` is the defect; the menu parser may miss it."""
+        case = CompletionCase(
+            name="attached",
+            line=f"{PRODUCT} --progressive page",
+            expected=("page-one.zip",),
+            forbidden=("true", "false"),
+        )
+        with self.assertRaisesRegex(AcceptanceError, "forbidden="):
+            verify_case("bash", case, f"{PRODUCT} --progressive page\n\npage-one.zip  true\n")
 
     def test_a_shell_diagnostic_fails_a_case_that_otherwise_matched(self) -> None:
-        case = CompletionCase(name="dct", line=f"{PRODUCT} --dct ", expected=("float",))
+        case = CompletionCase(
+            name="dct",
+            line=f"{PRODUCT} --dct ",
+            expected=("float",),
+            forbidden=("--quality",),
+        )
         with self.assertRaisesRegex(AcceptanceError, "diagnostics="):
             verify_case("fish", case, "float\ncompopt: not currently executing\n")
 
@@ -69,9 +121,22 @@ class HarnessTests(unittest.TestCase):
         script the shell never sourced.
         """
         self.assertEqual(menu_candidates(f"CAR_PROMPT> {PRODUCT} --r\n"), set())
-        case = CompletionCase(name="prefix", line=f"{PRODUCT} --r", expected=("--ratio",))
+        case = CompletionCase(
+            name="prefix",
+            line=f"{PRODUCT} --r",
+            expected=("--ratio",),
+            forbidden=("--dct",),
+        )
         with self.assertRaisesRegex(AcceptanceError, "missing="):
             verify_case("bash", case, f"CAR_PROMPT> {PRODUCT} --r\n")
+
+    def test_a_run_that_skipped_cases_fails(self) -> None:
+        """The exit status is all CI reads, so running nothing must not be a fast green."""
+        assert_ran("bash", ["syntax", *CASE_ORDER])
+        with self.assertRaisesRegex(AcceptanceError, "declared case list"):
+            assert_ran("bash", ["syntax"])
+        with self.assertRaisesRegex(AcceptanceError, "declared case list"):
+            assert_ran("bash", ["syntax", *CASE_ORDER[:-1]])
 
     def test_an_advertised_shell_that_is_absent_fails_closed(self) -> None:
         """A shell the tool ships a script for is never reported as unavailable."""
@@ -90,6 +155,28 @@ class HarnessTests(unittest.TestCase):
                     f"{shell}: installed outside the fixture home at {installation.script}",
                 )
 
+    def test_the_shells_own_state_is_redirected_too(self) -> None:
+        """The fixture's promise has to cover what the shells write, not only what we write.
+
+        Measured before this was fixed: a run left `fish` and `powershell` state under the
+        ambient cache and data roots, and `bash -n` sourced an ambient `BASH_ENV` inside what
+        is supposed to be a syntax check.
+        """
+        ambient = {
+            "XDG_DATA_HOME": "/ambient/data",
+            "XDG_CACHE_HOME": "/ambient/cache",
+            "XDG_STATE_HOME": "/ambient/state",
+            "BASH_ENV": "/ambient/bash_env.sh",
+        }
+        with mock.patch.dict("os.environ", ambient, clear=False), Fixture("bash") as fixture:
+            environment = isolated_environment(fixture, Path("/usr/bin"))
+        self.assertNotIn("BASH_ENV", environment)
+        for key in ("HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+            self.assertTrue(
+                Path(environment[key]).is_relative_to(fixture.home),
+                f"{key} points outside the fixture at {environment[key]}",
+            )
+
     def test_fixture_cleanup_removes_only_its_own_tree(self) -> None:
         with tempfile.TemporaryDirectory() as parent:
             sibling = Path(parent) / "keep-me"
@@ -102,7 +189,16 @@ class HarnessTests(unittest.TestCase):
     def test_a_shell_named_twice_is_refused_before_any_binary_runs(self) -> None:
         """Two runs of one shell must not read like coverage of two."""
         with self.assertRaisesRegex(AcceptanceError, "exactly once"):
-            main(["--binary", "/nonexistent/comic-auto-resize", "--shell", "bash", "--shell", "bash"])
+            main(
+                [
+                    "--binary",
+                    "/nonexistent/comic-auto-resize",
+                    "--shell",
+                    "bash",
+                    "--shell",
+                    "bash",
+                ]
+            )
 
 
 if __name__ == "__main__":

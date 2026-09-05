@@ -1,13 +1,20 @@
-//! Shell-completion scripts, generated from the shared command graph.
+//! Shell-completion scripts, generated from the shared command graph and then guarded.
 //!
 //! Generated rather than written. A hand-written script is a second copy of the flag list,
 //! free to drift from the first; produced from the same `clap::Command` the parser and
 //! `--help` are produced from, a flag cannot appear in completion without existing.
 //!
+//! Guarded because generating is not sufficient. `clap_complete` models neither
+//! `require_equals` nor an optional value, and its PowerShell generator emits no possible
+//! values at all, so its unmodified output offers this surface completions the parser
+//! refuses. Each guard below closes one measured gap and says which; none is inherited on
+//! the assumption that another project's reason applies here.
+//!
 //! Nothing here opens the input or reads filesystem state. A completion script is produced
 //! while a shell starts, where a failure is a broken prompt rather than a failed command.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 
 use clap::{Arg, Command, ValueEnum};
@@ -48,7 +55,8 @@ pub(crate) enum Shell {
 /// Into memory rather than straight to the destination: `clap_complete`'s generators panic on
 /// a write error, so handing them standard output would turn a reader that closed the pipe
 /// into an abort. Writing to a `Vec` cannot fail, which leaves exactly one fallible write —
-/// the one in [`write`], which gets to decide what a closed pipe means.
+/// the one in [`write`], which gets to decide what a closed pipe means. The guards need the
+/// whole script in hand anyway.
 fn script(shell: Shell) -> Vec<u8> {
     let mut command = crate::command();
     // The name the shell will complete for, taken from the graph rather than from `argv[0]`:
@@ -58,9 +66,18 @@ fn script(shell: Shell) -> Vec<u8> {
     command.build();
     let mut script = Vec::new();
     match shell {
-        Shell::Bash => generate(Bash, &mut command, name, &mut script),
-        Shell::Zsh => generate(Zsh, &mut command, name, &mut script),
-        Shell::Fish => generate(Fish, &mut command, name, &mut script),
+        Shell::Bash => {
+            generate(Bash, &mut command, name, &mut script);
+            script = guarded_bash(&script, &command);
+        }
+        Shell::Zsh => {
+            generate(Zsh, &mut command, name, &mut script);
+            script = guarded_zsh(&script, &command);
+        }
+        Shell::Fish => {
+            generate(Fish, &mut command, name, &mut script);
+            script = guarded_fish(&script, &command);
+        }
         Shell::PowerShell => {
             generate(PowerShell, &mut command, name, &mut script);
             script = guarded_powershell(&script, &command);
@@ -69,28 +86,185 @@ fn script(shell: Shell) -> Vec<u8> {
     script
 }
 
-/// Where the guard below is spliced into `clap_complete`'s PowerShell output: after the
-/// generated preamble has resolved `$command` and before it dispatches on it.
+// ---------------------------------------------------------------- the attached-value guards
+
+/// Options whose value may only be attached with `=`, sorted.
+///
+/// `--progressive` and `--optimizer` are both: they take an optional value and `require_equals`
+/// so that a value taken from the next argument cannot swallow the positional input path.
+/// `clap_complete` models neither property, so every generator it has offers those values in
+/// the *next word* — where the parser will read them as the input path instead. Measured:
+/// `comic-auto-resize --progressive false` exits 1 with `false: No such file or directory`.
+///
+/// Each shell's guard below removes that suggestion and leaves the `=` spelling working.
+fn equals_only_options(command: &Command) -> Vec<(String, BTreeSet<String>)> {
+    let mut options = Vec::new();
+    for argument in command.get_opts().filter(|arg| !arg.is_hide_set()) {
+        if !argument.is_require_equals_set() {
+            continue;
+        }
+        let values = possible_values(argument);
+        if values.is_empty() {
+            continue;
+        }
+        for name in option_names(argument) {
+            options.push((name, values.clone()));
+        }
+    }
+    options.sort();
+    options
+}
+
+/// Splits each attached-value option's two spellings, on both bashes macOS has.
+///
+/// The two disagree about `=`, and that is the whole difficulty. bash 5 has `=` in
+/// `COMP_WORDBREAKS`, so `--progressive ` and `--progressive=` both reach the generated `prev`
+/// arm and `${COMP_WORDS[COMP_CWORD]}` — `=` for the attached form — is what tells them apart.
+/// bash 3.2, which is what `/bin/bash` is on macOS, does not split on `=`: `--progressive=`
+/// arrives whole in `cur`, never reaches that arm, and is filtered against the option list as
+/// though it were an option name, so the attached spelling could not complete at all.
+///
+/// So two edits. The arm keeps the values under `=` and offers files under a space; a block
+/// ahead of the option-name filter catches the whole-word form and completes it with the
+/// prefix restored, which is what bash 3.2 needs and bash 5 never reaches.
+fn guarded_bash(generated: &[u8], command: &Command) -> Vec<u8> {
+    let mut script = utf8(generated).to_owned();
+    let mut attached = Vec::new();
+    for (option, values) in equals_only_options(command) {
+        // The emitted `COMPREPLY=` line is reused verbatim rather than rebuilt: it carries
+        // upstream's value order and quoting, and rebuilding it was how the first attempt at
+        // this guard broke — the graph's values are sorted and the generator's are not.
+        let header = format!("\n                {option})\n");
+        let start = script.find(&header).unwrap_or_else(|| {
+            panic!("clap_complete 4.6.9 no longer emits a bash value arm for `{option}`")
+        }) + header.len();
+        let line = script[start..]
+            .lines()
+            .next()
+            .filter(|line| line.trim_start().starts_with("COMPREPLY="))
+            .unwrap_or_else(|| {
+                panic!(
+                    "clap_complete 4.6.9's bash arm for `{option}` no longer opens with COMPREPLY"
+                )
+            })
+            .to_owned();
+        let guarded = format!(
+            "                    if [[ \"${{COMP_WORDS[COMP_CWORD]}}\" == \"=\" ]]; then\n\
+             \x20   {line}\n\
+             \x20                   else\n\
+             \x20                       COMPREPLY=($(compgen -f \"${{cur}}\"))\n\
+             \x20                   fi"
+        );
+        script.replace_range(start..start + line.len(), &guarded);
+        attached.push((option, values.iter().cloned().collect::<Vec<_>>().join(" ")));
+    }
+
+    if !attached.is_empty() {
+        let mut block = String::from(
+            "            # An attached value that reached `cur` whole, which is every bash without\n            # `=` in COMP_WORDBREAKS. Completed with its own prefix restored, because the\n            # candidate replaces the whole word there.\n            case \"${cur}\" in\n",
+        );
+        for (option, values) in attached {
+            write!(
+                block,
+                "                {option}=*)\n\
+                 \x20                   COMPREPLY=($(compgen -W \"{values}\" -- \"${{cur#*=}}\"))\n\
+                 \x20                   return 0\n\
+                 \x20                   ;;\n"
+            )
+            .expect("writing to a String cannot fail");
+        }
+        block.push_str("            esac\n");
+        let anchor = "            if [[ ${cur} == -* || ${COMP_CWORD} -eq 1 ]] ; then\n";
+        script = replace_once(
+            &script,
+            anchor,
+            &format!("{block}{anchor}"),
+            "bash option-name filter",
+            "the root command",
+        );
+    }
+    script.into_bytes()
+}
+
+/// Turns each attached-value option's `_arguments` spec from `=` into `=-`.
+///
+/// Two characters, and they are `_arguments`' own way of saying it: `--opt=` accepts the value
+/// in the same word or the next one, `--opt=-` accepts it only in the same word. zsh then
+/// offers the values after `=` and the input path after a space.
+fn guarded_zsh(generated: &[u8], command: &Command) -> Vec<u8> {
+    let mut script = utf8(generated).to_owned();
+    for (option, _) in equals_only_options(command) {
+        // Long options only: zsh spells a short option's attached value differently, and this
+        // surface gives neither switch a short form.
+        if !option.starts_with("--") {
+            continue;
+        }
+        let spec = format!("'{option}=[");
+        let replacement = format!("'{option}=-[");
+        script = replace_once(&script, &spec, &replacement, "zsh option spec", &option);
+    }
+    script.into_bytes()
+}
+
+/// Drops `-r` from each attached-value option's `complete` line.
+///
+/// `-r` is "this option requires a value", which is what makes fish offer the values in the
+/// next word. Without it the values are still offered after `=`, because fish splits an
+/// attached value itself, and the next word falls through to the input path.
+fn guarded_fish(generated: &[u8], command: &Command) -> Vec<u8> {
+    let name = command.get_name();
+    let mut script = utf8(generated).to_owned();
+    for (option, _) in equals_only_options(command) {
+        let Some(long) = option.strip_prefix("--") else {
+            continue;
+        };
+        let line = format!("complete -c {name} -l {long} ");
+        let start = script
+            .find(&line)
+            .unwrap_or_else(|| panic!("clap_complete 4.6.9 declares `{option}` to fish"));
+        let end = script[start..]
+            .find('\n')
+            .map_or(script.len(), |offset| start + offset);
+        let declared = script[start..end].to_owned();
+        let guarded = replace_once(&declared, " -r -f -a ", " -f -a ", "fish arity", &option);
+        script.replace_range(start..end, &guarded);
+    }
+    script.into_bytes()
+}
+
+// -------------------------------------------------------------------- the PowerShell guard
+
+/// Where the guard is spliced into `clap_complete`'s PowerShell output: after the generated
+/// preamble has resolved `$command` and before it dispatches on it.
 const POWERSHELL_ANCHOR: &str = "    $completions = @(switch ($command) {";
 
-/// The value dispatch `clap_complete` 4.6.9's PowerShell generator does not emit.
+/// Everything `clap_complete` 4.6.9's PowerShell generator gets wrong for this surface.
 ///
-/// Measured rather than inherited, which is the whole reason this exists. Its stock output is
-/// correct here for option names and for paths — `--r` offers `--ratio` and `--resize-mode`,
-/// and the positional and `--out` both complete files through PowerShell's own fallback — and
-/// carries no `PossibleValue` at all. So without this, `--dct <Tab>` offers the option list
-/// back, `--dct` among it. The other three shells need nothing: bash, zsh and fish each emit
-/// their possible values unaided.
+/// Measured rather than inherited, and measured twice: the first pass found only the missing
+/// possible values, and an independent review found four more by driving
+/// `[CommandCompletion]::CompleteInput` against the shipped script. What the stock output
+/// does correctly is option *names* with their help text, and that is what it is left to do.
+/// What it gets wrong here, each closed below:
 ///
-/// `skillmount` replaces this generator outright, several hundred lines of it, because its
-/// arguments carry `ValueHint::DirPath` and `ValueHint::ExecutablePath` and the stock path
-/// handling is wrong for both. This surface has neither hint — the positional is an archive
-/// *or* a directory and `--out` is a location *or* a filename, both ordinary file completion —
-/// so the gap here is narrower than the one there, and this is a guard over the generated
-/// bytes rather than a fork of the generator. An upstream release that emits values shrinks
-/// this to nothing instead of leaving a fork to reconcile.
+/// - **No `PossibleValue` at all**, so `--dct <Tab>` offered the option list back, `--dct`
+///   among it.
+/// - **A bareword extends `$command`**, so `comic-auto-resize book.zip --r` produced
+///   `comic-auto-resize;book.zip`, matched no arm, and offered nothing. Writing the input
+///   first is the ordinary way to type this command.
+/// - **Quoted tokens are compared raw**, so `--dct "if` offered nothing.
+/// - **A path option is answered by the option list.** `--out <Tab>` returned every option
+///   including `--out`, because the stock body filters names by an empty prefix and so never
+///   lets PowerShell's own file completion answer. `--out=sr` returned nothing, because that
+///   fallback does not strip `--out=`.
+/// - **A known value set with no match falls through to files**, so `--dct sr` completed to
+///   `./src`, which the parser then refuses.
+///
+/// `skillmount` replaces this generator outright, several hundred lines. This does not,
+/// because the largest part of that replacement handles `ValueHint::DirPath` and
+/// `ValueHint::ExecutablePath` and this surface has neither — its positional is an archive
+/// *or* a directory and `--out` is a location *or* a filename, both ordinary file completion.
 fn guarded_powershell(generated: &[u8], command: &Command) -> Vec<u8> {
-    let generated = std::str::from_utf8(generated).expect("clap_complete emits UTF-8");
+    let generated = utf8(generated);
     // A missing anchor means the pinned generator changed shape, which cannot happen without
     // an edit to `Cargo.toml`: the version is exact. The contract tests generate this script,
     // so a bump that moved the anchor would fail in CI rather than in someone's prompt.
@@ -100,72 +274,167 @@ fn guarded_powershell(generated: &[u8], command: &Command) -> Vec<u8> {
 
     let mut guarded = String::with_capacity(generated.len() * 2);
     guarded.push_str(&generated[..split]);
-    guarded.push_str(POWERSHELL_GUARD_HEAD);
-    powershell_option_values(&mut guarded, command);
-    guarded.push_str(POWERSHELL_GUARD_TAIL);
+    powershell_tables(&mut guarded, command);
+    guarded.push_str(POWERSHELL_GUARD);
     guarded.push_str(&generated[split..]);
     guarded.into_bytes()
 }
 
-/// Resolves which option's value is being completed, then dispatches on it.
+/// The three facts about the surface the guard dispatches on, emitted as PowerShell data.
 ///
-/// Two spellings, because both reach this surface: a value in the next word (`--dct ifa`) and
-/// a value attached with `=` (`--progressive=fa`), which is the only spelling `--progressive`
-/// and `--optimizer` accept at all.
-const POWERSHELL_GUARD_HEAD: &str = r#"    # Value completions. clap_complete's PowerShell generator emits option names and
-    # subcommand names and no possible values, so without this `--dct <Tab>` offers the
-    # option list again. Everything it does emit is left to the generated body below.
-    $carOption = $null
-    $carPrefix = $wordToComplete
-    $carAttached = ''
-    if ($wordToComplete -match '^(--[^=]+)=(.*)$') {
-        $carOption = $Matches[1]
-        $carPrefix = $Matches[2]
-        $carAttached = "$($Matches[1])="
-    } else {
-        $carPreceding = @($commandElements | Where-Object { $_.Extent.EndOffset -lt $cursorPosition })
-        if ($carPreceding.Count -gt 1 -and $carPreceding[-1].Extent.Text.StartsWith('-')) {
-            $carOption = $carPreceding[-1].Extent.Text
-        }
-    }
-    $carValues = switch ($carOption) {
-"#;
-
-/// Emits the matches, or falls through to the generated body when there are none.
-///
-/// Falling through rather than returning an empty set is what keeps the guard from hiding a
-/// completion: `--dct -<Tab>` names no method, and the generated body below still offers the
-/// option list.
-const POWERSHELL_GUARD_TAIL: &str = r#"        default { $null }
-    }
-    if ($null -ne $carValues) {
-        $carMatches = @(@($carValues) |
-            Where-Object { $_.StartsWith($carPrefix, [System.StringComparison]::OrdinalIgnoreCase) } |
-            Sort-Object)
-        if ($carMatches.Count -gt 0) {
-            $carMatches | ForEach-Object {
-                [CompletionResult]::new("$carAttached$_", $_, [CompletionResultType]::ParameterValue, $_)
-            }
-            return
-        }
-    }
-
-"#;
-
-/// One arm per option that has possible values, keyed by the option's own spelling.
-///
-/// Keyed on the option alone rather than on a command path because this surface has no
-/// subcommands and, per the design, will not grow one: the completion entry point is a flag.
-fn powershell_option_values(out: &mut String, command: &Command) {
+/// Data rather than generated control flow, so the logic below is one readable block that
+/// does not grow with the flag list.
+fn powershell_tables(out: &mut String, command: &Command) {
+    out.push_str("    # What this surface is, emitted from the command graph.\n");
+    out.push_str("    $carValues = @{\n");
     for argument in command.get_opts().filter(|arg| !arg.is_hide_set()) {
         let values = possible_values(argument);
         if values.is_empty() {
             continue;
         }
         for option in option_names(argument) {
-            write_powershell_arm(out, 8, &option, &values);
+            out.push_str("        ");
+            write_powershell_literal(out, &option);
+            out.push_str(" = @(");
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    out.push_str(", ");
+                }
+                write_powershell_literal(out, value);
+            }
+            out.push_str(")\n");
         }
     }
+    out.push_str("    }\n");
+
+    write_powershell_array(out, "$carPathOptions", &{
+        let mut names = BTreeSet::new();
+        for argument in command.get_opts().filter(|arg| !arg.is_hide_set()) {
+            if possible_values(argument).is_empty() {
+                names.extend(option_names(argument));
+            }
+        }
+        names
+    });
+    write_powershell_array(
+        out,
+        "$carEqualsOnly",
+        &equals_only_options(command)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect(),
+    );
+}
+
+/// The dispatch itself, which is the same for any surface the tables above can describe.
+const POWERSHELL_GUARD: &str = r#"
+    # This surface has no subcommands, so the generated preamble's bareword walk can only be
+    # wrong: `comic-auto-resize book.zip --r` makes $command 'comic-auto-resize;book.zip',
+    # which matches no arm below and loses option-name completion entirely.
+    $command = $commandAst.CommandElements[0].Value
+
+    # Tokens before the cursor, with quoting resolved. `.Value` is the parsed string of a
+    # StringConstantExpressionAst, so a quoted `"--dct"` reads as an option rather than as a
+    # word starting with a quote. Never evaluate an element to find its value.
+    $carTokens = @($commandAst.CommandElements |
+        Where-Object { $_.Extent.EndOffset -lt $cursorPosition } |
+        ForEach-Object {
+            if ($_ -is [System.Management.Automation.Language.StringConstantExpressionAst]) {
+                $_.Value
+            } else {
+                $_.Extent.Text
+            }
+        })
+
+    $carOption = $null
+    $carPrefix = $wordToComplete
+    $carAttached = ''
+    # Everything after `--` is the positional input, however it is spelled.
+    $carTerminated = $carTokens -contains '--'
+    if (-not $carTerminated) {
+        if ($wordToComplete -match '^(--?[^=]+)=(.*)$') {
+            $carOption = $Matches[1]
+            $carPrefix = $Matches[2]
+            $carAttached = "$($Matches[1])="
+        } elseif ($carTokens.Count -gt 1 -and $carTokens[-1].StartsWith('-')) {
+            # An attached-value option is complete on its own, so the next word is the input
+            # path rather than its value.
+            if ($carEqualsOnly -notcontains $carTokens[-1]) {
+                $carOption = $carTokens[-1]
+            } else {
+                $carTerminated = $true
+            }
+        }
+    }
+    # An unclosed quote is part of the word the shell is completing, not part of the value.
+    if ($carPrefix.Length -gt 0 -and ($carPrefix[0] -eq '"' -or $carPrefix[0] -eq "'")) {
+        $carQuote = $carPrefix[0]
+        $carPrefix = $carPrefix.Substring(1)
+        if ($carPrefix.EndsWith($carQuote)) {
+            $carPrefix = $carPrefix.Substring(0, $carPrefix.Length - 1)
+        }
+    }
+
+    if ($null -ne $carOption -and $carValues.ContainsKey($carOption)) {
+        # A known value set answers alone. Falling through on a prefix nothing matches would
+        # offer files and option names the parser refuses -- `--dct sr` completed to `./src`.
+        @($carValues[$carOption]) |
+            Where-Object { $_.StartsWith($carPrefix, [System.StringComparison]::OrdinalIgnoreCase) } |
+            Sort-Object |
+            ForEach-Object {
+                [CompletionResult]::new("$carAttached$_", $_, [CompletionResultType]::ParameterValue, $_)
+            }
+        return
+    }
+
+    if ($carTerminated -or ($null -ne $carOption -and $carPathOptions -contains $carOption)) {
+        # A path position. Returning nothing lets PowerShell's own file completion answer,
+        # which is what should have happened before the stock body offered the option list --
+        # but it cannot see past an attached `--out=`, so that spelling is completed here.
+        if ($carAttached -eq '') {
+            return
+        }
+        $carCut = [Math]::Max($carPrefix.LastIndexOf('/'), $carPrefix.LastIndexOf('\'))
+        if ($carCut -ge 0) {
+            $carParent = $carPrefix.Substring(0, $carCut + 1)
+            $carLeaf = $carPrefix.Substring($carCut + 1)
+        } else {
+            $carParent = ''
+            $carLeaf = $carPrefix
+        }
+        $carSearch = if ($carParent -eq '') { '.' } else { $carParent }
+        Get-ChildItem -LiteralPath $carSearch -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name.StartsWith($carLeaf, [System.StringComparison]::OrdinalIgnoreCase) } |
+            Sort-Object -Property Name |
+            ForEach-Object {
+                $carText = "$carAttached$carParent$($_.Name)"
+                [CompletionResult]::new($carText, $_.Name, [CompletionResultType]::ParameterValue, $carText)
+            }
+        return
+    }
+
+"#;
+
+// -------------------------------------------------------------------------------- helpers
+
+/// The generated script as text. `clap_complete` builds it from `String`s, so this cannot
+/// fail for any input the graph can produce.
+fn utf8(generated: &[u8]) -> &str {
+    std::str::from_utf8(generated).expect("clap_complete emits UTF-8")
+}
+
+/// Replaces `needle` once, failing loudly when the pinned generator no longer emits it.
+///
+/// A guard that silently found nothing is a guard that stopped guarding, and the defect it
+/// was written for would come back with no test failing. The dependency is pinned exactly, so
+/// this can only fire on a version bump — and the contract tests generate every script, so it
+/// fires in CI rather than in someone's prompt.
+fn replace_once(text: &str, needle: &str, replacement: &str, what: &str, option: &str) -> String {
+    assert!(
+        text.contains(needle),
+        "clap_complete 4.6.9 no longer emits the {what} this guard rewrites for `{option}`"
+    );
+    text.replacen(needle, replacement, 1)
 }
 
 /// Every spelling an option answers to, long and short.
@@ -190,23 +459,28 @@ fn possible_values(argument: &Arg) -> BTreeSet<String> {
         .collect()
 }
 
-/// `'<key>' { @('a', 'b'); break }`, indented.
-fn write_powershell_arm(out: &mut String, indent: usize, key: &str, values: &BTreeSet<String>) {
-    for _ in 0..indent {
-        out.push(' ');
-    }
-    write_powershell_literal(out, key);
-    out.push_str(" { @(");
+/// `    $name = @('a', 'b')`.
+fn write_powershell_array(out: &mut String, name: &str, values: &BTreeSet<String>) {
+    out.push_str("    ");
+    out.push_str(name);
+    out.push_str(" = @(");
     for (index, value) in values.iter().enumerate() {
         if index != 0 {
             out.push_str(", ");
         }
         write_powershell_literal(out, value);
     }
-    out.push_str("); break }\n");
+    out.push_str(")\n");
 }
 
 /// A single-quoted PowerShell literal, where a quote is escaped by doubling it.
+///
+/// Correct for the ASCII option names and possible values this surface has, which is all that
+/// reaches it: every argument is `@(…)` from the compiled command graph, and nothing from the
+/// command line, the environment or the filesystem gets here. It is **not** a general escaper
+/// — PowerShell also terminates a single-quoted string on U+2018 and U+2019, which this does
+/// not double — so a surface that ever took an option name or possible value from outside the
+/// binary would need more than this.
 fn write_powershell_literal(out: &mut String, value: &str) {
     out.push('\'');
     let mut parts = value.split('\'');
@@ -222,7 +496,7 @@ fn write_powershell_literal(out: &mut String, value: &str) {
 
 /// Writes `shell`'s script, treating a reader that closed the pipe as success.
 ///
-/// `comic-auto-resize completions bash | head` is an ordinary thing for a person to do, and
+/// `comic-auto-resize --completions bash | head` is an ordinary thing for a person to do, and
 /// the shell that pipes a script into `source` at startup is doing the same shape of thing.
 /// Every other write failure is reported: a script truncated by a full disk is not one a
 /// shell should source.
