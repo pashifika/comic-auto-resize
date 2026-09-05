@@ -22,7 +22,7 @@ use comic_auto_resize::source::{ReadOptions, SourceError, ZipSource};
 
 use support::{
     Framing, TempDir, corrupt_scan, framed_archive, jpeg_size, page_bytes, read_archive,
-    write_archive, write_pages,
+    start_of_frame, write_archive, write_pages,
 };
 
 /// The binary under test, built by Cargo for this integration test at the same profile.
@@ -736,6 +736,9 @@ fn the_output_holds_only_image_entries() {
 }
 
 /// Every long option `--help` lists, without its `--`.
+///
+/// Truncated at `=`, because a description that spells an option with its value —
+/// `--progressive=false` — is naming that option rather than a second one.
 fn help_options() -> Vec<String> {
     let output = Command::new(BINARY)
         .arg("--help")
@@ -746,7 +749,13 @@ fn help_options() -> Vec<String> {
     let mut found: Vec<String> = text
         .split_whitespace()
         .filter_map(|word| word.strip_prefix("--"))
-        .map(|word| word.trim_end_matches([',', '.', '>']).to_owned())
+        .map(|word| {
+            word.split('=')
+                .next()
+                .unwrap_or(word)
+                .trim_end_matches([',', '.', '>', '['])
+                .to_owned()
+        })
         .filter(|word| !word.is_empty())
         .collect();
     found.sort();
@@ -769,14 +778,16 @@ fn valid_input(directory: &TempDir) -> std::path::PathBuf {
 ///
 /// `--charset` and `--pwd` were here until they were implemented, and moved into the list
 /// below in the same Change — the movement `--fix-idx` made before them, then `-o/--out` and
-/// `--delete-org`, and now `-r/--ratio` and `--jobs`. `--split` is the only one left, and it
-/// is here because `spread-split` has not implemented it yet.
+/// `--delete-org`, then `-r/--ratio` and `--jobs`, and now `--progressive` and `--optimizer`.
+/// `--split` is here because `spread-split` has not implemented it yet; `--small-skip` is
+/// here permanently, because the reference tool's implementation of it disables resizing for
+/// every page rather than skipping the small ones its name promises.
 #[test]
 fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
     let directory = TempDir::new("unknown-flags");
     let input = valid_input(&directory);
 
-    for flag in ["--split", "--small-skip", "--optimizer", "--progressive"] {
+    for flag in ["--split", "--small-skip"] {
         let output = Command::new(BINARY)
             .arg(flag)
             .arg(&input)
@@ -801,7 +812,7 @@ fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
 /// `--help` lists exactly what exists, in both directions.
 #[test]
 fn help_lists_every_implemented_option_and_nothing_else() {
-    // The eleven the tool implements, plus what clap adds for free.
+    // The thirteen the tool implements, plus what clap adds for free.
     let mut expected = vec![
         "auto-width".to_owned(),
         "charset".to_owned(),
@@ -810,7 +821,9 @@ fn help_lists_every_implemented_option_and_nothing_else() {
         "fix-idx".to_owned(),
         "help".to_owned(),
         "jobs".to_owned(),
+        "optimizer".to_owned(),
         "out".to_owned(),
+        "progressive".to_owned(),
         "pwd".to_owned(),
         "quality".to_owned(),
         "ratio".to_owned(),
@@ -903,18 +916,21 @@ fn an_out_of_range_option_value_is_refused_before_any_work() {
 
 /// Each accepted flag that changes a page's *bytes* changes them in a way attributable to it.
 ///
-/// A flag that parses and then does nothing is the failure this guards against. Eleven flags
-/// exist and five of them change page bytes, so the other six are asserted where their rules
-/// live: `--fix-idx` in `tests/entry_naming.rs`, `--charset` and `--pwd` in
+/// A flag that parses and then does nothing is the failure this guards against. Thirteen
+/// flags exist and six of them change page bytes, so the other seven are asserted where their
+/// rules live: `--fix-idx` in `tests/entry_naming.rs`, `--charset` and `--pwd` in
 /// `tests/entry_charset.rs`, and `-o`/`--delete-org` — which change neither page bytes nor
 /// entry names, only where the output goes and whether the input survives — in
 /// `an_output_value_resolves_as_a_location_or_as_a_filename` and
 /// `the_input_is_removed_only_after_the_output_is_in_place` below.
 ///
-/// `--jobs` is the one accepted flag that must **not** change the output: it changes what the
-/// run costs, and the archive being identical at any worker count is the ordering writer's
-/// guarantee. That direction is asserted in
-/// `the_worker_count_is_the_hosts_by_default_and_does_not_reach_the_output`.
+/// Two accepted flags do **not** change the output on their own, each for its own reason, and
+/// both directions are asserted rather than left out. `--jobs` changes what the run costs, and
+/// the archive being identical at any worker count is the ordering writer's guarantee —
+/// `the_worker_count_is_the_hosts_by_default_and_does_not_reach_the_output`. `--optimizer` is
+/// delivered to the encoder and overridden by libjpeg while a progressive file is written, so
+/// it changes the output together with `--progressive=false` —
+/// `the_encoder_switches_reach_the_encoder_except_where_libjpeg_overrides_one`.
 #[test]
 fn every_accepted_flag_changes_the_output() {
     fn run_with(args: &[&str], label: &str) -> Vec<u8> {
@@ -946,13 +962,14 @@ fn every_accepted_flag_changes_the_output() {
     assert_eq!(jpeg_size(&narrower), Some((1000, 1414)));
     assert_eq!(jpeg_size(&ratioed), Some((1064, 1505)));
 
-    // The other three change the bytes at the same dimensions.
+    // The other four change the bytes at the same dimensions.
     for (args, label) in [
-        (["-q", "50"], "flag-quality"),
-        (["--dct", "islow"], "flag-dct"),
-        (["--resize-mode", "nearest-neighbor"], "flag-filter"),
+        (&["-q", "50"][..], "flag-quality"),
+        (&["--dct", "islow"][..], "flag-dct"),
+        (&["--resize-mode", "nearest-neighbor"][..], "flag-filter"),
+        (&["--progressive=false"][..], "flag-progressive"),
     ] {
-        let changed = run_with(&args, label);
+        let changed = run_with(args, label);
         assert_eq!(
             jpeg_size(&changed),
             Some((1280, 1811)),
@@ -960,6 +977,141 @@ fn every_accepted_flag_changes_the_output() {
         );
         assert_ne!(changed, baseline, "{args:?} did not change the output");
     }
+}
+
+/// The two encoder switches, through the shipped binary: the reference tool's spelling, the
+/// off switch, and the one combination libjpeg overrides.
+///
+/// The override is a library internal marked `TEMPORARY HACK ???` upstream — `jcmaster.c`
+/// lines 915-916 of the vendored `mozjpeg-sys 2.2.3`:
+///
+/// ```c
+/// if (cinfo->progressive_mode && !cinfo->arith_code)  /*  TEMPORARY HACK ??? */
+///     cinfo->optimize_coding = TRUE;
+/// ```
+///
+/// so `--optimizer=false` alone is delivered to the encoder and forced back on. This build
+/// never enables arithmetic coding, so the qualifier never spares it. Pinning it is
+/// deliberate: the help and the `jpeg-codec` requirement both state the interaction, and if a
+/// dependency bump ever removes the force, this test failing is what makes those two move in
+/// the same commit.
+#[test]
+fn the_encoder_switches_reach_the_encoder_except_where_libjpeg_overrides_one() {
+    fn page_of(args: &[&str], label: &str) -> Vec<u8> {
+        let directory = TempDir::new(label);
+        let input = directory.join("in.zip");
+        write_pages(&input, 1, 1520, 2150);
+        let status = Command::new(BINARY)
+            .args(args)
+            .arg(&input)
+            .status()
+            .expect("runs the binary");
+        assert!(status.success(), "{args:?} failed");
+        read_archive(&default_output(&input))
+            .into_iter()
+            .next()
+            .expect("one page")
+            .1
+    }
+
+    let default = page_of(&[], "switch-default");
+    assert_eq!(
+        start_of_frame(&default),
+        Some(0xC2),
+        "the default is progressive"
+    );
+
+    // The reference tool's spelling is bare, and it asserts the state its help promised
+    // rather than changing it. A no-op by design: an optional-value bool whose bare form
+    // means on.
+    for args in [
+        &["--progressive"][..],
+        &["--optimizer"][..],
+        &["--progressive", "--optimizer"][..],
+    ] {
+        assert_eq!(
+            page_of(args, "switch-bare"),
+            default,
+            "{args:?} changed the output; the bare form means on"
+        );
+    }
+
+    // The off switch, reached from the command line rather than from a settings struct. Every
+    // quality is covered at the encoder in `tests/page_codec.rs`; this is the wire.
+    let baseline = page_of(&["--progressive=false"], "switch-baseline");
+    assert_eq!(
+        start_of_frame(&baseline),
+        Some(0xC0),
+        "`--progressive=false` must give baseline, never SOF1"
+    );
+
+    // The override: the switch is accepted, delivered, and forced back on by the library.
+    assert_eq!(
+        page_of(&["--optimizer=false"], "switch-optimizer-alone"),
+        default,
+        "libjpeg no longer forces optimisation for a progressive file; the help and the \
+         `jpeg-codec` requirement both state that it does and must be corrected with this test"
+    );
+
+    // And where the library permits it, the setting is applied — which is what makes the line
+    // above an override rather than a flag that does nothing.
+    let unoptimised = page_of(
+        &["--optimizer=false", "--progressive=false"],
+        "switch-both-off",
+    );
+    assert_ne!(
+        unoptimised, baseline,
+        "`--optimizer=false` did not reach the encoder with progressive off"
+    );
+    assert!(
+        unoptimised.len() > baseline.len(),
+        "unoptimised entropy coding produced {} bytes against {} optimised",
+        unoptimised.len(),
+        baseline.len()
+    );
+    assert_eq!(
+        start_of_frame(&unoptimised),
+        Some(0xC0),
+        "both off is still baseline"
+    );
+}
+
+/// A value the parser cannot read is refused, and an unattached one cannot take the input
+/// path.
+///
+/// `require_equals` is why the second holds: an optional value taken from the next argument
+/// would make `--progressive false input.zip` read `false` as the value and leave the archive
+/// unprocessed. It instead becomes the positional, and the real input has nowhere to go.
+#[test]
+fn an_encoder_switch_takes_its_value_attached_or_not_at_all() {
+    let directory = TempDir::new("switch-refusals");
+    let input = valid_input(&directory);
+
+    let refused = Command::new(BINARY)
+        .arg("--progressive=maybe")
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(!refused.status.success(), "`maybe` was accepted as a bool");
+    let message = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        message.contains("maybe") && message.contains("true") && message.contains("false"),
+        "the refusal does not name the value and the accepted pair: {message}"
+    );
+
+    let unattached = Command::new(BINARY)
+        .args(["--progressive", "false"])
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(
+        !unattached.status.success(),
+        "a space-separated value was bound; it would swallow the input path"
+    );
+    assert!(
+        !default_output(&input).exists(),
+        "the refused run produced an output archive"
+    );
 }
 
 /// The floor's count covers a reduction that was refused, and nothing else.
@@ -1183,11 +1335,14 @@ fn a_worker_count_above_the_hosts_ceiling_is_refused_before_any_work() {
     }
 }
 
-/// The two facts a reader cannot infer from the flag's name, in the flag's own help.
+/// The facts a reader cannot infer from a flag's name, in that flag's own help.
 ///
 /// `-r`'s is the migration: the behaviour the reference tool's `-r 70` gave is this tool's
 /// default, so the answer for an invocation that carried it is to drop it. `--jobs`'s is the
 /// cost, and a measured figure rather than the four-line product the requirement carries.
+/// `--optimizer`'s is that it is overridden in the default configuration — a flag that is
+/// accepted and then silently overridden is the same failure as one accepted and ignored, so
+/// the sentence saying so is normative rather than editorial.
 #[test]
 fn the_new_flags_state_what_a_reader_cannot_infer() {
     let ratio = help_for("-r, --ratio");
@@ -1208,6 +1363,12 @@ fn the_new_flags_state_what_a_reader_cannot_infer() {
     assert!(
         jobs.contains("2.59 GB"),
         "`--jobs`'s help does not carry the measured point: {jobs}"
+    );
+
+    let optimizer = help_for("--optimizer");
+    assert!(
+        optimizer.contains("--progressive=false"),
+        "`--optimizer`'s help does not say what makes it take effect: {optimizer}"
     );
 }
 

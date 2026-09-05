@@ -213,12 +213,17 @@ fn lower_quality_produces_a_smaller_file() {
     assert!(decode("page.jpg", &high, DecodeSettings::default()).is_ok());
 }
 
+/// Both settings here are baseline, and that is a constraint rather than a convenience:
+/// libjpeg forces `optimize_coding` on whenever a progressive file is written without
+/// arithmetic coding — `jcmaster.c:915-916` of the vendored `mozjpeg-sys 2.2.3`, "assume
+/// default tables no good for progressive mode" — so a progressive pair would compare two
+/// identical files. The override itself is pinned through the command line, where the switch
+/// that runs into it lives:
+/// `pipeline::the_encoder_switches_reach_the_encoder_except_where_libjpeg_overrides_one`.
 #[test]
 fn entropy_coding_optimisation_is_honoured() {
     let page = decode("page.jpg", &fixture(), DecodeSettings::default()).expect("decodes");
 
-    // Both baseline, so the scan script cannot confound the comparison: the only
-    // difference between the two is whether the Huffman tables were optimised.
     let baseline = EncodeSettings {
         progressive: false,
         ..EncodeSettings::default()

@@ -1017,6 +1017,32 @@ pub fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
     None
 }
 
+/// The start-of-frame marker byte, which says whether a file is baseline (`C0`), extended
+/// sequential (`C1`), or progressive (`C2`).
+///
+/// Walked the same way as [`jpeg_size`], and for the same reason: `FF` followed by an
+/// arbitrary quantiser byte occurs inside `DQT`, so a byte scan can find a frame header that
+/// is not one.
+pub fn start_of_frame(jpeg: &[u8]) -> Option<u8> {
+    let mut index = 2;
+    while index + 9 < jpeg.len() {
+        if jpeg[index] != 0xFF {
+            return None;
+        }
+        match jpeg[index + 1] {
+            0xFF => index += 1,
+            marker @ 0xC0..=0xC2 => return Some(marker),
+            0xDA | 0xD9 => return None,
+            0x01 | 0xD0..=0xD8 => index += 2,
+            _ => {
+                let length = usize::from(u16::from_be_bytes([jpeg[index + 2], jpeg[index + 3]]));
+                index += 2 + length;
+            }
+        }
+    }
+    None
+}
+
 /// Flips every bit of one byte of entropy-coded data, `offset` bytes past the scan header.
 ///
 /// The scan is located by walking segment lengths, not by searching for `FF DA`: a
