@@ -5,10 +5,14 @@
 //! `-r` and `--jobs` from another, `--progressive` from a third, `--completions` from a fourth
 //! — so no per-flag test could state a rule that holds across all of them.
 //!
-//! Three rules are pinned here. A refusal's exit code is decided by the kind of fault rather
-//! than by the layer that caught it. A refusal names the path it is about, including the ones
-//! the run itself cannot name. And an option fault is refused before the input is touched,
-//! which is observable only by presenting two faults at once and seeing which wins.
+//! Six rules are pinned here, each a clause of one requirement. A refusal's exit code is
+//! decided by the kind of fault rather than by the layer that caught it. A refusal names the
+//! path it is about, including the ones the run itself cannot name — and a failure about the
+//! output does not name the input instead. An option fault is refused before the input is
+//! touched, which is observable only by presenting two faults at once and seeing which wins.
+//! A value from a fixed set is refused with the set listed. A refusal speaks of the flag the
+//! user typed rather than of the type behind it. And a refused run leaves the input exactly
+//! where it was, byte for byte.
 
 mod support;
 
@@ -118,7 +122,10 @@ fn a_usage_fault_exits_two_and_a_runtime_fault_exits_one() {
         // A value outside its range, at both ends and on three flags.
         vec!["--quality".as_ref(), "0".as_ref(), input.as_ref()],
         vec!["--quality".as_ref(), "101".as_ref(), input.as_ref()],
+        // `101` is the boundary; `250` is what a migrating `-r 250` invocation carries, which
+        // the reference tool clamps to 100 and this build refuses. They pin different rules.
         vec!["--ratio".as_ref(), "0".as_ref(), input.as_ref()],
+        vec!["--ratio".as_ref(), "101".as_ref(), input.as_ref()],
         vec!["--ratio".as_ref(), "250".as_ref(), input.as_ref()],
         vec!["--auto-width".as_ref(), "0".as_ref(), input.as_ref()],
         vec!["--auto-width".as_ref(), "65536".as_ref(), input.as_ref()],
@@ -311,12 +318,22 @@ fn a_failure_about_the_output_does_not_name_the_input_instead() {
     );
 }
 
-/// With two faults present at once, the option's refusal wins and the input is never opened.
+/// With two faults present at once, the option's refusal wins and the input was not read.
 ///
 /// The test every other refusal test could not be: they all use a *valid* input, so they can
 /// assert only that no output appeared — which is equally true of a tool that opened the
-/// archive, read it, and then refused. Here the input is one the tool cannot read at all, so
-/// its silence about it is what proves nothing looked.
+/// archive, read it, and then refused.
+///
+/// What makes the difference observable is the decoy's control line. `not an archive this
+/// build reads` is `SourceError::NotAnArchive`, which the reader can only reach by opening the
+/// file and reading its leading bytes — so a run that prints it read the input, and a run that
+/// prints the option's message instead did not. That is the pair: the same input, one legal
+/// option value and one illegal, and only the legal one reports having looked.
+///
+/// It does not exclude a build that opened the input, discarded what it read and then reported
+/// the option; nothing observable from outside the process would. `Source::open` refuses a
+/// named pipe — the one input whose opening is visible from outside — before opening it, and
+/// deliberately, so that avenue is closed by design rather than by omission.
 #[test]
 fn the_option_fault_wins_over_the_input_fault() {
     let directory = TempDir::new("pairing");
@@ -338,9 +355,9 @@ fn the_option_fault_wins_over_the_input_fault() {
         );
         assert!(!default_output(broken).exists());
 
-        // The control: the same input with an accepted option value is refused for being
-        // unreadable, at the runtime code. Without this row the assertions above would also
-        // pass for a build that refused every invocation at the parser.
+        // The control: the same input with an accepted option value is refused by the reader
+        // instead, at the runtime code. Without this row the assertions above would also pass
+        // for a build that refused every invocation at the parser.
         let (code, message) = refusal(&["--quality".as_ref(), "80".as_ref(), broken.as_ref()]);
         assert_eq!(code, RUNTIME, "{message}");
         assert!(
@@ -348,6 +365,13 @@ fn the_option_fault_wins_over_the_input_fault() {
             "a legal value should have reached the input: {message}"
         );
     }
+
+    // And the decoy's control names what only a reader that read the bytes can say.
+    let (_, message) = refusal(&["--quality".as_ref(), "80".as_ref(), decoy.as_ref()]);
+    assert!(
+        message.contains("not an archive this build reads"),
+        "the control must be the reader's own refusal, or it evidences nothing: {message}"
+    );
 }
 
 /// A value drawn from a fixed set is refused with the set listed, on every flag that has one.
@@ -415,12 +439,19 @@ fn a_refusal_speaks_of_the_flag_rather_than_of_the_type_behind_it() {
     }
 }
 
-/// No refusal path deletes the input, whatever combination of flags reached it.
+/// No refusal path deletes, moves or truncates the input, whatever combination of flags
+/// reached it.
 ///
 /// `--delete-org` is the only flag on this surface that destroys a file, so every refusal it
-/// can be given is a path the input has to survive. Survival is asserted rather than the
-/// message, because survival is what the user cares about and a late refusal is what would
-/// break it.
+/// can be given is a path the input has to survive. The bytes are compared rather than the
+/// message: existence alone would not catch a truncation, and truncation is what the
+/// requirement names beside deletion.
+///
+/// The rows are chosen by *how late* the refusal is, because a late one is what has something
+/// to destroy: the parser, then the paths alone, then three that had already read the archive
+/// — no pages, a page that will not decode, and two entries whose names collide once the
+/// extension is rewritten — then a damaged entry table, then the flag's own refusal for a
+/// directory input.
 #[test]
 fn a_refused_run_leaves_the_input_where_it_was() {
     let directory = TempDir::new("delete-org-refusals");
@@ -431,8 +462,19 @@ fn a_refused_run_leaves_the_input_where_it_was() {
     let nowhere = directory.join("nowhere").join("out.zip");
     let empty = without_pages(&directory);
     let undecodable = with_an_undecodable_page(&directory);
+    let collision = with_colliding_names(&directory);
+    let damaged = directory.join("damaged.zip");
+    let whole = fs::read(&input).expect("reads the fixture");
+    fs::write(&damaged, &whole[..whole.len() - 40]).expect("writes a truncated archive");
     let tree = directory.join("pages");
     write_tree(&tree, &[("001.jpg", page_bytes(320, 440))]);
+
+    let inputs = [&input, &empty, &undecodable, &collision, &damaged];
+    let before: Vec<Vec<u8>> = inputs
+        .iter()
+        .map(|path| fs::read(path).expect("reads the input"))
+        .collect();
+    let tree_before = fs::read(tree.join("001.jpg")).expect("reads the directory's page");
 
     let refusals: Vec<Vec<&OsStr>> = vec![
         // A usage fault, refused before anything is opened.
@@ -455,19 +497,32 @@ fn a_refused_run_leaves_the_input_where_it_was() {
             nowhere.as_ref(),
             input.as_ref(),
         ],
-        // A refusal the input's own contents decided, which is the latest one there is: the
-        // run had read the archive by the time it failed.
+        // Refusals the input's own contents decided, which are the latest there are: the run
+        // had read the archive, and in the collision's case written a page, by the time it
+        // failed.
         vec!["--delete-org".as_ref(), empty.as_ref()],
         vec!["--delete-org".as_ref(), undecodable.as_ref()],
+        vec!["--delete-org".as_ref(), collision.as_ref()],
+        vec!["--delete-org".as_ref(), damaged.as_ref()],
         // The flag's own refusal.
         vec!["--delete-org".as_ref(), tree.as_ref()],
     ];
     for args in refusals {
         let (code, message) = refusal(&args);
         assert_ne!(code, 0, "{args:?} succeeded: {message}");
-        for survivor in [&input, &empty, &undecodable, &tree] {
-            assert!(survivor.exists(), "{args:?} removed {}", survivor.display());
+        for (path, bytes) in inputs.iter().zip(&before) {
+            assert_eq!(
+                fs::read(path).ok().as_ref(),
+                Some(bytes),
+                "{args:?} did not leave {} as it was",
+                path.display()
+            );
         }
+        assert_eq!(
+            fs::read(tree.join("001.jpg")).ok().as_ref(),
+            Some(&tree_before),
+            "{args:?} disturbed the directory input's page"
+        );
     }
 }
 

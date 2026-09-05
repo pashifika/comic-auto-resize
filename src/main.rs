@@ -448,24 +448,29 @@ fn run(cli: &Cli, input: &Path) -> Result<(Report, PathBuf), CliError> {
     Ok((report, output))
 }
 
-/// Names the input on a run failure that is about it, and adds nothing to one that names its
-/// own path.
+/// Names the input on a run failure that carries no path of its own, and adds nothing to one
+/// that names its own.
 ///
 /// **Not a central prefix.** A blanket `{input}: {reason}` would assume every failure is about
-/// the input, and seven of `RunError`'s thirteen variants are not: an output that already
-/// exists, a directory to write into that is not there, a stray left by a failed cleanup. That
-/// line would print two unlabelled paths in a sentence whose subject was never the input.
+/// the input, and seven of `RunError`'s thirteen variants name a path already: an output that
+/// already exists, a directory to write into that is not there, a stray left by a failed
+/// cleanup. That line would print two unlabelled paths in a sentence whose subject was never
+/// the input.
 ///
-/// Which failures are which is [`pipeline::RunError::concerns_input`]'s answer rather than a
-/// list kept here, because the library owns the variants: its match is exhaustive in the
-/// crate that defines them, so a variant added later has to be classified before it compiles.
-/// A list here could not be — `RunError` is `#[non_exhaustive]`, so a match in this crate
-/// needs a wildcard, and the wildcard is exactly where a new path-free failure would hide.
+/// Which failures are which is [`pipeline::RunError::needs_the_input_named`]'s answer rather
+/// than a list kept here, because the library owns the variants: its match is exhaustive in
+/// the crate that defines them, so a variant added later has to be classified before it
+/// compiles. A list here could not be — `RunError` is `#[non_exhaustive]`, so a match in this
+/// crate needs a wildcard, and the wildcard is exactly where a new path-free failure would
+/// hide.
 fn presented(input: &Path, error: pipeline::RunError) -> CliError {
-    if error.concerns_input() {
+    if error.needs_the_input_named() {
         CliError::Input {
             path: input.to_path_buf(),
-            source: error,
+            // Boxed because the variant would otherwise carry a `RunError` beside a `PathBuf`
+            // and make every `run()` result that much larger — `clippy::result_large_err`,
+            // and only on Windows, where the wrapped `SourceError` is wider.
+            source: Box::new(error),
         }
     } else {
         CliError::Run(error)
@@ -605,17 +610,21 @@ enum CliError {
     /// write into that is not there.
     #[error(transparent)]
     Run(pipeline::RunError),
-    /// A run failure that is about the input, which [`pipeline::run`] is given as a source and
-    /// cannot name. The one place the input's name is added, and [`presented`] decides where
-    /// from the library's own classification.
+    /// A run failure that carries no path of its own, given the input's. The one place the
+    /// input's name is added, and [`presented`] decides where from the library's own
+    /// classification.
     ///
     /// The line is `{input}: {reason}`, which is what a `SourceError` raised during iteration
     /// already produced through the `Archive` arm above, so that one is unchanged by being
     /// folded in here.
+    ///
+    /// `Box` because this variant is the widest one: a `RunError` beside a `PathBuf` puts
+    /// `run()`'s whole `Result` over `clippy::result_large_err`'s limit on Windows, where the
+    /// `SourceError` inside it is wider than on macOS.
     #[error("{}: {source}", path.display())]
     Input {
         path: PathBuf,
-        source: pipeline::RunError,
+        source: Box<pipeline::RunError>,
     },
     /// `--delete-org` with a directory input. The pipeline reads the page files a directory
     /// holds and passes over everything else, so removing the input would take files it never
