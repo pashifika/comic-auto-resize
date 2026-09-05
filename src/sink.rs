@@ -186,7 +186,10 @@ impl Sink {
         // No reopen, and therefore no dependence on the file's own mode.
         archive
             .finish()
-            .map_err(RunError::Archive)?
+            .map_err(|source| RunError::Archive {
+                path: self.path.clone(),
+                source,
+            })?
             .sync_all()
             .map_err(|source| RunError::Io {
                 path: self.path.clone(),
@@ -248,7 +251,10 @@ impl Sink {
         })?;
         archive
             .start_file(page.name.as_str(), options)
-            .map_err(RunError::Archive)?;
+            .map_err(|source| RunError::Archive {
+                path: path.clone(),
+                source,
+            })?;
         archive
             .write_all(&page.bytes)
             .map_err(|source| RunError::Io { path, source })?;
