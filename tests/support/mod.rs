@@ -989,11 +989,14 @@ pub fn write_tree(root: &Path, files: &[(&str, Vec<u8>)]) {
     }
 }
 
-/// The dimensions a JPEG's start-of-frame header declares.
+/// The offset of a JPEG's start-of-frame segment.
 ///
 /// Walked by segment length rather than scanned for `FF C0`: a quantisation table entry of
-/// `FF` followed by an arbitrary quantiser byte occurs inside `DQT`.
-pub fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
+/// `FF` followed by an arbitrary quantiser byte occurs inside `DQT`, so a byte scan can find a
+/// frame header that is not one. The two readers below project from this one walk — the
+/// alternative is a second transcription of the arm list, which is how the copy in
+/// `tests/page_codec.rs` came to be missing the standalone-marker arm.
+fn start_of_frame_offset(jpeg: &[u8]) -> Option<usize> {
     let mut index = 2;
     while index + 9 < jpeg.len() {
         if jpeg[index] != 0xFF {
@@ -1001,11 +1004,8 @@ pub fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
         }
         match jpeg[index + 1] {
             0xFF => index += 1,
-            0xC0..=0xC2 => {
-                let height = u16::from_be_bytes([jpeg[index + 5], jpeg[index + 6]]);
-                let width = u16::from_be_bytes([jpeg[index + 7], jpeg[index + 8]]);
-                return Some((u32::from(width), u32::from(height)));
-            }
+            0xC0..=0xC2 => return Some(index),
+            // Start of scan or end of image: there is no frame header.
             0xDA | 0xD9 => return None,
             0x01 | 0xD0..=0xD8 => index += 2,
             _ => {
@@ -1015,6 +1015,22 @@ pub fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
         }
     }
     None
+}
+
+/// The dimensions a JPEG's start-of-frame header declares.
+///
+/// The segment's layout is marker (2), length (2), precision (1), height (2), width (2).
+pub fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
+    let at = start_of_frame_offset(jpeg)?;
+    let height = u16::from_be_bytes([jpeg[at + 5], jpeg[at + 6]]);
+    let width = u16::from_be_bytes([jpeg[at + 7], jpeg[at + 8]]);
+    Some((u32::from(width), u32::from(height)))
+}
+
+/// The start-of-frame marker byte, which says whether a file is baseline (`C0`), extended
+/// sequential (`C1`), or progressive (`C2`).
+pub fn start_of_frame(jpeg: &[u8]) -> Option<u8> {
+    start_of_frame_offset(jpeg).map(|at| jpeg[at + 1])
 }
 
 /// Flips every bit of one byte of entropy-coded data, `offset` bytes past the scan header.

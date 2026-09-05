@@ -33,8 +33,10 @@ pub struct EncodeSettings {
 }
 
 impl Default for EncodeSettings {
-    /// Quality 90 with optimisation and progressive on, as the Go implementation
-    /// defaults.
+    /// Quality 90 with optimisation and progressive on — the reference tool's *documented*
+    /// defaults. Its help displays both bools as on; go-flags' `default-mask` changes only what
+    /// help prints, so its binary applied neither and shipped baseline, unoptimised files.
+    /// `--progressive` and `--optimizer` state that divergence where a user meets it.
     fn default() -> Self {
         Self {
             quality: 90,
@@ -166,8 +168,13 @@ mod tests {
         .expect("the buffer is built from the dimensions")
     }
 
+    /// The canonical defaults, two of which are the reference tool's *documented* ones rather
+    /// than the ones its binary applied: go-flags' `default-mask` moved its help and not its
+    /// bools, so it shipped baseline and unoptimised. Quality and DCT method have no such
+    /// split. Named for what it asserts, because "matches the Go implementation" is true of
+    /// two of these four settings only against its help.
     #[test]
-    fn defaults_match_the_go_implementation() {
+    fn the_defaults_are_the_reference_tools_documented_ones() {
         let settings = EncodeSettings::default();
         assert_eq!(settings.quality, 90);
         assert!(settings.optimize_coding);

@@ -1,13 +1,19 @@
 //! Command-line entry point.
 //!
 //! The surface contains exactly what is implemented. A flag may exist and be unimplemented,
-//! or not exist; it must not exist and silently do the wrong thing — so the flags Go had and
-//! this build does not (`--small-skip`, `--optimizer`, `--progressive`) are absent rather
-//! than accepted and ignored. Absence is the honest form of "not yet".
+//! or not exist; it must not exist and silently do the wrong thing — so the three flags Go had
+//! and this build does not are absent rather than accepted and ignored. `--small-skip` will
+//! stay absent: Go's implementation of it is `if !skipSmallSize && doResize`, so passing it
+//! disables resizing for every page rather than skipping the small-ratio ones its name
+//! promises, and the behaviour the name describes is what `policy.rs`'s `MIN_EDGE` floor does
+//! unconditionally. `--show-time` and `--debug` are Go's `Developer Options` group and measure
+//! or instrument that build rather than describe an archive. Absence is the honest form of
+//! "not yet", and for these three it is the honest form of "no".
 //!
 //! `--fix-idx` was the first flag added since the rewrite began; `--charset` and `--pwd`
-//! joined it, then `-o/--out` and `--delete-org`, and `-r/--ratio` and `--jobs` join now,
-//! each in the Change that implements it — which is that rule read the other way round.
+//! joined it, then `-o/--out` and `--delete-org`, then `-r/--ratio` and `--jobs`, and
+//! `--progressive` and `--optimizer` join now, each in the Change that implements it — which
+//! is that rule read the other way round.
 //!
 //! `--jobs` is the one flag here with no reference-tool equivalent: the Go implementation
 //! derives its worker count from the host and offers no way to say otherwise. `-r/--ratio`
@@ -20,6 +26,18 @@
 //! CP437 and turns a page into a subdirectory. A flag defaults to off when what it changes is
 //! a choice, and to on when what it changes is a defect. `--delete-org` removes the user's
 //! input, which is the most destructive choice on the surface, so it is off.
+//!
+//! `--progressive` and `--optimizer` are the two whose bare form is a no-op, and deliberately:
+//! they take an optional value and default to on, so the reference tool's spelling parses and
+//! asserts the state its help promised, while `=false` is the switch. The value is attached
+//! with `=` because an optional value taken from the next argument would swallow the
+//! positional input path.
+//!
+//! Their polarity is a third case beside the two above, and it is why the rule does not settle
+//! it: neither is a defect correction — baseline output is a compatibility and memory trade,
+//! not a repair — and neither is an open choice this build gets to make freshly. They default
+//! to on because that is what the reference tool's help documented and what this build has
+//! written since `native-deps`, so the default is inherited rather than chosen.
 
 use std::ffi::OsString;
 use std::fs;
@@ -29,7 +47,7 @@ use std::process::ExitCode;
 use std::sync::LazyLock;
 use std::thread;
 
-use clap::{Parser, builder::TypedValueParser};
+use clap::{ArgAction, Parser, builder::TypedValueParser};
 use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter};
 use comic_auto_resize::pipeline::{self, Report, Settings};
 use comic_auto_resize::policy::{AUTO_WIDTH, Target};
@@ -41,6 +59,17 @@ use thiserror::Error;
 const MAX_WIDTH: i64 = 65535;
 
 /// Auto-resize the pages of a comic archive and repack them as zip.
+///
+/// Four bools, which is one past what `clippy::pedantic` allows a struct. The lint's remedy —
+/// a state machine, or two-variant enums — does not apply to this one: the fields are not
+/// state, they are the command-line surface itself, one per flag, and `clap`'s derive reads
+/// the type to decide how the flag parses. An enum here would produce a different surface and
+/// then have to be converted back. `expect` rather than `allow`, so a Change that drops a
+/// switch is told the exemption is no longer needed.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one field per command-line flag; the type decides how clap parses it"
+)]
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -103,6 +132,38 @@ struct Cli {
     /// JPEG DCT/IDCT method.
     #[arg(long, default_value = DctMethod::default().name(), value_parser = DctMethod::NAMES)]
     dct: String,
+
+    /// Write progressive JPEG pages; pass `--progressive=false` for baseline. On by default,
+    /// matching the reference tool's documented default — its binary applied the opposite, so
+    /// the same command line produces different bytes here. Baseline costs size rather than
+    /// saving it: measured across this project's sample archives it is 1.8 to 5.4 per cent
+    /// larger. What it buys is compatibility and read-back memory — a progressive page costs
+    /// about 4.3x a baseline one to decode — so `=false` suits an archive this tool, or an
+    /// older viewer, will read again.
+    #[arg(
+        long,
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = true,
+        value_name = "BOOL",
+    )]
+    progressive: bool,
+
+    /// Optimise the entropy-coding tables: costs an encoding pass, saves bytes. On by
+    /// default. While a progressive file is written libjpeg forces this on regardless, so
+    /// `--optimizer=false` takes effect together with `--progressive=false`.
+    #[arg(
+        long,
+        action = ArgAction::Set,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        default_value_t = true,
+        value_name = "BOOL",
+    )]
+    optimizer: bool,
 
     /// Resize interpolation mode.
     #[arg(long, default_value = Filter::default().name(), value_parser = Filter::NAMES)]
@@ -211,10 +272,14 @@ fn run(cli: &Cli) -> Result<(Report, PathBuf), CliError> {
             dct_method: cli.dct.parse().map_err(CliError::Dct)?,
             ..DecodeSettings::default()
         },
+        // Every field named, and no `..default()` spread: each of the four settings the
+        // encoder carries now has a flag, so a spread here would only hide which of them the
+        // command line reaches.
         encode: EncodeSettings {
             quality: cli.quality,
+            optimize_coding: cli.optimizer,
+            progressive: cli.progressive,
             dct_method: cli.dct.parse().map_err(CliError::Dct)?,
-            ..EncodeSettings::default()
         },
     };
     // Every option is settled before the input is opened: an unknown `--charset` label was
