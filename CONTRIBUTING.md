@@ -201,10 +201,12 @@ subjects.
 
 ## Continuous integration
 
-One workflow, `.github/workflows/ci.yml`. It defines `hygiene` on Linux, `windows` and
-`macos` on their respective release targets, and a terminal `ci` job that fails unless
-every one of them reported `success` — a *skipped* job is not a passing job, so the gate
-checks each result by name rather than calling `success()`.
+Two workflows. `.github/workflows/ci.yml` defines `hygiene` and `release-validation` on
+Linux, `windows` and `macos` on their respective release targets, the two shell-completion
+jobs, and a terminal `ci` job that fails unless every one of them reported `success` — a
+*skipped* job is not a passing job, so the gate checks each result by name rather than
+calling `success()`. `.github/workflows/release.yml` builds and publishes downloads; it is
+never a required pull-request status, and only its offline half runs in `ci`.
 
 `ci` is the only status context the branch rulesets require, and they name no individual
 job. **Adding a job therefore means adding it to the `ci` gate's `needs` list and nothing
@@ -221,6 +223,115 @@ uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 `hygiene` enforces this across the whole workflow tree, and fails if it finds no
 references at all — a check that verified nothing is not a passing check.
 
-The three branch rulesets are declared under `.github/rulesets/`. Those files are the
-source of truth, but committing one does not enforce it; a maintainer applies them to the
-repository through `gh api`.
+The branch rulesets are declared under `.github/rulesets/`, together with the version-tag
+ruleset. Those files are the source of truth, but committing one does not enforce it; a
+maintainer applies them to the repository through `gh api`.
+
+## Releasing
+
+Stable binary releases are published from an existing `vMAJOR.MINOR.PATCH` tag whose commit
+is contained in `main`. The workflow never creates, moves, or deletes a tag, and it refuses
+to publish unless the repository default branch is `main`, `ci` succeeded for that exact
+commit on `main`, and the tagged tree's `.github/workflows` matches current `main` — the
+Actions token cannot write workflow files, and a divergent tree is where that surfaces.
+
+### What a release produces
+
+```text
+comic-auto-resize-<tag>-x86_64-pc-windows-msvc.zip
+comic-auto-resize-<tag>-aarch64-apple-darwin.tar.gz
+SHA256SUMS
+```
+
+Each archive has one top-level directory matching its filename stem, holding the executable,
+`LICENSE`, `NOTICE.md`, a generated `THIRD-PARTY-LICENSES.txt`, and `VERSION`. The licence
+bundle is built from the locked non-development dependency graph for that target, including
+text a crate carries somewhere other than its own root: `unrar-ng-sys` vendors RARLAB's
+modified UnRAR and ships no root licence file, and packaging fails rather than dropping it.
+
+Repackaging the same inputs is byte-deterministic. Independent builds on a changed runner
+image are not claimed to be, which is what the published SHA-256 values are for.
+
+### Prepare a version
+
+Bump `version` in `Cargo.toml` through the normal topic-to-development flow, let Cargo
+rewrite the root entry in `Cargo.lock`, and confirm no dependency resolution changed. Run
+the verification sequence above, promote `dev/2.0.x` to `main`, and record the resulting
+`main` commit. Never tag a topic or development commit.
+
+### Rehearse without publishing
+
+`workflow_dispatch` exercises both native builds, the licence bundle, the conversion smoke,
+packaging, and aggregation, then stops. The workflow must already exist on the default
+branch for the dispatch to be offered:
+
+```sh
+gh workflow run Release --ref main -f ref=<commit>
+gh run list --workflow Release --event workflow_dispatch --limit 1
+gh run watch <run-id> --exit-status
+```
+
+Both `build` rows and `aggregate` must succeed, and `publish` and `verify-published` must be
+skipped. Manual preflight always reports `publish=false`, and the publish job independently
+requires a tag-push event, so a rehearsal that selected a real release tag still cannot
+publish.
+
+### Protect version tags, once
+
+Apply `.github/rulesets/version-tags.json` only after `release.yml` is present on `main`,
+and check first that no tag ruleset already exists:
+
+```sh
+gh api --method GET repos/{owner}/{repo}/rulesets -f targets=tag
+gh api repos/{owner}/{repo}/rulesets --input .github/rulesets/version-tags.json
+```
+
+Read the result back and require the expected name, `tag` target, `active` enforcement,
+exact `refs/tags/v*` include with no exclusions, and an empty bypass list. GitHub's readback
+normalizes the `update` rule by omitting its parameters; the reviewed request payload is the
+evidence for `update_allows_fetch_and_merge=false`. GitHub documents an effective-rules
+endpoint for branches only, so do not test the rules by moving or deleting a real tag — read
+the non-destructive rule-suite evaluation for the ref after the tag is created normally.
+
+### Create the tag
+
+```sh
+git tag -a <tag> <commit> -m "comic-auto-resize <tag>"
+git push origin refs/tags/<tag>
+```
+
+The push is the public-release authorization boundary: nothing before it is visible, and
+nothing after it can be taken back. Do not merge workflow changes between creating the tag
+and publication.
+
+### Verify the published release
+
+The two `verify-published` jobs already download the public assets, check the checksums and
+package identity, extract, and run a real conversion natively. Repeat it by hand from an
+empty directory when a release is being accepted:
+
+```sh
+gh release download <tag> --dir <empty-directory>
+python3 -B .github/scripts/release.py verify-set \
+  --directory <empty-directory> --version <MAJOR.MINOR.PATCH> --tag <tag> --commit <commit>
+```
+
+### Failure and retry
+
+| Failure | Required outcome |
+|---|---|
+| Preflight, build, smoke, package or aggregate failure | No Release interaction happened. Fix forward; if the tag exists, use a new patch version rather than moving it. |
+| Workflow tree differs from current `main`, or main CI is not green for the commit | Stop before Release interaction. Promote the intended state and release a new version. |
+| Upload interrupted after the draft was created | A marker-bound draft remains. Rerun the same tag's workflow while its artifacts are retained. |
+| Draft missing an asset, or holding an `open` incomplete one | Only that asset is uploaded or replaced, then the complete set is redownloaded and verified. |
+| Uploaded asset, marker, tag commit, title or asset set conflicts | Stop for review. Never clobber, never publish the draft. |
+| Retry after a successful publication | The existing set is downloaded and verified; nothing is mutated. |
+| A published binary is defective | Increment the patch version and release a new tag. Never rewrite published bytes. |
+
+### Evidence to retain
+
+Preparation and promotion pull requests, the promoted `main` commit, the tag object, the
+workflow run and attempt, runner and `rustc -vV` evidence, the archive SHA-256 values, the
+release ID and asset listing, the tag-ruleset payload and readback, and the native
+downloaded-asset results. Signing, notarization, crates.io, and package-manager channels are
+not provided and are not implied by any of the above.

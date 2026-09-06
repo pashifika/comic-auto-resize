@@ -9,6 +9,46 @@ Shrink comic archives by resizing their pages, keeping line art clear and saving
 - **Resize choices:** fit pages to a common width or reduce each by a percentage.
 - **Originals kept:** write a separate archive; remove the input only when you request it.
 
+## Install
+
+Each `v2` release publishes a native archive per platform on the
+[Releases page](https://github.com/pashifika/comic-auto-resize/releases), alongside a
+`SHA256SUMS` file:
+
+| Platform | Asset |
+|---|---|
+| Windows x86-64 | `comic-auto-resize-<tag>-x86_64-pc-windows-msvc.zip` |
+| Apple Silicon macOS | `comic-auto-resize-<tag>-aarch64-apple-darwin.tar.gz` |
+
+Releases tagged `v1.x` are the older Go implementation and are not built from this source.
+If the page lists no `v2` release yet, build from source with the steps below.
+
+Download the archive for your platform and `SHA256SUMS`, check the file against the list,
+then unpack it. The commands below use Bash (Git Bash on Windows):
+
+```bash
+sha256sum --ignore-missing --check SHA256SUMS
+
+# Windows
+unzip comic-auto-resize-<tag>-x86_64-pc-windows-msvc.zip
+./comic-auto-resize-<tag>-x86_64-pc-windows-msvc/comic-auto-resize.exe --version
+
+# macOS
+tar -xzf comic-auto-resize-<tag>-aarch64-apple-darwin.tar.gz
+./comic-auto-resize-<tag>-aarch64-apple-darwin/comic-auto-resize --version
+```
+
+Each archive holds one directory containing the executable, `LICENSE`, `NOTICE.md`,
+`THIRD-PARTY-LICENSES.txt`, and a `VERSION` file naming the version, tag, target, and
+source commit. Nothing else is required to run it — no Rust, no C compiler, no separately
+installed runtime library.
+
+The binaries are **not code-signed or notarized**. A checksum proves the file arrived
+intact from the release you selected; it says nothing about who built it. macOS Gatekeeper
+and Windows SmartScreen will therefore warn on first run. Clear that warning for this file
+alone — on macOS, `xattr -d com.apple.quarantine <path>` after checking the checksum — or
+build from source instead. Do not turn a security control off system-wide.
+
 ## Build from source
 
 Install Git, [rustup](https://rustup.rs/), and a C/C++ compiler; x86 builds also need `nasm`.
@@ -23,8 +63,8 @@ cargo build --locked --release
 ```
 
 The executable is `target/release/comic-auto-resize` (`comic-auto-resize.exe` on Windows).
-There is no packaged release of this Rust version yet. The first build takes minutes because
-it compiles mozjpeg from source.
+The first build takes minutes because it compiles mozjpeg from source; a prebuilt archive
+from [Install](#install) needs no toolchain at all.
 
 ## Usage
 
@@ -86,9 +126,11 @@ These are the binary's long options. Run `--help` for accepted values, defaults,
 
 ## Requirements
 
-Native verification targets Windows x86-64 and Apple Silicon macOS. Building requires Rust 1.93
-or newer; `rust-toolchain.toml` selects the tested toolchain through rustup. Build dependencies
-and platform setup are in [CONTRIBUTING.md](CONTRIBUTING.md#prerequisites).
+Native verification targets Windows x86-64 and Apple Silicon macOS, and the published
+archives are built and exercised on those two targets rather than cross-compiled. A
+prebuilt archive needs nothing installed. Building from source requires Rust 1.93 or newer;
+`rust-toolchain.toml` selects the tested toolchain through rustup. Build dependencies and
+platform setup are in [CONTRIBUTING.md](CONTRIBUTING.md#prerequisites).
 
 ## Contributing
 
