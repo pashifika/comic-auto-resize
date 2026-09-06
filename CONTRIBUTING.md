@@ -176,7 +176,7 @@ editing the workflow. CI does not, so a syntax error there costs a round trip.
 feat|fix|perf|refactor|docs|test|build|ci|chore|revert/<slug>
         │
         ▼
-   dev/2.0.x
+   dev/2.0.x ◀── main   synchronize after each promotion
         │
         ▼  once, at parity with master
       main
@@ -188,8 +188,11 @@ directly is rejected by the branch-flow check, and so is a pull request into `ma
 fork.
 
 `dev/2.0.x` merges into `main` once, at parity with `master`. `main` requires its head to
-be up to date with itself, so each promotion leaves `dev/2.0.x` one merge commit behind;
-fast-forward `dev/2.0.x` onto `main` afterwards.
+be up to date with itself, so each promotion leaves `dev/2.0.x` one merge commit behind.
+Catch it up by opening a pull request from `main` into `dev/2.0.x`. That direction is the
+one exception to topic-branch-only heads, and it is the only way to do it: the development
+ruleset requires a pull request and the `ci` check, so a direct fast-forward push is
+refused with `GH013`.
 
 Both branches are protected and require the `ci` status check. `main` accepts merge
 commits only and requires every review thread resolved; `dev/2.0.x` is looser and accepts
