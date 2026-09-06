@@ -15,6 +15,12 @@
 //! line prints. `--debug` names the pages those counts only count; `--show-time` shows the
 //! time `--jobs` trades against memory.
 //!
+//! `--debug` does open with a settings line, which is what Go's config dump looks like from a
+//! distance and is not one: Go prints its own configuration *type*, fields the archive never
+//! sees included, while this prints the resolved values that decide each page's outcome — the
+//! same numbers the page lines below it are read against. A trace whose target width is not
+//! stated cannot be interpreted.
+//!
 //! `--fix-idx` was the first flag added since the rewrite began; `--charset` and `--pwd`
 //! joined it, then `-o/--out` and `--delete-org`, then `-r/--ratio` and `--jobs`, then
 //! `--progressive` and `--optimizer`, and these two join now — each in the Change that
@@ -44,10 +50,9 @@
 //! to on because that is what the reference tool's help documented and what this build has
 //! written since `native-deps`, so the default is inherited rather than chosen.
 
-use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -219,10 +224,12 @@ struct Cli {
 
     /// Trace every page as it is written: its position, name, format, source size, what was
     /// decided for it, and the bytes it cost before and after. One line per page on standard
-    /// output, in read order at any `--jobs` value, before the run's summary line. The name is
-    /// the entry as the output holds it — the extension is rewritten to `.jpg`, and `--fix-idx`
-    /// renumbers — while the format names what the page was decoded from. Off by default, and
-    /// implies `--show-time`.
+    /// output, in read order at any `--jobs` value, framed by two header lines — the paths and
+    /// the resolved settings — and a totals line, all before the run's summary line. The name
+    /// is the entry as the output holds it, escaped: the extension is rewritten to `.jpg`,
+    /// `--fix-idx` renumbers, and a name carrying a control character is printed in escaped
+    /// form so that one page cannot write two lines. The format names what the page was
+    /// decoded from. Off by default, and implies `--show-time`.
     #[arg(long)]
     debug: bool,
 
@@ -320,16 +327,19 @@ fn main() -> ExitCode {
             } else {
                 String::new()
             };
-            println!(
+            note(format_args!(
                 "{} page(s) written to {}{notes}{removed}",
                 report.pages,
                 output.display()
-            );
+            ));
             // After the summary line, and on success only: a failed run has an error to
             // report and no time worth reporting. `--debug` implies it, as in the reference
             // tool's `ShowTime || Debug`.
             if cli.show_time || cli.debug {
-                println!("execution time: {:.2}s", started.elapsed().as_secs_f64());
+                note(format_args!(
+                    "execution time: {:.2}s",
+                    started.elapsed().as_secs_f64()
+                ));
             }
             ExitCode::SUCCESS
         }
@@ -445,22 +455,24 @@ fn run(cli: &Cli, input: &Path) -> Result<(Report, PathBuf), CliError> {
         resolve_output(input, kind, cli.out.as_deref()).map_err(|error| presented(input, error))?;
 
     // The trace's two header lines go out before the first page, so a run that fails part-way
-    // has still said what it was doing. `Cell` because the observer is an `Fn`: it is called
-    // from the writer, which is this thread, so nothing here needs a lock.
-    let totals = Cell::new((0_usize, 0_usize));
+    // has still said what it was doing.
+    let mut totals = (0_usize, 0_usize);
     if cli.debug {
-        println!("debug: {} -> {}", input.display(), output.display());
-        println!("debug: {}", described(cli, &settings));
-    }
-    let observe = |page: pipeline::Trace<'_>| {
-        let (source, encoded) = totals.get();
-        totals.set((
-            source.saturating_add(page.outcome.source_bytes),
-            encoded.saturating_add(page.outcome.encoded_bytes),
+        note(format_args!(
+            "debug: {} -> {}",
+            input.display(),
+            output.display()
         ));
-        println!("debug: {}", traced(&page));
+        note(format_args!("debug: {}", described(&options, &settings)));
+    }
+    let mut observe = |page: pipeline::Trace<'_>| {
+        totals.0 = totals.0.saturating_add(page.outcome.source_bytes);
+        totals.1 = totals.1.saturating_add(page.outcome.encoded_bytes);
+        note(format_args!("debug: {}", traced(&page)));
     };
-    let trace: Option<&dyn Fn(pipeline::Trace<'_>)> = if cli.debug { Some(&observe) } else { None };
+    // The borrow of `totals` ends with the call, so the totals line below can read them.
+    let trace: Option<&mut dyn FnMut(pipeline::Trace<'_>)> =
+        if cli.debug { Some(&mut observe) } else { None };
 
     // A `SourceError` raised during iteration would otherwise reach the user through two
     // transparent wrappers with no path at all, while the same error raised inside
@@ -470,11 +482,11 @@ fn run(cli: &Cli, input: &Path) -> Result<(Report, PathBuf), CliError> {
     let report = pipeline::run(source, &output, &settings, trace)
         .map_err(|error| presented(input, error))?;
     if cli.debug {
-        let (source, encoded) = totals.get();
-        println!(
+        let (source, encoded) = totals;
+        note(format_args!(
             "debug: {} page(s), {source} -> {encoded} bytes",
             report.pages
-        );
+        ));
     }
 
     // `pipeline::run` took the source by value and dropped it before returning, so this
@@ -641,26 +653,61 @@ fn output(value: OsString) -> Result<PathBuf, &'static str> {
     Ok(PathBuf::from(value))
 }
 
+/// Writes one line to standard output, and does not fail the run when it cannot.
+///
+/// Two failures, and they are not the same failure. **A closed pipe is success**, as it already
+/// is for a completion script: `--debug … | head` is an ordinary thing to do, and `println!`
+/// would panic — which, raised from the observer, unwinds through `pipeline::run` while the sink
+/// is live and takes the archive the run had already built. **Any other failure is reported**,
+/// because a full disk that swallows the success line would otherwise leave a script an empty
+/// stream and a zero exit. The line itself goes to standard error rather than a summary of it,
+/// so nothing the run had to say is lost; the run's own result is unchanged, because the archive
+/// is written either way and what failed is the telling.
+fn note(line: std::fmt::Arguments<'_>) {
+    match writeln!(io::stdout().lock(), "{line}") {
+        Err(error) if error.kind() != io::ErrorKind::BrokenPipe => {
+            // Not `eprintln!`: it panics on the same failure this arm exists to survive.
+            let _ = writeln!(
+                io::stderr().lock(),
+                "error: standard output: {error}; {line}"
+            );
+        }
+        _ => {}
+    }
+}
+
 /// The resolved settings a page's outcome depends on: `--debug`'s second header line.
 ///
-/// Resolved values rather than the `Cli` struct. The reference tool prints its own
-/// configuration type, which describes that build; these are what the run will do.
-fn described(cli: &Cli, settings: &Settings) -> String {
-    let target = match settings.target {
+/// Read from what the run was given rather than from the `Cli` it was derived from, so the
+/// header cannot state a rule the reader did not follow. Every field of [`Settings`] is
+/// destructured for the reason `run` names each encoder field rather than spreading a default:
+/// a field added later has to be printed or explicitly ignored, not silently dropped.
+fn described(options: &ReadOptions, settings: &Settings) -> String {
+    let Settings {
+        jobs,
+        target,
+        filter,
+        // The decoder's settings are the encoder's `dct` plus limits no flag reaches.
+        decode: _,
+        encode,
+    } = *settings;
+    let target = match target {
         Target::Width(width) => format!("{width}px"),
         Target::Ratio(percent) => format!("{percent}%"),
     };
-    let charset = cli.charset.names();
+    let charset = options.charset.names();
     format!(
-        "target={target} quality={} dct={} filter={} progressive={} optimizer={} jobs={} \
+        "target={target} quality={} dct={} filter={} progressive={} optimizer={} jobs={jobs} \
          naming={} charset={}",
-        settings.encode.quality,
-        settings.encode.dct_method.name(),
-        settings.filter.name(),
-        settings.encode.progressive,
-        settings.encode.optimize_coding,
-        settings.jobs,
-        if cli.fix_idx { "position" } else { "stored" },
+        encode.quality,
+        encode.dct_method.name(),
+        filter.name(),
+        encode.progressive,
+        encode.optimize_coding,
+        match options.naming {
+            Naming::ByPosition => "position",
+            Naming::Stored => "stored",
+        },
         if charset.is_empty() { "none" } else { &charset },
     )
 }
@@ -669,22 +716,31 @@ fn described(cli: &Cli, settings: &Settings) -> String {
 ///
 /// The resized geometry comes from the plan the run acted on rather than being recomputed, so
 /// the line cannot disagree with the page. The two pass-through arms are distinguished because
-/// only one of them is a reduction the user asked for and did not get.
+/// only one of them is a reduction the user asked for and did not get. [`Outcome`] is
+/// destructured for [`described`]'s reason.
+///
+/// The name is escaped, and that is not decoration. It comes from the archive, and the reader
+/// refuses only what a filesystem must refuse — a NUL, a traversal — so an entry may carry a
+/// newline or a terminal escape. Printed raw, one page could write several lines, or move a
+/// cursor. `escape_debug` leaves ordinary text, Japanese included, exactly as it is.
+///
+/// [`Outcome`]: pipeline::Outcome
 fn traced(page: &pipeline::Trace<'_>) -> String {
-    let outcome = page.outcome;
-    let size = match outcome
-        .plan
-        .scale_to(outcome.source_width, outcome.source_height)
-    {
-        Some((width, height)) => format!(
-            "{}x{} -> {width}x{height}",
-            outcome.source_width, outcome.source_height
-        ),
+    let pipeline::Outcome {
+        format,
+        source_width,
+        source_height,
+        plan,
+        composited,
+        source_bytes,
+        encoded_bytes,
+        ..
+    } = page.outcome;
+    let size = match plan.scale_to(source_width, source_height) {
+        Some((width, height)) => format!("{source_width}x{source_height} -> {width}x{height}"),
         None => format!(
-            "{}x{} kept ({})",
-            outcome.source_width,
-            outcome.source_height,
-            if matches!(outcome.plan, Plan::BelowFloor) {
+            "{source_width}x{source_height} kept ({})",
+            if matches!(plan, Plan::BelowFloor) {
                 "below floor"
             } else {
                 "at or below target"
@@ -692,17 +748,11 @@ fn traced(page: &pipeline::Trace<'_>) -> String {
         ),
     };
     format!(
-        "{} {}: {} {size}, {} -> {} bytes{}",
+        "{} {}: {} {size}, {source_bytes} -> {encoded_bytes} bytes{}",
         page.position.saturating_add(1),
-        page.name,
-        outcome.format.name(),
-        outcome.source_bytes,
-        outcome.encoded_bytes,
-        if outcome.composited {
-            ", composited"
-        } else {
-            ""
-        },
+        page.name.escape_debug(),
+        format.name(),
+        if composited { ", composited" } else { "" },
     )
 }
 

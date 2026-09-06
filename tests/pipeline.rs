@@ -6,12 +6,11 @@
 
 mod support;
 
-use std::cell::RefCell;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -785,6 +784,7 @@ fn help_lists_every_implemented_option_and_nothing_else() {
         "charset".to_owned(),
         "completions".to_owned(),
         "dct".to_owned(),
+        "debug".to_owned(),
         "delete-org".to_owned(),
         "fix-idx".to_owned(),
         "help".to_owned(),
@@ -796,9 +796,8 @@ fn help_lists_every_implemented_option_and_nothing_else() {
         "quality".to_owned(),
         "ratio".to_owned(),
         "resize-mode".to_owned(),
-        "version".to_owned(),
-        "debug".to_owned(),
         "show-time".to_owned(),
+        "version".to_owned(),
     ];
     expected.sort();
 
@@ -2087,9 +2086,9 @@ fn observed(input: &[u8], output: &Path, jobs: usize, target: Target) -> (Report
         &ReadOptions::default(),
     )
     .expect("the fixture is a zip");
-    let rows = RefCell::new(Vec::new());
-    let observe = |page: pipeline::Trace<'_>| {
-        rows.borrow_mut().push((
+    let mut rows = Vec::new();
+    let mut observe = |page: pipeline::Trace<'_>| {
+        rows.push((
             page.position,
             page.name.to_owned(),
             page.outcome.plan,
@@ -2103,10 +2102,10 @@ fn observed(input: &[u8], output: &Path, jobs: usize, target: Target) -> (Report
             target,
             ..settings(jobs)
         },
-        Some(&observe),
+        Some(&mut observe),
     )
     .expect("the fixture runs");
-    (report, rows.into_inner())
+    (report, rows)
 }
 
 /// Three pages whose outcomes differ: one resized, one the floor refuses, one composited.
@@ -2254,6 +2253,51 @@ fn the_trace_names_the_pages_the_summary_only_counted() {
         lines[summary + 1].starts_with("execution time: "),
         "`--debug` did not imply `--show-time`: {stdout}"
     );
+
+    // The other pass-through arm, which the same page reaches under the default target: at
+    // 600 wide it is already under 1280, so nothing was asked of it. The two arms read
+    // differently because only the first is a reduction the user asked for and did not get.
+    let default = Command::new(BINARY)
+        .arg("--debug")
+        .arg("-o")
+        .arg(directory.join("default.zip"))
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(default.status.success(), "{default:?}");
+    let stdout = String::from_utf8(default.stdout).expect("stdout is UTF-8");
+    assert!(
+        stdout.contains("a-small.jpg: JPEG 600x850 kept (at or below target)"),
+        "a page nothing was asked of reads as the floor's refusal: {stdout}"
+    );
+    assert!(
+        !stdout.contains("too small to shrink"),
+        "the summary counted a page the floor never refused: {stdout}"
+    );
+
+    // The same input at two worker counts prints the same page lines, in the same order — the
+    // guarantee the archive already carries, applied to what the run says about itself. Through
+    // the binary, because the seam-level test above cannot see the formatting.
+    let traced_at = |jobs: &str, name: &str| -> Vec<String> {
+        let run = Command::new(BINARY)
+            .args(["--debug", "--jobs", jobs])
+            .arg("-o")
+            .arg(directory.join(name))
+            .arg(&input)
+            .output()
+            .expect("runs the binary");
+        assert!(run.status.success(), "{run:?}");
+        String::from_utf8(run.stdout)
+            .expect("stdout is UTF-8")
+            .lines()
+            .filter(|line| line.starts_with("debug: ") && line.contains(".jpg:"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let one = traced_at("1", "one.zip");
+    let many = traced_at("4", "many.zip");
+    assert_eq!(one.len(), 3);
+    assert_eq!(one, many, "the trace differs with the worker count");
 }
 
 /// `--show-time` alone is the elapsed line and nothing else, and neither flag says anything
@@ -2328,4 +2372,80 @@ fn neither_diagnostic_flag_changes_the_archive() {
         written.push(fs::read(&output).expect("reads the output back"));
     }
     assert_eq!(written[0], written[1]);
+}
+
+/// A reader that stops after one line must not cost the archive.
+///
+/// `println!` panics when its write fails, and a panic raised from the observer unwinds through
+/// `pipeline::run` while the sink is live — so before the diagnostics went through a writer that
+/// ignores the error, `--debug … | head -1` deleted an output the run had already built.
+#[test]
+fn a_closed_pipe_does_not_cost_the_archive() {
+    let directory = TempDir::new("debug-pipe");
+    let input = directory.join("in.zip");
+    write_archive(&input, &mixed_entries());
+    let output = directory.join("out.zip");
+
+    let mut child = Command::new(BINARY)
+        .arg("--debug")
+        .arg("-o")
+        .arg(&output)
+        .arg(&input)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("runs the binary");
+
+    // One line, then the read end closes — which is what `head -1` does. Every later write
+    // fails, and the run must finish anyway.
+    let mut first = String::new();
+    let mut lines = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    lines.read_line(&mut first).expect("the first line arrives");
+    assert!(first.starts_with("debug: "), "{first}");
+    drop(lines);
+
+    let status = child.wait().expect("the run ends");
+    assert!(
+        status.success(),
+        "a closed pipe ended the run as a failure: {status}"
+    );
+    assert!(
+        output.exists(),
+        "the archive was deleted because its trace could not be printed"
+    );
+    assert_eq!(read_archive(&output).len(), 3);
+}
+
+/// An entry name is the archive's, not the tool's: it may carry a newline or a terminal escape,
+/// and printing it raw would break the line-per-page contract and let an archive drive the
+/// terminal it is traced on.
+#[test]
+fn a_traced_name_cannot_carry_a_newline_or_an_escape() {
+    let directory = TempDir::new("debug-escape");
+    let input = directory.join("in.zip");
+    write_archive(
+        &input,
+        &[("one\ntwo\u{1b}[31m.jpg".to_owned(), page_bytes(1520, 2150))],
+    );
+
+    let run = Command::new(BINARY)
+        .arg("--debug")
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(run.status.success(), "{run:?}");
+    let stdout = String::from_utf8(run.stdout).expect("stdout is UTF-8");
+
+    assert_eq!(
+        stdout.lines().count(),
+        6,
+        "one page is one line, plus two headers, the totals, the summary and the time: {stdout}"
+    );
+    assert!(
+        stdout.contains("one\\ntwo\\u{1b}[31m.jpg"),
+        "the name is not escaped: {stdout}"
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "an escape sequence reached the terminal: {stdout:?}"
+    );
 }

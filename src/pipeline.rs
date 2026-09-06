@@ -5,11 +5,15 @@
 //! credits ─────────────────────────────────────────────────────────┐
 //!    │ capacity W                                                  │ one per entry written
 //!    ▼                                                             │
-//! reader (1 thread*) ─► work ─► workers (J) ─► done ─► writer (1 thread)
+//! reader (1 thread*) ─► work ─► workers (J) ─► done ─► writer (caller's thread)
 //!    entry bytes    capacity J   decode      capacity J   BTreeMap ─► ZipWriter
-//!                               resize
+//!                               resize                            └─► trace (optional)
 //!                               encode
 //! ```
+//!
+//! The writer runs on the caller's own thread rather than on one of its own, and the optional
+//! trace runs there with it: each page's record is handed to the observer as that page is
+//! written and before its credit goes back, so an observer that blocks stalls the reader too.
 //!
 //! # Why peak memory is `O(J)`
 //!
@@ -48,6 +52,13 @@
 //! be wrong. Flipping [`Entries`](crate::source::Entries) to a push shape would not remove
 //! the extra entry: in a push shape every source reads before it offers, so all four would
 //! pay it instead of one.
+//!
+//! ## The trace's records are inside the same window
+//!
+//! An observer adds a second map beside the sink's, holding one record per page the sink has
+//! taken and not yet written. It is populated from the same entries the credits count and
+//! drained as the sink writes them, so it holds no more than `W` either, and a record is a
+//! name and seven `Copy` fields rather than a page. A run with no observer allocates none.
 //!
 //! # What the run's peak actually is, with every factor named
 //!
@@ -327,7 +338,12 @@ pub struct Report {
 ///
 /// `plan` is the value [`Report::below_floor`] counts, so a page reported as kept at full size
 /// cannot be traced as resized.
+///
+/// `non_exhaustive` because this is a view of a decision that will grow: the run decides more
+/// about a page than it did a Change ago, and an observer only reads. Adding a field is then a
+/// compatible change rather than a break.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct Outcome {
     /// The format the entry's bytes selected.
     pub format: Format,
@@ -346,7 +362,12 @@ pub struct Outcome {
 ///
 /// Borrowed: `name` points into the record the writer holds until the page is written, so an
 /// observer that formats and drops it allocates nothing.
+///
+/// `non_exhaustive` for [`Outcome`]'s reason and one of its own: `position` is
+/// [`PageKey`]'s entry index, and the key's second field exists for the day a spread is split
+/// into two pages. Both halves would share this position, so that day adds a field here.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct Trace<'a> {
     /// Position in read order, from zero.
     pub position: u32,
@@ -365,8 +386,15 @@ struct Record {
 
 /// Processes every page of `source` into a new archive at `output`.
 ///
-/// `trace`, when given, is called once per page as that page is written — so in read order,
-/// at every worker count. A run that passes `None` keeps no record and copies no name.
+/// `trace`, when given, is called once per page as that page is written — so in read order, at
+/// every worker count — up to the failure that ends a run: a page written in the same call as
+/// the failure is not traced, and is not in any archive either. A run that passes `None` keeps
+/// no record and copies no name.
+///
+/// It is called on **this** thread, synchronously, before that page's credit is returned to the
+/// reader, so an observer that blocks stalls the writer and then the whole pipeline. `FnMut`
+/// rather than `Fn` because the observers that exist keep running totals, and the single call
+/// site needs no more than a mutable borrow.
 ///
 /// # Errors
 ///
@@ -383,11 +411,16 @@ struct Record {
 /// If the credit channel rejects a token while it is still being filled, which cannot
 /// happen: it was just created with room for exactly that many and nothing can have
 /// disconnected yet.
+///
+/// **A panicking `trace` unwinds out of this function**, unlike the reader and the workers,
+/// whose panics are caught and reported as [`RunError::StagePanicked`]. It runs on the caller's
+/// own thread rather than on a stage's, and the archive under construction is removed on the
+/// way out, so an observer that may fail should say so rather than panic.
 pub fn run<S: Entries + Send>(
     source: S,
     output: &Path,
     settings: &Settings,
-    trace: Option<&dyn Fn(Trace<'_>)>,
+    trace: Option<&mut dyn FnMut(Trace<'_>)>,
 ) -> Result<Report, RunError> {
     let capacities = Capacities::for_jobs(settings.jobs);
 
@@ -447,8 +480,7 @@ pub fn run<S: Entries + Send>(
 
         // The writer runs here rather than on a worker: it is the one stage that must never
         // wait on another stage's thread while holding something that stage needs.
-        let (composited, below_floor, failure) =
-            write_in_order(&mut sink, &done_rx, &credit_tx, trace);
+        let written = write_in_order(&mut sink, &done_rx, &credit_tx, trace);
 
         // Disconnect both directions so the reader and the workers stop, whether the loop
         // ended because the work ran out or because a page failed.
@@ -461,9 +493,9 @@ pub fn run<S: Entries + Send>(
 
         // A page failure is reported ahead of a reader failure: the reader's error is
         // usually just the disconnect the failure caused.
-        match (failure, read) {
-            (Some(error), _) | (None, Err(error)) => Err(error),
-            (None, Ok(())) => Ok((composited, below_floor)),
+        match (written, read) {
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+            (Ok(counts), Ok(())) => Ok(counts),
         }
     });
 
@@ -521,25 +553,27 @@ struct Finished {
 
 /// The writer stage: takes finished pages, restores read order, and tallies what it wrote.
 ///
-/// Returns the two counts and the first failure it met, if any. It is the one stage that sees
-/// every page exactly once and in one thread, which is why both the counting and the tracing
-/// happen here.
+/// Returns the two counts, or the first failure it met. It is the one stage that sees every
+/// page exactly once and in one thread, which is why both the counting and the tracing happen
+/// here.
+///
+/// The trace stops at the failure rather than after it: a [`Sink::accept`] that wrote a page and
+/// then failed on the next reports only the error, so those pages are not traced. They are also
+/// not in any archive — the run removes its output — so the untraced pages are pages that no
+/// longer exist. Reporting them would mean widening `accept`'s error to carry a count.
 fn write_in_order(
     sink: &mut Sink,
     done: &crossbeam_channel::Receiver<Result<Finished, PageError>>,
     credits: &crossbeam_channel::Sender<()>,
-    trace: Option<&dyn Fn(Trace<'_>)>,
-) -> (u32, u32, Option<RunError>) {
+    mut trace: Option<&mut dyn FnMut(Trace<'_>)>,
+) -> Result<(u32, u32), RunError> {
     let mut composited = 0;
     let mut below_floor = 0;
     // Outcomes for pages the sink has taken and not yet written, kept only while an observer
     // is watching. Bounded by the credit window, like the sink's own map.
     let mut pending: BTreeMap<PageKey, Record> = BTreeMap::new();
     while let Ok(finished) = done.recv() {
-        let finished = match finished {
-            Ok(finished) => finished,
-            Err(error) => return (composited, below_floor, Some(RunError::Page(error))),
-        };
+        let finished = finished.map_err(RunError::Page)?;
         composited += u32::from(finished.outcome.composited);
         below_floor += u32::from(matches!(finished.outcome.plan, Plan::BelowFloor));
         if trace.is_some() {
@@ -551,14 +585,10 @@ fn write_in_order(
                 },
             );
         }
-        let written = match sink.accept(finished.page) {
-            Ok(written) => written,
-            Err(error) => return (composited, below_floor, Some(error)),
-        };
-        for _ in 0..written {
+        for _ in 0..sink.accept(finished.page)? {
             // The sink writes in key order, so the lowest records are the pages it just
             // wrote, in the order it wrote them.
-            if let Some(observe) = trace
+            if let Some(observe) = trace.as_deref_mut()
                 && let Some((key, record)) = pending.pop_first()
             {
                 observe(Trace {
@@ -571,7 +601,7 @@ fn write_in_order(
             let _ = credits.send(());
         }
     }
-    (composited, below_floor, None)
+    Ok((composited, below_floor))
 }
 
 /// Reads the archive once, taking a credit before each entry.
