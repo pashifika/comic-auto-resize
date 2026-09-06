@@ -32,6 +32,10 @@ ACCEPTED: list[tuple[str, str, str, str, str]] = [
     ("dev/2.0.x", "ci/gate", REPOSITORY, REPOSITORY, AUTHOR),
     ("dev/2.0.x", "chore/deps", REPOSITORY, REPOSITORY, AUTHOR),
     ("dev/2.0.x", "revert/bad-merge", REPOSITORY, REPOSITORY, AUTHOR),
+    # Promotion synchronization: a promotion leaves the development line one merge commit
+    # behind, and the development ruleset refuses a direct fast-forward push.
+    ("dev/2.0.x", "main", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/10.11.x", "main", REPOSITORY, REPOSITORY, AUTHOR),
     # Dependabot is exempt on both bases, from the base repository only.
     ("main", "dependabot/cargo/clap-4.6.7", REPOSITORY, REPOSITORY, DEPENDABOT),
     ("dev/2.0.x", "dependabot/cargo/clap-4.6.7", REPOSITORY, REPOSITORY, DEPENDABOT),
@@ -63,6 +67,13 @@ REJECTED: list[tuple[str, str, str, str, str]] = [
     ("main", "dependabot/cargo/clap-4.6.7", REPOSITORY, REPOSITORY, AUTHOR),
     ("main", "feat/looks-like-a-bot", REPOSITORY, REPOSITORY, DEPENDABOT),
     ("main", "dependabot/cargo/clap-4.6.7", REPOSITORY, FORK, DEPENDABOT),
+    # Synchronization is bound to the base repository: a fork's `main` is unrelated
+    # content wearing a trusted name.
+    ("dev/2.0.x", "main", REPOSITORY, FORK, AUTHOR),
+    # Only `main` synchronizes. `master` is the Go reference branch, and its tree is not
+    # what a development line catches up to.
+    ("dev/2.0.x", "master", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/2.0.x", "main-sync", REPOSITORY, REPOSITORY, AUTHOR),
 ]
 
 
