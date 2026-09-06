@@ -1,8 +1,8 @@
 # Repository Guidelines
 
 `CONTRIBUTING.md` defines the toolchain, prerequisites, verification sequence, branch,
-and pull-request policy, and `README.md` states what the tool is and which branch to
-use. Treat the rules in this file as the default project guidance for everything else,
+and pull-request policy, and `README.md` states what the tool does and how to run it.
+Treat the rules in this file as the default project guidance for everything else,
 and do not restate what those two already say: two copies of a rule are two rules.
 
 ## Product definition
@@ -27,10 +27,9 @@ development line: it cannot be deleted or force-pushed, and it remains the repos
 default branch until the rewrite reaches parity. Do not open work against it.
 `main` holds the Rust rewrite. `dev/2.0.x` is the integration line feeding `main`.
 
-The behavioural reference the rewrite is measured against is the `master` branch itself.
-A convenience checkout of it may be present at `examples/comic-auto-resize-master/`; that
-path is ignored and machine-local, so read it if it is there and fall back to
-`git show master:<path>` if it is not.
+The behavioural reference is the `master` branch. Read it with `git show master:<path>`;
+when a run is needed, produce its source with `git archive master`. A machine-local
+checkout may hold any revision and is not authoritative.
 
 ## Size reduction strategy
 
@@ -45,6 +44,10 @@ smaller file at equal quality — and its decoder is used because scaled decode 
 method selection are needed and no pure-Rust decoder offers them.
 
 ## Architecture
+
+The Go implementation holds every page of an archive in memory at once, so peak usage
+grows with page count. It also carries four checked-in static libraries to link mozjpeg.
+The rewrite replaces these with a bounded streaming pipeline and builds mozjpeg from source.
 
 The pipeline is a single streaming pass with no look-ahead: a sequential reader feeds a
 bounded channel, worker threads decode, resize, and encode, and an ordering writer
