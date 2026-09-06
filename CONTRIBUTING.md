@@ -319,6 +319,18 @@ python3 -B .github/scripts/release.py verify-set \
   --directory <empty-directory> --version <MAJOR.MINOR.PATCH> --tag <tag> --commit <commit>
 ```
 
+Then run `README.md`'s own download commands for the platform you are on, verbatim, with
+`PATH` reduced to the system directories:
+
+```sh
+env PATH=/usr/bin:/bin sh -c 'shasum -a 256 --ignore-missing --check SHA256SUMS'
+```
+
+That step is not redundant with the jobs above, and it is where the `v2.0.0` release found
+its one defect: the instructions named `sha256sum`, which Git for Windows ships and macOS
+does not. The workflow used its own Python helper and never noticed. A tool the reader is
+told to run has to be a tool the reader has.
+
 ### Failure and retry
 
 | Failure | Required outcome |

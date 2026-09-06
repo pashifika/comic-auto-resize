@@ -24,19 +24,24 @@ Releases tagged `v1.x` are the older Go implementation and are not built from th
 If the page lists no `v2` release yet, build from source with the steps below.
 
 Download the archive for your platform and `SHA256SUMS`, check the file against the list,
-then unpack it. The commands below use Bash (Git Bash on Windows):
+then unpack it. The two platforms need different commands, because the checksum tool each
+one ships is different: Git for Windows carries GNU coreutils, and macOS carries `shasum`.
 
 ```bash
+# Windows, in Git Bash. `tar` is the one Windows itself ships, and it reads zip.
 sha256sum --ignore-missing --check SHA256SUMS
-
-# Windows
-unzip comic-auto-resize-<tag>-x86_64-pc-windows-msvc.zip
+tar -xf comic-auto-resize-<tag>-x86_64-pc-windows-msvc.zip
 ./comic-auto-resize-<tag>-x86_64-pc-windows-msvc/comic-auto-resize.exe --version
+```
 
-# macOS
+```bash
+# macOS. There is no `sha256sum` here; `shasum` is in /usr/bin.
+shasum -a 256 --ignore-missing --check SHA256SUMS
 tar -xzf comic-auto-resize-<tag>-aarch64-apple-darwin.tar.gz
 ./comic-auto-resize-<tag>-aarch64-apple-darwin/comic-auto-resize --version
 ```
+
+Both checks must print `OK` for the archive you downloaded before you run anything.
 
 Each archive holds one directory containing the executable, `LICENSE`, `NOTICE.md`,
 `THIRD-PARTY-LICENSES.txt`, and a `VERSION` file naming the version, tag, target, and
