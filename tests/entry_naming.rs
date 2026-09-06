@@ -186,7 +186,8 @@ fn two_entries_a_padding_rule_would_have_collapsed_get_distinct_names_and_no_ref
     );
     let output = scratch.join("out.zip");
     let source = Source::open(&input, &by_position()).expect("opens");
-    let report = pipeline::run(source, &output, &settings()).expect("no duplicate-name refusal");
+    let report =
+        pipeline::run(source, &output, &settings(), None).expect("no duplicate-name refusal");
     assert_eq!(report.pages, 2);
     assert_eq!(
         read_archive(&output)
@@ -365,6 +366,6 @@ fn the_writers_duplicate_name_refusal_is_still_reachable_without_renumbering() {
     );
     let output = scratch.join("out.zip");
     let source = Source::open(&input, &ReadOptions::default()).expect("opens");
-    let error = pipeline::run(source, &output, &settings()).expect_err("a collision");
+    let error = pipeline::run(source, &output, &settings(), None).expect_err("a collision");
     assert!(matches!(error, RunError::NameCollision { .. }), "{error}");
 }

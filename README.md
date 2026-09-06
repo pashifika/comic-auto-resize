@@ -118,6 +118,8 @@ These are the binary's long options. Run `--help` for accepted values, defaults,
 | `--charset <LIST>` | Try encodings for undeclared archive entry names; defaults to `ja,zh`. |
 | `--pwd <PASSWORD>` | Decrypt ZipCrypto zip or encrypted rar; AES zip and encrypted 7z are unsupported. |
 | `--jobs <COUNT>` | Set parallel page workers; lower the count to reduce memory use. |
+| `--debug` | Trace every page as it is written; implies `--show-time`. |
+| `--show-time` | Print how long a successful run took. |
 | `--completions <SHELL>` | Print a Bash, Zsh, Fish, or PowerShell completion script; use alone. |
 | `--help` | Print help (`-h`). |
 | `--version` | Print the version (`-V`). |
@@ -128,6 +130,7 @@ These are the binary's long options. Run `--help` for accepted values, defaults,
 - `-r` has no default percentage. Without it, `--auto-width` controls resizing and defaults to 1280.
 - `--small-skip` is absent. Small-page protection is always applied; the old flag disabled all resizing, not just small-page resizing.
 - `-o out.cbz` writes `out.cbz`, not `out.cbz.zip`.
+- `--debug` and `--show-time` name the elapsed time as `1.23s`, where v1.1.2 printed `1.23/s`.
 
 ## Requirements
 
