@@ -1,6 +1,13 @@
 This is a manga compressed file auto-resize tool
 ================================================
 
+> **This branch is the Go implementation, v1.1.2, kept as a reference.**
+> The current implementation is the Rust rewrite on
+> [`main`](https://github.com/pashifika/comic-auto-resize/tree/main), which is the
+> repository's default branch and where new work happens. It reads zip, rar, 7z and plain
+> directories; see its README for how to install or build it. The instructions below still
+> describe this branch and still work.
+
 Are you still bothered by the size of your comic compressed files?<br>
 Still doing the tedious operation of decompressing files -> other software processing images -> repacking compressed files?<br>
 This tool will do the above work for you, from the open file all processing is done in memory!<br>
