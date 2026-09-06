@@ -399,7 +399,7 @@ fn the_output_is_named_after_the_directory_and_written_beside_it() {
 
         let source = Source::open(root, &ReadOptions::default()).expect("opens");
         assert_eq!(
-            pipeline::run(source, &output, &settings())
+            pipeline::run(source, &output, &settings(), None)
                 .expect("runs")
                 .pages,
             2
@@ -535,7 +535,7 @@ fn a_directory_holding_no_page_says_so_rather_than_naming_a_format() {
             let output = scratch.join("out.zip");
             let source =
                 Source::open(root, &ReadOptions::default()).expect("a directory always opens");
-            let error = pipeline::run(source, &output, &settings()).expect_err("no pages");
+            let error = pipeline::run(source, &output, &settings(), None).expect_err("no pages");
             assert!(matches!(error, RunError::Empty), "{error}");
 
             let message = error.to_string();

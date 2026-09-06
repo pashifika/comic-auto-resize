@@ -54,7 +54,7 @@ fn run(input: &[u8], output: &Path) -> Result<pipeline::Report, RunError> {
         std::io::Cursor::new(input.to_vec()),
         &ReadOptions::default(),
     )?;
-    pipeline::run(source, output, &settings())
+    pipeline::run(source, output, &settings(), None)
 }
 
 /// A zip holding `entries`, as `(name, bytes)`.
@@ -1126,7 +1126,7 @@ fn two_formats_sharing_a_stem_collide_in_the_output_and_the_run_is_refused() {
     let output = directory.path().join("unnumbered.zip");
     let source = ZipSource::new(std::io::Cursor::new(stored), &by_position()).expect("reads");
     assert!(matches!(
-        pipeline::run(source, &output, &settings()),
+        pipeline::run(source, &output, &settings(), None),
         Err(RunError::NameCollision { .. })
     ));
 
@@ -1137,7 +1137,8 @@ fn two_formats_sharing_a_stem_collide_in_the_output_and_the_run_is_refused() {
     ]);
     let output = directory.path().join("numbered.zip");
     let source = ZipSource::new(std::io::Cursor::new(numbered), &by_position()).expect("reads");
-    let report = pipeline::run(source, &output, &settings()).expect("positions separate them");
+    let report =
+        pipeline::run(source, &output, &settings(), None).expect("positions separate them");
     assert_eq!(report.pages, 2);
     let names: Vec<String> = read_archive(&output)
         .into_iter()

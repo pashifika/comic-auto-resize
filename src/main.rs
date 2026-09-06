@@ -1,19 +1,24 @@
 //! Command-line entry point.
 //!
 //! The surface contains exactly what is implemented. A flag may exist and be unimplemented,
-//! or not exist; it must not exist and silently do the wrong thing — so the three flags Go had
-//! and this build does not are absent rather than accepted and ignored. `--small-skip` will
-//! stay absent: Go's implementation of it is `if !skipSmallSize && doResize`, so passing it
-//! disables resizing for every page rather than skipping the small-ratio ones its name
-//! promises, and the behaviour the name describes is what `policy.rs`'s `MIN_EDGE` floor does
-//! unconditionally. `--show-time` and `--debug` are Go's `Developer Options` group and measure
-//! or instrument that build rather than describe an archive. Absence is the honest form of
-//! "not yet", and for these three it is the honest form of "no".
+//! or not exist; it must not exist and silently do the wrong thing. One flag Go had stays
+//! absent for that reason: `--small-skip`, whose implementation there is `if !skipSmallSize
+//! && doResize`, so passing it disables resizing for every page rather than skipping the
+//! small-ratio ones its name promises — and what the name describes is what `policy.rs`'s
+//! `MIN_EDGE` floor does unconditionally.
+//!
+//! `--debug` and `--show-time` were absent under the same rule, read as instrumenting Go's
+//! build rather than describing an archive. Half of that holds: Go's config dump and its two
+//! cancellation lines describe that build and stay out. The rest — the format and geometry
+//! each page was identified as, and the size it was resized to — is a fact about the archive,
+//! and this build already decides it per page and then reduces it to the counts the summary
+//! line prints. `--debug` names the pages those counts only count; `--show-time` shows the
+//! time `--jobs` trades against memory.
 //!
 //! `--fix-idx` was the first flag added since the rewrite began; `--charset` and `--pwd`
-//! joined it, then `-o/--out` and `--delete-org`, then `-r/--ratio` and `--jobs`, and
-//! `--progressive` and `--optimizer` join now, each in the Change that implements it — which
-//! is that rule read the other way round.
+//! joined it, then `-o/--out` and `--delete-org`, then `-r/--ratio` and `--jobs`, then
+//! `--progressive` and `--optimizer`, and these two join now — each in the Change that
+//! implements it, which is that rule read the other way round.
 //!
 //! `--jobs` is the one flag here with no reference-tool equivalent: the Go implementation
 //! derives its worker count from the host and offers no way to say otherwise. `-r/--ratio`
@@ -39,6 +44,7 @@
 //! to on because that is what the reference tool's help documented and what this build has
 //! written since `native-deps`, so the default is inherited rather than chosen.
 
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -47,11 +53,12 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::LazyLock;
 use std::thread;
+use std::time::Instant;
 
 use clap::{ArgAction, CommandFactory, Parser, builder::TypedValueParser};
 use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter};
 use comic_auto_resize::pipeline::{self, Report, Settings};
-use comic_auto_resize::policy::{AUTO_WIDTH, Target};
+use comic_auto_resize::policy::{AUTO_WIDTH, Plan, Target};
 use comic_auto_resize::sink::{InputKind, durable_directory_entry, resolve_output};
 use comic_auto_resize::source::{Charset, DEFAULT_LABELS, Naming, ReadOptions, Source};
 use thiserror::Error;
@@ -63,7 +70,7 @@ const MAX_WIDTH: i64 = 65535;
 
 /// Auto-resize the pages of a comic archive and repack them as zip.
 ///
-/// Four bools, which is one past what `clippy::pedantic` allows a struct. The lint's remedy —
+/// Six bools, which is past what `clippy::pedantic` allows a struct. The lint's remedy —
 /// a state machine, or two-variant enums — does not apply to this one: the fields are not
 /// state, they are the command-line surface itself, one per flag, and `clap`'s derive reads
 /// the type to decide how the flag parses. An enum here would produce a different surface and
@@ -210,6 +217,20 @@ struct Cli {
     #[arg(long, default_value_t = worker_count(), value_parser = jobs, value_name = "COUNT")]
     jobs: NonZeroUsize,
 
+    /// Trace every page as it is written: its position, name, format, source size, what was
+    /// decided for it, and the bytes it cost before and after. One line per page on standard
+    /// output, in read order at any `--jobs` value, before the run's summary line. The name is
+    /// the entry as the output holds it — the extension is rewritten to `.jpg`, and `--fix-idx`
+    /// renumbers — while the format names what the page was decoded from. Off by default, and
+    /// implies `--show-time`.
+    #[arg(long)]
+    debug: bool,
+
+    /// Print how long the run took, after its summary line and only when it succeeded. Off by
+    /// default.
+    #[arg(long)]
+    show_time: bool,
+
     /// Write this shell's completion script to standard output and exit. Takes `bash`,
     /// `zsh`, `fish` or `powershell`, and nothing else on the command line: no input is
     /// opened and no filesystem state is read, because a script is generated while a shell
@@ -261,6 +282,9 @@ fn main() -> ExitCode {
             )
             .exit()
     };
+    // Taken unconditionally: one clock read is cheaper than deciding whether to take it, and
+    // the span matches the reference tool's — everything the run does, and no argument parsing.
+    let started = Instant::now();
     match run(&cli, input) {
         Ok((report, output)) => {
             // One line for the run, and each extra clause only when the extra thing
@@ -301,6 +325,12 @@ fn main() -> ExitCode {
                 report.pages,
                 output.display()
             );
+            // After the summary line, and on success only: a failed run has an error to
+            // report and no time worth reporting. `--debug` implies it, as in the reference
+            // tool's `ShowTime || Debug`.
+            if cli.show_time || cli.debug {
+                println!("execution time: {:.2}s", started.elapsed().as_secs_f64());
+            }
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -414,13 +444,38 @@ fn run(cli: &Cli, input: &Path) -> Result<(Report, PathBuf), CliError> {
     let output =
         resolve_output(input, kind, cli.out.as_deref()).map_err(|error| presented(input, error))?;
 
+    // The trace's two header lines go out before the first page, so a run that fails part-way
+    // has still said what it was doing. `Cell` because the observer is an `Fn`: it is called
+    // from the writer, which is this thread, so nothing here needs a lock.
+    let totals = Cell::new((0_usize, 0_usize));
+    if cli.debug {
+        println!("debug: {} -> {}", input.display(), output.display());
+        println!("debug: {}", described(cli, &settings));
+    }
+    let observe = |page: pipeline::Trace<'_>| {
+        let (source, encoded) = totals.get();
+        totals.set((
+            source.saturating_add(page.outcome.source_bytes),
+            encoded.saturating_add(page.outcome.encoded_bytes),
+        ));
+        println!("debug: {}", traced(&page));
+    };
+    let trace: Option<&dyn Fn(pipeline::Trace<'_>)> = if cli.debug { Some(&observe) } else { None };
+
     // A `SourceError` raised during iteration would otherwise reach the user through two
     // transparent wrappers with no path at all, while the same error raised inside
     // `Source::open` arrives as `{path}: {source}`. rar is where that shows: it walks headers
     // as it goes, so a damaged entry surfaces here rather than at open. It is one of six
     // failures `presented` names the input on, rather than the one arm it used to be.
-    let report =
-        pipeline::run(source, &output, &settings).map_err(|error| presented(input, error))?;
+    let report = pipeline::run(source, &output, &settings, trace)
+        .map_err(|error| presented(input, error))?;
+    if cli.debug {
+        let (source, encoded) = totals.get();
+        println!(
+            "debug: {} page(s), {source} -> {encoded} bytes",
+            report.pages
+        );
+    }
 
     // `pipeline::run` took the source by value and dropped it before returning, so this
     // process holds no handle to the input — which is what makes the removal safe on Windows.
@@ -584,6 +639,71 @@ fn output(value: OsString) -> Result<PathBuf, &'static str> {
         return Err("an empty value names no path to write");
     }
     Ok(PathBuf::from(value))
+}
+
+/// The resolved settings a page's outcome depends on: `--debug`'s second header line.
+///
+/// Resolved values rather than the `Cli` struct. The reference tool prints its own
+/// configuration type, which describes that build; these are what the run will do.
+fn described(cli: &Cli, settings: &Settings) -> String {
+    let target = match settings.target {
+        Target::Width(width) => format!("{width}px"),
+        Target::Ratio(percent) => format!("{percent}%"),
+    };
+    let charset = cli.charset.names();
+    format!(
+        "target={target} quality={} dct={} filter={} progressive={} optimizer={} jobs={} \
+         naming={} charset={}",
+        settings.encode.quality,
+        settings.encode.dct_method.name(),
+        settings.filter.name(),
+        settings.encode.progressive,
+        settings.encode.optimize_coding,
+        settings.jobs,
+        if cli.fix_idx { "position" } else { "stored" },
+        if charset.is_empty() { "none" } else { &charset },
+    )
+}
+
+/// One page's line for `--debug`.
+///
+/// The resized geometry comes from the plan the run acted on rather than being recomputed, so
+/// the line cannot disagree with the page. The two pass-through arms are distinguished because
+/// only one of them is a reduction the user asked for and did not get.
+fn traced(page: &pipeline::Trace<'_>) -> String {
+    let outcome = page.outcome;
+    let size = match outcome
+        .plan
+        .scale_to(outcome.source_width, outcome.source_height)
+    {
+        Some((width, height)) => format!(
+            "{}x{} -> {width}x{height}",
+            outcome.source_width, outcome.source_height
+        ),
+        None => format!(
+            "{}x{} kept ({})",
+            outcome.source_width,
+            outcome.source_height,
+            if matches!(outcome.plan, Plan::BelowFloor) {
+                "below floor"
+            } else {
+                "at or below target"
+            },
+        ),
+    };
+    format!(
+        "{} {}: {} {size}, {} -> {} bytes{}",
+        page.position.saturating_add(1),
+        page.name,
+        outcome.format.name(),
+        outcome.source_bytes,
+        outcome.encoded_bytes,
+        if outcome.composited {
+            ", composited"
+        } else {
+            ""
+        },
+    )
 }
 
 #[derive(Debug, Error)]

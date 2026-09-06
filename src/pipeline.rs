@@ -222,6 +222,7 @@
 //! push-shaped walk on a thread of its own, and pins the LZMA2 reader to a single thread, so
 //! the count is exactly one and it is this module's choice rather than the host's.
 
+use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
@@ -322,7 +323,50 @@ pub struct Report {
     pub below_floor: u32,
 }
 
+/// What the run decided about one page.
+///
+/// `plan` is the value [`Report::below_floor`] counts, so a page reported as kept at full size
+/// cannot be traced as resized.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Outcome {
+    /// The format the entry's bytes selected.
+    pub format: Format,
+    pub source_width: u32,
+    pub source_height: u32,
+    pub plan: Plan,
+    /// Whether an alpha channel was composited onto white.
+    pub composited: bool,
+    /// The entry as the archive stored it, decompressed.
+    pub source_bytes: usize,
+    /// The page as it was written.
+    pub encoded_bytes: usize,
+}
+
+/// One page, handed to the observer as that page is written.
+///
+/// Borrowed: `name` points into the record the writer holds until the page is written, so an
+/// observer that formats and drops it allocates nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct Trace<'a> {
+    /// Position in read order, from zero.
+    pub position: u32,
+    pub name: &'a str,
+    pub outcome: Outcome,
+}
+
+/// One page's outcome, held from the moment the sink takes the page until it writes it.
+///
+/// Owns the name because [`Sink::accept`] takes the page by value. That is one clone per
+/// page, paid only while an observer is watching.
+struct Record {
+    name: String,
+    outcome: Outcome,
+}
+
 /// Processes every page of `source` into a new archive at `output`.
+///
+/// `trace`, when given, is called once per page as that page is written — so in read order,
+/// at every worker count. A run that passes `None` keeps no record and copies no name.
 ///
 /// # Errors
 ///
@@ -343,6 +387,7 @@ pub fn run<S: Entries + Send>(
     source: S,
     output: &Path,
     settings: &Settings,
+    trace: Option<&dyn Fn(Trace<'_>)>,
 ) -> Result<Report, RunError> {
     let capacities = Capacities::for_jobs(settings.jobs);
 
@@ -401,36 +446,9 @@ pub fn run<S: Entries + Send>(
         drop(done_tx);
 
         // The writer runs here rather than on a worker: it is the one stage that must never
-        // wait on another stage's thread while holding something that stage needs. It is also
-        // where the composited pages are counted, because it is the one stage that sees every
-        // page exactly once and in one thread.
-        let mut composited = 0;
-        let mut below_floor = 0;
-        let mut failure = None;
-        while let Ok(finished) = done_rx.recv() {
-            match finished {
-                Ok(finished) => {
-                    composited += u32::from(finished.composited);
-                    below_floor += u32::from(finished.below_floor);
-                    match sink.accept(finished.page) {
-                        Ok(written) => {
-                            for _ in 0..written {
-                                // The reader may already be gone; that is not a failure.
-                                let _ = credit_tx.send(());
-                            }
-                        }
-                        Err(error) => {
-                            failure = Some(error);
-                            break;
-                        }
-                    }
-                }
-                Err(error) => {
-                    failure = Some(RunError::Page(error));
-                    break;
-                }
-            }
-        }
+        // wait on another stage's thread while holding something that stage needs.
+        let (composited, below_floor, failure) =
+            write_in_order(&mut sink, &done_rx, &credit_tx, trace);
 
         // Disconnect both directions so the reader and the workers stop, whether the loop
         // ended because the work ran out or because a page failed.
@@ -494,13 +512,66 @@ struct Job {
 
 /// One finished page and what the run has to remember about it.
 ///
-/// The flag rides here rather than on [`Page`] because the sink writes bytes and has no use
-/// for the page's provenance; only the tally does.
+/// The outcome rides here rather than on [`Page`] because the sink writes bytes and has no use
+/// for the page's provenance; only the tally and the observer do.
 struct Finished {
     page: Page,
-    composited: bool,
-    /// Whether the floor refused the reduction this page's target asked for.
-    below_floor: bool,
+    outcome: Outcome,
+}
+
+/// The writer stage: takes finished pages, restores read order, and tallies what it wrote.
+///
+/// Returns the two counts and the first failure it met, if any. It is the one stage that sees
+/// every page exactly once and in one thread, which is why both the counting and the tracing
+/// happen here.
+fn write_in_order(
+    sink: &mut Sink,
+    done: &crossbeam_channel::Receiver<Result<Finished, PageError>>,
+    credits: &crossbeam_channel::Sender<()>,
+    trace: Option<&dyn Fn(Trace<'_>)>,
+) -> (u32, u32, Option<RunError>) {
+    let mut composited = 0;
+    let mut below_floor = 0;
+    // Outcomes for pages the sink has taken and not yet written, kept only while an observer
+    // is watching. Bounded by the credit window, like the sink's own map.
+    let mut pending: BTreeMap<PageKey, Record> = BTreeMap::new();
+    while let Ok(finished) = done.recv() {
+        let finished = match finished {
+            Ok(finished) => finished,
+            Err(error) => return (composited, below_floor, Some(RunError::Page(error))),
+        };
+        composited += u32::from(finished.outcome.composited);
+        below_floor += u32::from(matches!(finished.outcome.plan, Plan::BelowFloor));
+        if trace.is_some() {
+            pending.insert(
+                finished.page.key,
+                Record {
+                    name: finished.page.name.clone(),
+                    outcome: finished.outcome,
+                },
+            );
+        }
+        let written = match sink.accept(finished.page) {
+            Ok(written) => written,
+            Err(error) => return (composited, below_floor, Some(error)),
+        };
+        for _ in 0..written {
+            // The sink writes in key order, so the lowest records are the pages it just
+            // wrote, in the order it wrote them.
+            if let Some(observe) = trace
+                && let Some((key, record)) = pending.pop_first()
+            {
+                observe(Trace {
+                    position: key.0,
+                    name: &record.name,
+                    outcome: record.outcome,
+                });
+            }
+            // The reader may already be gone; that is not a failure.
+            let _ = credits.send(());
+        }
+    }
+    (composited, below_floor, None)
 }
 
 /// Reads the archive once, taking a credit before each entry.
@@ -543,6 +614,10 @@ fn process(
         bytes,
     } = job;
 
+    // Before the decode, because `bytes` is what the archive held for this entry and the
+    // trace reports the reduction against it.
+    let source_bytes = bytes.len();
+
     // The header first, because the resize policy needs the source geometry to choose both
     // the target height and whether to resize at all, and a scaled decode cannot be
     // configured before that is known. The budget refusal itself is inside `decode`, at the
@@ -572,9 +647,16 @@ fn process(
     let bytes = encode(&name, &page, settings.encode)?;
 
     Ok(Finished {
+        outcome: Outcome {
+            format,
+            source_width,
+            source_height,
+            plan,
+            composited: decoded.composited,
+            source_bytes,
+            encoded_bytes: bytes.len(),
+        },
         page: Page { key, name, bytes },
-        composited: decoded.composited,
-        below_floor: matches!(plan, Plan::BelowFloor),
     })
 }
 
