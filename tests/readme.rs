@@ -5,7 +5,7 @@ use std::process::Command;
 
 fn long_option(token: &str) -> Option<&str> {
     let name = token
-        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '=' | '['))
         .next()?;
     name.strip_prefix("--")
         .filter(|name| !name.is_empty())
