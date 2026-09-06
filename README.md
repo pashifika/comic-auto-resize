@@ -1,39 +1,142 @@
-comic-auto-resize
-=================
+# comic-auto-resize
 
-A manga archive auto-resize tool: it opens a compressed comic file, shrinks every page,
-and writes a new zip — all in memory, without unpacking to disk.
+Shrink comic archives by resizing their pages, keeping line art clear and saving storage space.
 
-## Status
+## Features
 
-**This branch is a Rust rewrite in progress and does not work yet.**
+- **Archive inputs:** read zip, rar, 7z, or a directory of pages; write a zip archive.
+- **Image inputs:** read JPEG, PNG, BMP, and WebP pages; encode resized pages as JPEG.
+- **Resize choices:** fit pages to a common width or reduce each by a percentage.
+- **Originals kept:** write a separate archive; remove the input only when you request it.
 
-| branch | contents |
+## Install
+
+Each `v2` release publishes a native archive per platform on the
+[Releases page](https://github.com/pashifika/comic-auto-resize/releases), alongside a
+`SHA256SUMS` file:
+
+| Platform | Asset |
 |---|---|
-| `master` | The shipped Go implementation, v1.1.2. Frozen; it is the reference the rewrite is measured against. |
-| `main` | The Rust rewrite. Currently a skeleton with CI and repository policy only. |
-| `dev/2.0.x` | Integration line for the rewrite. |
+| Windows x86-64 | `comic-auto-resize-<tag>-x86_64-pc-windows-msvc.zip` |
+| Apple Silicon macOS | `comic-auto-resize-<tag>-aarch64-apple-darwin.tar.gz` |
 
-`master` remains the repository default branch until the rewrite reaches feature parity.
-Until then, use `master` — see its [README](https://github.com/pashifika/comic-auto-resize/blob/master/README.md)
-for the tool as it currently ships.
+Releases tagged `v1.x` are the older Go implementation and are not built from this source.
+If the page lists no `v2` release yet, build from source with the steps below.
 
-## Why rewrite
+Download the archive for your platform and `SHA256SUMS`, check the file against the list,
+then unpack it. The commands below use Bash (Git Bash on Windows):
 
-The Go implementation holds every page of an archive in memory at once, so peak usage
-grows with page count rather than with page size. It also carries four checked-in static
-libraries to link mozjpeg. The rewrite streams pages through a bounded pipeline, so peak
-memory is a function of worker count alone, and builds mozjpeg from source.
+```bash
+sha256sum --ignore-missing --check SHA256SUMS
 
-Behaviour is otherwise intended to match v1.1.2, with a handful of confirmed defects
-corrected rather than reproduced.
+# Windows
+unzip comic-auto-resize-<tag>-x86_64-pc-windows-msvc.zip
+./comic-auto-resize-<tag>-x86_64-pc-windows-msvc/comic-auto-resize.exe --version
+
+# macOS
+tar -xzf comic-auto-resize-<tag>-aarch64-apple-darwin.tar.gz
+./comic-auto-resize-<tag>-aarch64-apple-darwin/comic-auto-resize --version
+```
+
+Each archive holds one directory containing the executable, `LICENSE`, `NOTICE.md`,
+`THIRD-PARTY-LICENSES.txt`, and a `VERSION` file naming the version, tag, target, and
+source commit. Nothing else is required to run it — no Rust, no C compiler, no separately
+installed runtime library.
+
+The binaries are **not code-signed or notarized**. A checksum proves the file arrived
+intact from the release you selected; it says nothing about who built it. macOS Gatekeeper
+and Windows SmartScreen will therefore warn on first run. Clear that warning for this file
+alone — on macOS, `xattr -d com.apple.quarantine <path>` after checking the checksum — or
+build from source instead. Do not turn a security control off system-wide.
+
+## Build from source
+
+Install Git, [rustup](https://rustup.rs/), and a C/C++ compiler; x86 builds also need `nasm`.
+See [prerequisites](CONTRIBUTING.md#prerequisites) for platform setup and Git authentication.
+The commands below use Bash (Git Bash on Windows).
+
+```bash
+git clone --branch dev/2.0.x https://github.com/pashifika/comic-auto-resize.git
+cd comic-auto-resize
+cargo build --locked --release
+./target/release/comic-auto-resize --help
+```
+
+The executable is `target/release/comic-auto-resize` (`comic-auto-resize.exe` on Windows).
+The first build takes minutes because it compiles mozjpeg from source; a prebuilt archive
+from [Install](#install) needs no toolchain at all.
+
+## Usage
+
+Place a copy of your comic archive in the cloned directory as `volume.zip`, then run:
+
+```bash
+./target/release/comic-auto-resize volume.zip
+```
+
+This writes `volume_resize.zip` beside the input, targeting a width of 1280 pixels.
+It keeps the original. Pages are never enlarged; pages that are too small to resize safely
+are kept unchanged. Existing output files are refused, not overwritten.
+
+To reduce each page to 70% of its own width instead:
+
+```bash
+./target/release/comic-auto-resize -r 70 -o volume-70.cbz volume.zip
+```
+
+This writes a zip archive named `volume-70.cbz`; no extra extension is added.
+For a 960-pixel target with baseline JPEG pages for older viewers:
+
+```bash
+./target/release/comic-auto-resize --auto-width 960 --progressive=false -o volume-960.zip volume.zip
+```
+
+This writes `volume-960.zip`. The height follows each page's aspect ratio.
+Use an archive or a directory path in place of `volume.zip` for your own books.
+
+## Options
+
+These are the binary's long options. Run `--help` for accepted values, defaults, and trade-offs.
+
+| Option | Summary |
+|---|---|
+| `--out <PATH>` | Output filename, or an existing directory for the default name (`-o`). |
+| `--delete-org` | Delete the input archive only after successful output; refused for directories. |
+| `--auto-width <PIXELS>` | Target a common page width; defaults to 1280. |
+| `--ratio <PERCENT>` | Use 1–100% of each page's width (`-r`); cannot combine with `--auto-width`. |
+| `--quality <QUALITY>` | Set JPEG quality from 1 to 100 (`-q`); defaults to 90. |
+| `--dct <DCT>` | Select the JPEG DCT/IDCT method. |
+| `--progressive[=<BOOL>]` | Write progressive JPEGs by default; `--progressive=false` selects baseline. |
+| `--optimizer[=<BOOL>]` | Optimise entropy coding by default; disabling takes effect with baseline JPEGs. |
+| `--resize-mode <RESIZE_MODE>` | Select interpolation; defaults to `lanczos3`. |
+| `--fix-idx` | Replace trailing page numbers with read-order positions within each directory. |
+| `--charset <LIST>` | Try encodings for undeclared archive entry names; defaults to `ja,zh`. |
+| `--pwd <PASSWORD>` | Decrypt ZipCrypto zip or encrypted rar; AES zip and encrypted 7z are unsupported. |
+| `--jobs <COUNT>` | Set parallel page workers; lower the count to reduce memory use. |
+| `--completions <SHELL>` | Print a Bash, Zsh, Fish, or PowerShell completion script; use alone. |
+| `--help` | Print help (`-h`). |
+| `--version` | Print the version (`-V`). |
+
+## Coming from v1.1.2
+
+- `-r 70` now means 70% of each page's width, not “fit to 1280”. Remove it to keep the old width target.
+- `-r` has no default percentage. Without it, `--auto-width` controls resizing and defaults to 1280.
+- `--small-skip` is absent. Small-page protection is always applied; the old flag disabled all resizing, not just small-page resizing.
+- `-o out.cbz` writes `out.cbz`, not `out.cbz.zip`.
+
+## Requirements
+
+Native verification targets Windows x86-64 and Apple Silicon macOS, and the published
+archives are built and exercised on those two targets rather than cross-compiled. A
+prebuilt archive needs nothing installed. Building from source requires Rust 1.93 or newer;
+`rust-toolchain.toml` selects the tested toolchain through rustup. Build dependencies and
+platform setup are in [CONTRIBUTING.md](CONTRIBUTING.md#prerequisites).
 
 ## Contributing
 
-[`CONTRIBUTING.md`](CONTRIBUTING.md) covers the toolchain, how to build, the verification
-sequence to run before opening a pull request, and the branch flow.
-[`CLAUDE.md`](CLAUDE.md) covers the architecture and the decisions behind it.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers builds, verification, and pull requests.
+[CLAUDE.md](CLAUDE.md) covers architecture and project decisions.
 
 ## Licence
 
-Apache-2.0. See [`LICENSE`](LICENSE).
+[Apache-2.0](LICENSE). [NOTICE.md](NOTICE.md) carries third-party notices.

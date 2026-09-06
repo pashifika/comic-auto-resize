@@ -1,12 +1,14 @@
 [package]
 name = "comic-auto-resize"
-version = "2.0.0-dev"
+version = "2.0.0"
 edition = "2024"
 # The crate's own floor, separate from the channel pinned in `rust-toolchain.toml`.
-# Raised from 1.85 to 1.87 because `fast_image_resize` 6.1.0 declares 1.87; nothing here
-# needs more yet. Later changes raise it when a dependency actually demands it, not
-# pre-emptively.
-rust-version = "1.87"
+# Raised from 1.88 to 1.93 because `sevenz-rust2` 0.22.2 declares 1.93; `zip` 8.6.0 declares
+# 1.88 and was the previous reason. Pinning `sevenz-rust2` 0.20.2 to keep 1.85 instead would
+# give up the path-traversal fix, the malformed-archive hardening, the coder-stream-count
+# overflow fix and the Delta/BCJ2 folder fix. Lowering the floor again means dropping a
+# dependency, so the one that demands it is named rather than left to be bisected for.
+rust-version = "1.93"
 description = "Auto-resize the pages of a comic archive and repack them as zip"
 license = "Apache-2.0"
 repository = "https://github.com/pashifika/comic-auto-resize"
@@ -27,21 +29,183 @@ pedantic = "deny"
 
 [dependencies]
 clap = { version = "=4.6.6", features = ["derive"] }
+# Static completion-script generation over the same `clap::Command` the parser is built from.
+# Exact, like every other pin here: a generated artifact that changes underneath a previously
+# green run is the hardest kind of failure to attribute.
+#
+# The feature set is stated rather than inherited, and the measurement is what makes the line
+# honest: this crate's default set is *empty* (`default = []`), so `default-features = false`
+# subtracts nothing today. It is written anyway because the one capability this binary cannot
+# use — the runtime completion engine, which completes from a live process rather than from a
+# script a shell sources at startup — sits behind `unstable-dynamic`, and writing the empty set
+# explicitly makes a version bump that adds a default a decision instead of an inheritance.
+clap_complete = { version = "=4.6.9", default-features = false }
+# The pipeline's queues. Bounded MPMC is the primitive it needs — many workers drawing
+# from one queue, with a declared capacity — and `std::sync::mpsc` is single-consumer, so
+# sharing a `Receiver` would mean holding a lock across a blocking `recv`. Chosen over
+# `rayon`, whose work-stealing a fixed pool draining one queue never uses, and whose
+# global pool is what makes a blocking send from inside a task a deadlock risk. Nothing
+# here runs on a shared pool.
+crossbeam-channel = "=0.5.16"
+# Entry-name decoding for a container that declares no encoding. Deliberately the whole
+# crate: it cannot be subsetted, measured — naming one static (`SHIFT_JIS`) costs 0.5% less
+# than the full WHATWG label lookup, because `new_variant_decoder` matches every variant and
+# makes every table reachable. So `--charset` takes any label an *ASCII-compatible* encoding
+# answers to rather than a curated list, which buys generality for nothing; the qualifier is
+# load-bearing, because an encoding that swallows the `2E` of `.jpg` would make the extension
+# filter drop the page. Licence `(Apache-2.0 OR MIT) AND BSD-3-Clause`: a conjunction, so the
+# `BSD-3-Clause` term is not optional — see `deny.toml`, where the entry is shared with
+# `mozjpeg-sys` and removable against neither.
+encoding_rs = "=0.8.35"
 # Both pinned exactly: a native build that changes underneath a previously green run is
 # the hardest kind of failure to attribute.
 fast_image_resize = "=6.1.0"
+# Named directly because `zip` declares `flate2` with defaults off and only its
+# `deflate-flate2-zlib-*` variants pick a backend, so choosing one needs a direct dependency.
+# `rust_backend` is `miniz_oxide`, pure safe Rust; `zlib-rs` is faster but a large translated C
+# body, and inflate here reads JPEG, which Deflate keeps in stored blocks. Swap both lines to
+# `deflate-flate2-zlib-rs` if the reader ever measures as the bottleneck. The test support
+# module also uses its `Crc`, which is the checksum `zip` verifies entries against.
+flate2 = { version = "=1.1.10", default-features = false, features = ["rust_backend"] }
+# png, bmp and webp decoding — one crate for three decoders rather than `png`, `image-webp`
+# and a hand-written BMP reader, which would save three crates and cost a BMP implementation.
+# BMP is a family of seven compression schemes and five header generations; measured, `image`
+# reads 27 of the conformance suite's 27 valid files and refuses the rest by name.
+#
+# Defaults refused for three of the four reasons the dependency policy recognises, and the
+# fourth is recorded as not applying:
+#
+# - **A recorded decision contradicted.** The defaults enable `rayon`, which the
+#   `crossbeam-channel` comment above already rejected — "whose global pool is what makes a
+#   blocking send from inside a task a deadlock risk. Nothing here runs on a shared pool."
+#   This is not unused capability; enabling it would put back what that comment ruled out.
+# - **Capability the binary cannot use.** The defaults reach `rav1e`, `ravif`,
+#   `avif-serialize`, `exr`, `gif`, `qoi` and `tiff` for formats nothing here asks for.
+# - **Supply-chain surface, measured.** +77 crates against +9 for these three, and the
+#   defaults add a second duplicate version — `syn` 1 and 3 through `rav1e` — on top of the
+#   `miniz_oxide` one `png` causes by itself.
+# - **Licence is not a reason here**, and that is stated rather than left out: `cargo deny`
+#   reports `licenses ok` on the defaults, so a reader who finds features disabled beside a
+#   green licence check does not read this comment as stale.
+#
+# Per-feature cost on this graph, so one of the three can be dropped without a new survey:
+# `bmp` +4 crates, `png` +7, `webp` +6, all three +9. `png` alone is what trips
+# `multiple-versions` — see the `skip` entry in `deny.toml`. Figures and the binary-size
+# delta: `rasen/changes/image-decoders/evidence/dependency.md`.
+image = { version = "=0.25.10", default-features = false, features = ["bmp", "png", "webp"] }
 mozjpeg = "=0.10.13"
+# Not a new crate: `mozjpeg` already builds it. Direct only for libjpeg's `JWRN_*`
+# message-code constants, which the corruption policy classifies by — the alternative is
+# hard-coded integers from a C enum. Features are left off here so the native build stays
+# entirely `mozjpeg`'s to configure.
+mozjpeg-sys = { version = "=2.2.3", default-features = false }
+# 7z reading, pure Rust — no build script and no C, unlike rar. Defaults are refused for a
+# licence reason rather than a size one, which is the difference `deny.toml` cares about:
+# `bzip2` reaches `libbz2-rs-sys` declaring `bzip2-1.0.6` and `ppmd` reaches `ppmd-rust`
+# declaring `CC0-1.0 OR MIT-0`, and neither `bzip2-1.0.6` nor `MIT-0` is in the allow-list, so
+# `cargo deny` refuses the build outright. `compress` (writing, and the output is zip) and
+# `util` (whole-archive extraction to disk, which this pipeline never does) are off because
+# they are capability the binary cannot use.
+#
+# `aes256` is off for a third reason, and it is neither of those two: **supply-chain surface**.
+# It is a real capability, `cargo deny` passes on it clean, and it is declined anyway — 15
+# crates for reading an archive no sample in `samples/` is, and 7z's only encryption method is
+# AES-256, so an encrypted 7z is refused by name at open instead. Measured, so a later Change
+# can reverse this without a new survey: +15 crates, +16,672 B, and 12 of those crates shared
+# with `zip`'s `aes-crypto`. See `rasen/changes/entry-name-charset/evidence/dependency.md`.
+#
+# What remains covers Copy, LZMA, LZMA2, BCJ, BCJ2 and Delta — 7-Zip writes LZMA2 by
+# default and Copy for "store", so an ordinary comic archive is read.
+#
+# No `[patch.crates-io]` entry: the entry reader is handed `&mut dyn Read`, so
+# `MAX_ENTRY_BYTES` applies to the read itself with no fork, which is what rar needed one for.
+sevenz-rust2 = { version = "=0.22.2", default-features = false }
 # Already in the tree through `fast_image_resize`, so it adds no dependency and no new
 # licence: typed page errors the pipeline can branch on, without hand-written `Display`.
 thiserror = "=2.0.20"
-
-# Temporary. `mozjpeg` 0.10.13 exposes `Decompress::dct_method` but no encoder-side
-# counterpart, and `Compress` keeps `cinfo` private, so `--dct` cannot reach the
-# compressor through the released crate. The fork is the v0.10.13 tag plus one commit
-# adding `Compress::set_dct_method`, and nothing else.
+# rar reading, through RARLAB's own UnRAR compiled from vendored C++. Named at its
+# published version and redirected below; `[patch.crates-io]` carries why the fork exists.
+# `default-features = false` drops `linux-batch-extract-utf8`, which defines a cc flag only
+# on non-Apple non-Windows Unix — neither release target — and patches a batch-extract path
+# this crate never calls.
 #
-# Exit condition: https://github.com/ImageOptim/mozjpeg-rust/pull/54 landing in a
-# release. When it does, this section and the matching `allow-git` entry in `deny.toml`
-# are deleted together and the requirement above is raised to that release.
+# `unrar-ng-sys` is deliberately not named here. `mozjpeg-sys` is, because the corruption
+# policy reads its `JWRN_*` constants; there is no equivalent here, and `unsafe_code =
+# "forbid"` means this crate could not call the FFI even if it wanted to.
+unrar-ng = { version = "=0.7.7", default-features = false }
+# Reading needs Deflate; writing uses Stored, because JPEG data does not compress. So one
+# backend, and defaults off to keep `bzip2`, `deflate64`, `lzma`, `ppmd`, `time`, `zstd`, and
+# `xz` out of a binary that cannot invoke them. An entry in one of
+# those codings is reported as unsupported rather than skipped.
+#
+# `aes-crypto` is off for a different reason from those, and the manifest has to say which:
+# **supply-chain surface**. AES is a real capability whose licence check passes clean, and it
+# is declined for 19 crates in service of reading an archive no sample in `samples/` is. An
+# AES-encrypted entry is refused by form rather than mis-read. Measured: +19 crates, +34,352 B,
+# 12 shared with `sevenz-rust2`'s `aes256`. ZipCrypto needs no feature at all — `mod zipcrypto`
+# is unconditional — so `--pwd` reads a classic-encrypted zip in this build.
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
+
+# Temporary, for two things the released crate cannot do. `--dct` cannot reach the
+# compressor, because `Compress` keeps `cinfo` private. And libjpeg's recoverable warnings
+# are discarded, because `emit_message` is an empty function, so a page libjpeg repaired
+# by fabricating coefficients decodes as if it were sound.
+#
+# The fork is the v0.10.13 tag (306a7da0) plus exactly three commits: `set_dct_method`, the
+# warning accessors, and a follow-up that reports warnings from `finish` — libjpeg reads on
+# to the end-of-image marker there and warns about extraneous data before it — and holds the
+# error manager as a raw pointer, because `cinfo.common.err` points into that allocation and
+# a `Box` deref asserts uniqueness over it.
+#
+# Exit condition: both upstream pull requests landing in a release —
+# https://github.com/ImageOptim/mozjpeg-rust/pull/54 (`set_dct_method`) and
+# https://github.com/ImageOptim/mozjpeg-rust/pull/55 (warnings, carrying the follow-up).
+# This section and the `allow-git` entry in `deny.toml` are deleted together once both have.
 [patch.crates-io]
-mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "58f4e0ef91f2a0c477140734ef8b3fe5403befc3" }
+mozjpeg = { git = "https://github.com/pashifika/mozjpeg-rust.git", rev = "a3effde52b989b6fb93d7fbf854869fa7931e4af" }
+
+# rar, from a fork carrying three commits. Taken out because neither upstream can be relied on
+# to answer in time: `muja/unrar.rs`, the original, has had one commit in sixteen months
+# with twenty issues open, and `ttys3/unrar.rs`, the maintained line this forks, is one
+# person with five stars. Doing the paperwork — this block, the `allow-git` entry, the CI
+# run — before anything was broken is what let the first fix land the same day it was
+# needed.
+#
+# Drift: 3 commits on top of v0.7.7.
+#
+# What it carries:
+#
+# - `DataSink` and `OpenArchive::read_into`, letting the caller's sink abort a read part-way.
+#   Without it `read` accumulates a whole entry into a `Vec` with no way to stop, so
+#   `src/source/rar.rs` could not apply `MAX_ENTRY_BYTES` to the read itself the way
+#   `src/source/zip.rs` does — it could only check the size the archive claims, and a check
+#   that trusts the number it is validating is not a check. libunrar always supported the
+#   abort (`vendor/unrar/rdwrfn.cpp` exits on a callback returning -1 for `UCM_PROCESSDATA`);
+#   only the Rust wrapper's hardcoded 0 stood in the way.
+# - `Send` for the archive handle. `pipeline::run` opens the source before creating the sink
+#   — so a bad archive fails before an output file exists — and then moves it to the reader
+#   thread. Nothing claimed `Send` for a raw `NonNull`, so that move did not compile. This
+#   crate cannot add the impl itself: it declares `unsafe_code = "forbid"`.
+# - Two fixes to the above, found by adversarial review rather than by use. An entry name
+#   longer than 1023 characters came back cut, because `HeaderDataEx::FileNameW` is a fixed
+#   `[wchar_t; 1024]` — which made a page with a deep path vanish from the archive silently,
+#   the one outcome this project refuses. And the `Send` impl was unsound as justified: a
+#   thread sanitiser found races in libunrar's process-wide state, so it now rests on a lock
+#   inside the fork rather than on per-archive ownership.
+#
+# Not offered upstream yet, and that is a decision rather than an omission: contributing to
+# a third party's repository is the maintainer's call, not this Change's. The shape was
+# built to be offerable — a general sink that serves any caller needing to bound or stream,
+# not a `read_bounded(limit)` cut to this project's measurements — so the decision stays
+# open rather than foreclosed.
+#
+# Exit condition: the change stops being needed, which means either this project stops
+# reading rar or an upstream release carries an equivalent abort seam. This block and the
+# `allow-git` entry in `deny.toml` are deleted together.
+#
+# Only `unrar-ng` is patched, and that is measured rather than assumed: it declares
+# `unrar-ng-sys` as a `path` dependency inside the same repository, so the sys crate
+# resolves out of this git checkout too and `Cargo.lock` records both at this revision. A
+# second entry here would be redundant. The pin is by revision because `required-git-spec
+# = "rev"` makes a branch or tag a policy violation, not merely a bad habit.
+unrar-ng = { git = "https://github.com/pashifika/unrar.rs.git", rev = "ca9cb595a9a3fd45c9f2d6eafe76f8610693a5b3" }

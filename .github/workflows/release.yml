@@ -1,0 +1,491 @@
+name: Release
+
+# Two triggers, one of which can publish. A tag push is the public-release authorization
+# boundary; `workflow_dispatch` exists to exercise everything up to it and stop. The `v*`
+# filter is broad because GitHub tag filters are globs — the grammar that decides what may
+# publish is anchored in `.github/scripts/release.py`, not here.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit, branch, or tag to build without publishing
+        required: true
+        default: main
+        type: string
+
+# Least privilege by default. Exactly one job below widens this, and only for the write it
+# needs.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Everything a publication depends on is decided here, once, from a full checkout: the
+  # tag grammar, the version it must agree with, the commit it must resolve to, the branch
+  # that must contain it, the CI that must have passed for it, and the default branch this
+  # workflow must have been read from.
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # Read-only, and needed for one question the Git history cannot answer: did CI
+      # succeed for this exact commit on main.
+      actions: read
+    outputs:
+      version: ${{ steps.validate.outputs.version }}
+      tag: ${{ steps.validate.outputs.tag }}
+      commit: ${{ steps.validate.outputs.commit }}
+      publish: ${{ steps.validate.outputs.publish }}
+      matrix: ${{ steps.validate.outputs.matrix }}
+    steps:
+      - name: Check out the selected release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - name: Validate version and release provenance
+        id: validate
+        timeout-minutes: 5
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          # Quoted through the environment rather than interpolated into a shell program:
+          # a ref is attacker-influenced text.
+          SELECTED_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+        run: >-
+          python3 -B .github/scripts/release.py preflight
+          --event-name "$EVENT_NAME"
+          --ref-name "$SELECTED_REF"
+          --event-sha "$EVENT_SHA"
+          --github-repository "$RELEASE_REPOSITORY"
+          --github-output "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    # `python3` is not a reliable name on the Windows image; `ci.yml` reaches for `python`
+    # there for the same reason. Resolved once per row rather than at every call site.
+    env:
+      PYTHON: ${{ matrix.target == 'x86_64-pc-windows-msvc' && 'python' || 'python3' }}
+    steps:
+      - name: Check out the validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+
+          channel="$(tr -d '\r' < rust-toolchain.toml | sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p')"
+          if [ -z "${channel}" ]; then
+            echo "::error::could not read the pinned channel from rust-toolchain.toml"
+            exit 1
+          fi
+          echo "pinned channel: ${channel}"
+
+          rustup toolchain install "${channel}" --profile minimal --no-self-update
+          rustup default "${channel}"
+
+      - name: Confirm the native runner and host
+        shell: bash
+        timeout-minutes: 5
+        env:
+          EXPECTED_HOST: ${{ matrix.host }}
+          EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+          TARGET: ${{ matrix.target }}
+        run: >-
+          "$PYTHON" -B .github/scripts/release.py verify-runner
+          --runner-arch "$RUNNER_ARCH"
+          --expected-runner-arch "$EXPECTED_RUNNER_ARCH"
+          --expected-host "$EXPECTED_HOST"
+          --target "$TARGET"
+
+      # The same provisioning `ci.yml` performs, pinned to the same package, digest and
+      # reported version. The two copies are compared by `test_release.py`, so bumping one
+      # alone fails the gate instead of quietly shipping a differently assembled mozjpeg.
+      - name: Provision nasm
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        timeout-minutes: 10
+        env:
+          NASM_PACKAGE_VERSION: 3.2.0
+          NASM_VERSION: "3.02"
+          NASM_NUPKG_SHA512: 78a722fac25a736929a1171bf6bb9a54fa3e373532b114ab364f7479e15663b50749a89d1c0b54367125eb2d73f7c616487a5745fae5ea06d41480ec8f95ca88
+        run: |
+          set -euo pipefail
+
+          package_dir="$(cygpath --unix "${RUNNER_TEMP}")/nasm-package"
+          mkdir -p "${package_dir}"
+          nupkg="${package_dir}/nasm.${NASM_PACKAGE_VERSION}.nupkg"
+
+          curl --fail --silent --show-error --location --output "${nupkg}" \
+            "https://community.chocolatey.org/api/v2/package/nasm/${NASM_PACKAGE_VERSION}"
+          printf '%s  %s\n' "${NASM_NUPKG_SHA512}" "${nupkg}" | sha512sum --check --strict -
+
+          choco install nasm --yes --no-progress --force --allow-downgrade \
+            --version "${NASM_PACKAGE_VERSION}" \
+            --source "$(cygpath --windows "${package_dir}")"
+
+          nasm_dir='/c/Program Files/NASM'
+          printf '%s\n' 'C:\Program Files\NASM' >> "${GITHUB_PATH}"
+          export PATH="${nasm_dir}:${PATH}"
+
+          if ! command -v nasm >/dev/null 2>&1; then
+            echo "::error::nasm is absent after installation; mozjpeg-sys would drop SIMD"
+            exit 1
+          fi
+
+          installed="$(nasm -v | tr -d '\r' | sed -n 's/^NASM version \([^ ]*\).*$/\1/p')"
+          if [ "${installed}" != "${NASM_VERSION}" ]; then
+            echo "::error::expected NASM ${NASM_VERSION} on PATH but found '${installed:-unknown}'"
+            exit 1
+          fi
+          nasm -v
+
+      # Same assertion as `ci.yml`: a 7z suite that skipped every test is not a suite that
+      # passed, and this build is what the release is cut from.
+      - name: Confirm a 7-Zip archiver is available
+        shell: bash
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          for program in 7zz 7z; do
+            if command -v "${program}" >/dev/null 2>&1; then
+              "${program}" i >/dev/null
+              echo "7z fixtures will be written by $(command -v "${program}")"
+              exit 0
+            fi
+          done
+
+          echo "::error::no 7-Zip archiver on PATH; every test in tests/sevenz_source.rs would skip"
+          exit 1
+
+      - name: Test the validated commit natively
+        shell: bash
+        timeout-minutes: 30
+        run: cargo test --locked --all-features
+
+      # `+crt-static` on Windows only, and set on this step rather than the job so the test
+      # compilation above stays the one `ci.yml` also produces. `cc` reads the same target
+      # feature and switches mozjpeg's C objects to `/MT`, which is what actually removes
+      # the redistributable — the import check below is what proves it happened.
+      - name: Build the release binary and confirm release SIMD survived
+        shell: bash
+        timeout-minutes: 30
+        env:
+          RUSTFLAGS: ${{ matrix.target == 'x86_64-pc-windows-msvc' && '-C target-feature=+crt-static' || '' }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          cargo build --locked --release
+
+          configs=(target/release/build/mozjpeg-sys-*/out/include/jconfig.h)
+          if [ "${#configs[@]}" -eq 0 ]; then
+            echo "::error::the release build produced no mozjpeg-sys jconfig.h; its build script did not run"
+            exit 1
+          fi
+
+          for config in "${configs[@]}"; do
+            if ! grep -q 'define WITH_SIMD 1' "${config}"; then
+              echo "::error::${config} has no WITH_SIMD; the shipped release links jsimd_none.c"
+              exit 1
+            fi
+            echo "mozjpeg-sys: WITH_SIMD confirmed in ${config}"
+          done
+
+      - name: Inspect the shipped binary's runtime dependencies
+        shell: bash
+        timeout-minutes: 5
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [ "${TARGET}" = "x86_64-pc-windows-msvc" ]; then
+            suffix=".exe"
+          fi
+          "$PYTHON" -B .github/scripts/release.py inspect-linkage \
+            --executable "target/release/comic-auto-resize${suffix}" \
+            --target "${TARGET}"
+
+      - name: Collect the third-party licences this target links
+        shell: bash
+        timeout-minutes: 10
+        env:
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: >-
+          "$PYTHON" -B .github/scripts/release.py licenses
+          --target "$TARGET"
+          --version "$VERSION"
+          --commit "$COMMIT"
+          --output "${RUNNER_TEMP}/THIRD-PARTY-LICENSES.txt"
+
+      - name: Convert a generated comic archive with the built binary
+        shell: bash
+        timeout-minutes: 10
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          suffix=""
+          if [ "${TARGET}" = "x86_64-pc-windows-msvc" ]; then
+            suffix=".exe"
+          fi
+          "$PYTHON" -B .github/scripts/release_smoke.py smoke \
+            --executable "target/release/comic-auto-resize${suffix}" \
+            --version "$VERSION" \
+            --work-directory "${RUNNER_TEMP}/build-smoke"
+
+      - name: Build and reinspect the deterministic package
+        shell: bash
+        timeout-minutes: 10
+        env:
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: >-
+          "$PYTHON" -B .github/scripts/release.py package
+          --binary-directory "${GITHUB_WORKSPACE}/target/release"
+          --third-party-licenses "${RUNNER_TEMP}/THIRD-PARTY-LICENSES.txt"
+          --output-directory "${RUNNER_TEMP}/release-package"
+          --target "$TARGET"
+          --version "$VERSION"
+          --tag "$TAG"
+          --commit "$COMMIT"
+
+      - name: Upload the target-named workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 10
+        with:
+          name: release-package-${{ matrix.target }}
+          path: ${{ runner.temp }}/release-package/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  aggregate:
+    name: aggregate
+    needs:
+      - preflight
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download every target artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 10
+        with:
+          pattern: release-package-*
+          path: ${{ runner.temp }}/release-input
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Require and verify the complete archive set
+        timeout-minutes: 5
+        env:
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: >-
+          python3 -B .github/scripts/release.py aggregate
+          --input-directory "${RUNNER_TEMP}/release-input"
+          --output-directory "${RUNNER_TEMP}/release-verified"
+          --version "$VERSION"
+          --tag "$TAG"
+          --commit "$COMMIT"
+
+      - name: Upload the verified release asset set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        timeout-minutes: 10
+        with:
+          name: verified-release-assets
+          path: ${{ runner.temp }}/release-verified/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  # The only job that can write. Its condition repeats what preflight already decided,
+  # independently: a manual rehearsal cannot reach this job even if it selected a valid
+  # release tag, because `github.event_name` is not a value preflight controls.
+  publish:
+    name: publish
+    needs:
+      - preflight
+      - build
+      - aggregate
+    if: >-
+      ${{
+        needs.preflight.result == 'success' &&
+        needs.build.result == 'success' &&
+        needs.aggregate.result == 'success' &&
+        needs.preflight.outputs.publish == 'true' &&
+        github.event_name == 'push' &&
+        github.ref == format('refs/tags/{0}', needs.preflight.outputs.tag)
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    # Serialized per validated tag, and never cancelled: interrupting a publisher
+    # mid-upload is how a release ends up half-populated.
+    concurrency:
+      group: release-${{ needs.preflight.outputs.tag }}
+      cancel-in-progress: false
+    steps:
+      - name: Check out the validated publication source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the verified release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        timeout-minutes: 10
+        with:
+          name: verified-release-assets
+          path: ${{ runner.temp }}/release-publish
+          digest-mismatch: error
+
+      - name: Reverify the publication boundary
+        timeout-minutes: 5
+        env:
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: >-
+          python3 -B .github/scripts/release.py verify-set
+          --directory "${RUNNER_TEMP}/release-publish"
+          --version "$VERSION"
+          --tag "$TAG"
+          --commit "$COMMIT"
+
+      # `main` can advance outside the workflow tree between preflight and here, so the
+      # conditions are read again rather than inherited from a job that ran an hour ago.
+      - name: Revalidate current main publication compatibility
+        timeout-minutes: 5
+        env:
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: >-
+          python3 -B .github/scripts/release.py verify-publication-source
+          --commit "$COMMIT"
+          --github-repository "$RELEASE_REPOSITORY"
+
+      - name: Create or resume and publish the verified release
+        timeout-minutes: 15
+        env:
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh --version
+          python3 -B .github/scripts/release_publish.py \
+            --repo "$RELEASE_REPOSITORY" \
+            --assets-directory "${RUNNER_TEMP}/release-publish" \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --commit "$COMMIT" \
+            --run-url "$RUN_URL"
+
+  # What a user actually receives. These jobs take the bytes from the public Release rather
+  # than from the build workspace or the Actions artifact store, because an artifact nobody
+  # can download without a GitHub account is not a distribution.
+  verify-published:
+    name: verify-published (${{ matrix.name }})
+    needs:
+      - preflight
+      - publish
+    if: needs.publish.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    env:
+      PYTHON: ${{ matrix.target == 'x86_64-pc-windows-msvc' && 'python' || 'python3' }}
+    steps:
+      - name: Check out the validated commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download the published release assets
+        shell: bash
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/download"
+          gh release download "$TAG" \
+            --repo "$RELEASE_REPOSITORY" \
+            --dir "${RUNNER_TEMP}/download"
+          ls -l "${RUNNER_TEMP}/download"
+
+      - name: Verify, extract and run what was downloaded
+        shell: bash
+        timeout-minutes: 10
+        env:
+          COMMIT: ${{ needs.preflight.outputs.commit }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: >-
+          "$PYTHON" -B .github/scripts/release_smoke.py verify-download
+          --directory "${RUNNER_TEMP}/download"
+          --work-directory "${RUNNER_TEMP}/download-smoke"
+          --target "$TARGET"
+          --version "$VERSION"
+          --tag "$TAG"
+          --commit "$COMMIT"

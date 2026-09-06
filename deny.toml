@@ -37,6 +37,15 @@ exceptions = [
     # Builds mozjpeg from vendored C. Its expression is `IJG AND Zlib AND BSD-3-Clause`;
     # only the `IJG` term needs granting, the other two are already allowed above.
     { name = "mozjpeg-sys", allow = ["IJG"] },
+    # No entry for the rar dependency, and the absence is the finding rather than an
+    # oversight. `unrar-ng` and `unrar-ng-sys` both declare `MIT OR Apache-2.0`, so this
+    # check passes them — while the tree they build is RARLAB's UnRAR under a non-OSI
+    # licence at `vendor/unrar/license.txt`. cargo-deny reads licence files only at a
+    # crate's root and only when the name begins with `LICENSE` or `COPYING`, and it does
+    # not recurse, so it never sees that file and the sys crate ships no root licence at
+    # all. Granting an exception here would be worse than useless: it would imply the
+    # check had found something. `NOTICE.md` carries the obligation instead, and a test
+    # asserts it survives.
 ]
 
 [licenses.private]
@@ -50,7 +59,29 @@ workspace-default-features = "allow"
 external-default-features = "allow"
 allow = []
 deny = []
-skip = []
+# The first entry here, and it is charged to one feature rather than to a dependency:
+# `image`'s `png` feature. Measured on this graph, `bmp` alone and `webp` alone are both
+# clean; enabling `png` is what makes `multiple-versions` fire.
+#
+#   miniz_oxide 0.8.9  └── png 0.18.1 └── image 0.25.10
+#   miniz_oxide 0.9.1  └── flate2 1.1.10 ├── (this crate, pinned)
+#                                        ├── png 0.18.1
+#                                        └── zip 8.6.0
+#
+# `png` 0.18.1 pulls both majors itself: `miniz_oxide "^0.8"` with `simd`, *and*
+# `flate2 "^1.0.35"`, which resolves to the 1.1.10 pinned in `Cargo.toml` and thence to
+# `miniz_oxide` 0.9.1.
+#
+# Alignment was attempted first, as the policy requires, and is unavailable from this side:
+# `cargo search png` reports 0.18.1 as the newest release, and `image` 0.25.10 declares
+# `png ^0.18.0`, so a hypothetical 0.19 would not be accepted either. Downgrading this
+# project's `flate2` pin moves the wrong side of the conflict and gives up a pin chosen for
+# its own reasons.
+#
+# Exit condition: `png` aligning its two inflate paths onto one `miniz_oxide` major, which is
+# upstream's to do. This entry is deleted when a release of `png` that `image` accepts does
+# that.
+skip = [{ crate = "miniz_oxide", reason = "png 0.18.1 depends on miniz_oxide 0.8 and on flate2, which reaches 0.9.1; no release aligns them" }]
 skip-tree = []
 
 [sources]
@@ -60,8 +91,17 @@ unknown-git = "deny"
 # branch that can move underneath a previously green build.
 required-git-spec = "rev"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# The `mozjpeg` fork carrying `Compress::set_dct_method`. Deleted together with
-# `[patch.crates-io]` in `Cargo.toml` when
-# https://github.com/ImageOptim/mozjpeg-rust/pull/54 lands in a release.
-allow-git = ["https://github.com/pashifika/mozjpeg-rust.git"]
+# The `mozjpeg` fork carrying `Compress::set_dct_method` and the warning accessors.
+# Deleted together with `[patch.crates-io]` in `Cargo.toml` when both
+# https://github.com/ImageOptim/mozjpeg-rust/pull/54 and
+# https://github.com/ImageOptim/mozjpeg-rust/pull/55 land in a release.
+#
+# The `unrar-ng` fork, carrying one commit: a `DataSink` seam that lets a read be aborted
+# part-way, which `src/source/rar.rs` needs to bound an entry as `src/source/zip.rs` does.
+# Deleted together with its `[patch.crates-io]` entry when that change stops being needed.
+# Rationale, drift, and the upstream decision are in `Cargo.toml`.
+allow-git = [
+    "https://github.com/pashifika/mozjpeg-rust.git",
+    "https://github.com/pashifika/unrar.rs.git",
+]
 unused-allowed-source = "allow"
