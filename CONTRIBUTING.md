@@ -4,8 +4,8 @@ Read [CLAUDE.md](CLAUDE.md) before changing architecture, dependency policy, or 
 resize strategy. It is the baseline this repository is verified against; this file
 covers building it and getting a change merged.
 
-`main` is a rewrite in progress. If you are looking for the tool that currently works,
-it is on `master`.
+The Rust implementation is developed on `dev/2.0.x` and promoted to `main` at parity.
+See [`README.md`](README.md) to build and run the tool.
 
 ## Toolchain and lockfile
 
@@ -130,11 +130,11 @@ Set `CAR_BMP_FIXTURES` to write them somewhere other than `tools/bmp-fixtures/`.
 ## Building
 
 ```sh
-cargo build --release
+cargo build --locked --release
 ```
 
-The binary lands at `target/release/comic-auto-resize`. Today it prints its version and
-exits.
+The binary lands at `target/release/comic-auto-resize` (`comic-auto-resize.exe` on Windows).
+Run it with `--help` for options or follow the examples in [`README.md`](README.md).
 
 ## Verification
 
