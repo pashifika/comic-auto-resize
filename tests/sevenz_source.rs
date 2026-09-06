@@ -549,7 +549,7 @@ fn a_7z_runs_end_to_end_and_the_output_keeps_the_order() {
     with_archive("sevenz-pipeline", &files, &[], |archive| {
         let output = archive.with_file_name("out.zip");
         let source = Source::open(archive, &ReadOptions::default()).expect("opens");
-        let report = pipeline::run(source, &output, &settings()).expect("runs");
+        let report = pipeline::run(source, &output, &settings(), None).expect("runs");
         assert_eq!(report.pages, 3);
 
         let written: Vec<String> = support::read_archive(&output)
@@ -567,7 +567,7 @@ fn a_7z_with_no_page_reports_that_rather_than_writing_an_empty_archive() {
     with_archive("sevenz-empty", &files, &[], |archive| {
         let output = archive.with_file_name("out.zip");
         let source = Source::open(archive, &ReadOptions::default()).expect("opens");
-        let error = pipeline::run(source, &output, &settings()).expect_err("no pages");
+        let error = pipeline::run(source, &output, &settings(), None).expect_err("no pages");
         assert!(matches!(error, RunError::Empty), "{error}");
         assert!(!output.exists());
     });
@@ -591,7 +591,7 @@ fn the_output_is_read_back_by_the_zip_reader_not_by_the_7z_one() {
     with_archive("sevenz-output-kind", &files, &[], |archive| {
         let output = archive.with_file_name("out.zip");
         let source = Source::open(archive, &ReadOptions::default()).expect("opens");
-        pipeline::run(source, &output, &settings()).expect("runs");
+        pipeline::run(source, &output, &settings(), None).expect("runs");
 
         let file = std::fs::File::open(&output).expect("opens the output");
         let mut zip = ZipSource::new(file, &ReadOptions::default()).expect("the output is a zip");

@@ -370,7 +370,7 @@ fn two_names_that_decode_onto_one_are_refused_by_the_writer() {
 
     let output = scratch.join("out.zip");
     let source = Source::open(&input, &options("ja")).expect("opens");
-    let error = pipeline::run(source, &output, &settings()).expect_err("a collision");
+    let error = pipeline::run(source, &output, &settings(), None).expect_err("a collision");
     assert!(
         matches!(error, pipeline::RunError::NameCollision { .. }),
         "expected the writer's duplicate refusal, got {error}"
@@ -459,7 +459,7 @@ fn a_zipcrypto_entry_with_the_right_password_is_read() {
     };
     let output = scratch.join("out.zip");
     let source = Source::open(&input, &options).expect("opens");
-    let report = pipeline::run(source, &output, &settings()).expect("runs");
+    let report = pipeline::run(source, &output, &settings(), None).expect("runs");
     assert_eq!(report.pages, 1);
     assert_eq!(read_archive(&output).len(), 1);
 
