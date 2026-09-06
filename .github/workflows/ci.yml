@@ -683,6 +683,34 @@ jobs:
           --binary artifact/comic-auto-resize.exe
           --shell powershell
 
+  # The release boundary decides what reaches a public download, and every one of its
+  # refusals is a policy this repository has to be able to change without a release. These
+  # cases are the offline half: tag grammar, provenance, package contract, aggregation,
+  # linkage, and the publisher's conflict outcomes, none of which needs a runner secret, a
+  # toolchain, or the network. The native half is the release workflow itself.
+  release-validation:
+    name: release-validation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the source tree
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+
+      - name: Test the release provenance and packaging boundary
+        timeout-minutes: 5
+        run: python3 -B .github/scripts/test_release.py
+
+      - name: Test the packaged-binary smoke harness
+        timeout-minutes: 5
+        run: python3 -B .github/scripts/test_release_smoke.py
+
+      - name: Test the controlled publisher
+        timeout-minutes: 5
+        run: python3 -B .github/scripts/test_release_publish.py
+
   # The single required status context. Every ruleset names this job and no other, so a
   # change that adds a job extends the `needs` list below and touches no repository
   # setting.
@@ -690,7 +718,15 @@ jobs:
     name: ci
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    needs: [hygiene, windows, macos, shell-completions-macos, shell-completions-windows]
+    needs:
+      [
+        hygiene,
+        windows,
+        macos,
+        shell-completions-macos,
+        shell-completions-windows,
+        release-validation,
+      ]
     # `always()` so the gate still reports when a predecessor failed; without it the gate
     # would be skipped, and a skipped required check blocks rather than fails.
     if: always()
@@ -702,6 +738,7 @@ jobs:
           MACOS_RESULT: ${{ needs.macos.result }}
           COMPLETIONS_MACOS_RESULT: ${{ needs.shell-completions-macos.result }}
           COMPLETIONS_WINDOWS_RESULT: ${{ needs.shell-completions-windows.result }}
+          RELEASE_VALIDATION_RESULT: ${{ needs.release-validation.result }}
         run: |
           set -euo pipefail
 
@@ -714,7 +751,8 @@ jobs:
             "windows=${WINDOWS_RESULT}" \
             "macos=${MACOS_RESULT}" \
             "shell-completions-macos=${COMPLETIONS_MACOS_RESULT}" \
-            "shell-completions-windows=${COMPLETIONS_WINDOWS_RESULT}"; do
+            "shell-completions-windows=${COMPLETIONS_WINDOWS_RESULT}" \
+            "release-validation=${RELEASE_VALIDATION_RESULT}"; do
             name="${pair%%=*}"
             result="${pair#*=}"
             if [ "${result}" != "success" ]; then
@@ -724,8 +762,8 @@ jobs:
           done
 
           if [ -n "${failed}" ]; then
-            echo "::error::Required job results: hygiene=${HYGIENE_RESULT} windows=${WINDOWS_RESULT} macos=${MACOS_RESULT} shell-completions-macos=${COMPLETIONS_MACOS_RESULT} shell-completions-windows=${COMPLETIONS_WINDOWS_RESULT}"
+            echo "::error::Required job results: hygiene=${HYGIENE_RESULT} windows=${WINDOWS_RESULT} macos=${MACOS_RESULT} shell-completions-macos=${COMPLETIONS_MACOS_RESULT} shell-completions-windows=${COMPLETIONS_WINDOWS_RESULT} release-validation=${RELEASE_VALIDATION_RESULT}"
             exit 1
           fi
 
-          echo "ci: hygiene, windows, macos, and both shell-completion jobs all succeeded."
+          echo "ci: hygiene, windows, macos, both shell-completion jobs and release-validation all succeeded."

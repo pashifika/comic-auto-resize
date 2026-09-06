@@ -1,6 +1,6 @@
 [package]
 name = "comic-auto-resize"
-version = "2.0.0-dev"
+version = "2.0.0"
 edition = "2024"
 # The crate's own floor, separate from the channel pinned in `rust-toolchain.toml`.
 # Raised from 1.88 to 1.93 because `sevenz-rust2` 0.22.2 declares 1.93; `zip` 8.6.0 declares

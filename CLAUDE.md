@@ -23,13 +23,18 @@ zip reader to keep it.
 ## Repository layout and branches
 
 `master` holds the shipped Go implementation, v1.1.2. It is a reference rather than a
-development line: it cannot be deleted or force-pushed, and it remains the repository
-default branch until the rewrite reaches parity. Do not open work against it.
-`main` holds the Rust rewrite. `dev/2.0.x` is the integration line feeding `main`.
+development line: it cannot be deleted or force-pushed, and new work does not belong on it.
+`main` holds the Rust rewrite and is the branch a visitor is meant to land on once the
+cutover completes. `dev/2.0.x` is the integration line feeding `main`, and topic branches
+continue to reach `main` through it afterwards.
 
-The behavioural reference is the `master` branch. Read it with `git show master:<path>`;
-when a run is needed, produce its source with `git archive master`. A machine-local
-checkout may hold any revision and is not authoritative.
+The behavioural reference is the recorded revision
+`d840ccc84ed5ac5f09be0e08a5a17fb14449a029` — `master` at tag `v1.1.2`. Read it with
+`git show d840ccc84ed5ac5f09be0e08a5a17fb14449a029:<path>`; when a run is needed, produce
+its source with `git archive` at that revision. The revision is named rather than the
+branch because a later commit on `master`, such as a README pointer to the Rust
+implementation, would otherwise move the reference underneath a comparison. A
+machine-local checkout may hold any revision and is not authoritative.
 
 ## Size reduction strategy
 
@@ -72,6 +77,11 @@ reads metadata and cannot see vendored trees.
 Pin dependency versions exactly. A Git dependency needs a pinned revision and an
 `allow-git` entry, and it is a temporary measure: record what has to happen upstream
 before it can be removed.
+
+A binary release carries the licence text of everything it links, generated from the locked
+non-development graph for that target rather than from metadata names. A dependency whose
+text cannot be resolved — at its crate root or at a recorded vendored path — fails packaging
+instead of shipping without it.
 
 ## Testing
 
