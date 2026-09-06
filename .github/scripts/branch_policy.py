@@ -50,11 +50,20 @@ def validate_branch_flow(
     if DEVELOPMENT_BRANCH.fullmatch(base):
         if is_dependabot_update(head, base_repository, head_repository, author_login):
             return None
+        # Promotion synchronization, and the only direction that flows backwards. A
+        # promotion leaves the development line one merge commit behind `main`, and the
+        # development ruleset requires a pull request, so this is how the line catches up
+        # -- a direct fast-forward push is refused. Bound to the base repository: a fork's
+        # `main` is unrelated content wearing a trusted name.
+        if head == "main":
+            if head_repository != base_repository:
+                return "synchronization from main must come from the base repository"
+            return None
         if TOPIC_BRANCH.fullmatch(head):
             return None
         return (
             "pull requests into a development line must come from a supported "
-            "topic branch with a non-empty slug"
+            "topic branch with a non-empty slug, or from main to synchronize a promotion"
         )
 
     return "the pull-request base must be main or dev/<major>.<minor>.x"
