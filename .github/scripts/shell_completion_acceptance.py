@@ -193,7 +193,7 @@ def completion_cases() -> tuple[CompletionCase, ...]:
         ),
         CompletionCase(
             name="split-prefix",
-            line=f"{PRODUCT} --spli",
+            line=f"{PRODUCT} --split",
             expected=("--split", "--split-pos"),
             forbidden=("--show-time", "page-one.zip"),
         ),
