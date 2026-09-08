@@ -60,6 +60,24 @@ fn names_and_indices(entries: &[Entry]) -> Vec<(u32, String)> {
         .collect()
 }
 
+#[test]
+fn rar_keeps_the_shared_split_and_corrupt_header_contract() {
+    with_fixture("spread-pages.rar", |path| {
+        support::assert_reader_split_contract(|options| {
+            Source::open(path, options).expect("opens")
+        });
+    });
+}
+
+/// Called only by the manual RAR fixture builder, so every container uses the same pages.
+#[test]
+#[ignore = "run through tests/fixtures/make-rar-fixtures.sh"]
+fn generate_split_reader_pages() {
+    let root = std::env::var_os("CAR_SPLIT_READER_PAGES")
+        .expect("the RAR fixture builder supplies CAR_SPLIT_READER_PAGES");
+    support::write_tree(Path::new(&root), &support::split_reader_pages());
+}
+
 // ---------------------------------------------------------------- ordering
 
 /// Task 3.1. The fixture's stored order is deliberately not its alphabetical order, so

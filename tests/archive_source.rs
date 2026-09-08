@@ -53,6 +53,38 @@ fn read_all(bytes: &[u8]) -> Result<Vec<(u32, String)>, SourceError> {
     Ok(yielded)
 }
 
+#[test]
+fn zip_keeps_the_shared_split_and_corrupt_header_contract() {
+    let bytes = archive(&support::split_reader_pages());
+    support::assert_reader_split_contract(|options| {
+        ZipSource::new(Cursor::new(&bytes), options).expect("opens")
+    });
+}
+
+#[test]
+fn the_split_gate_reads_the_probed_image_format() {
+    for (name, bytes) in [
+        ("002.jpeg", support::page_bytes(140, 100)),
+        ("002.png", support::png_page(140, 100)),
+        ("002.bmp", support::bmp_page(140, 100)),
+        ("002.webp", support::webp_page(140, 100)),
+    ] {
+        let bytes = archive(&[(name, bytes)]);
+        let options = ReadOptions {
+            split: comic_auto_resize::policy::Split::new(
+                50,
+                0,
+                comic_auto_resize::policy::ReadingOrder::Right,
+            ),
+            ..Default::default()
+        };
+        let mut source = ZipSource::new(Cursor::new(&bytes), &options).expect("opens");
+        let entry = source.next_entry().expect("a page").expect("reads");
+        assert_eq!(entry.name, "002-1.jpg");
+        assert_eq!(entry.spread.expect("a spread").second_name, "002-2.jpg");
+    }
+}
+
 /// Every page the source yields, with the number of bytes it produced.
 ///
 /// Separate from `read_all` rather than a widening of it, so the tests that predate the

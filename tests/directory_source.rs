@@ -68,6 +68,19 @@ fn settings() -> Settings {
     }
 }
 
+#[test]
+fn directory_keeps_the_shared_split_and_corrupt_header_contract() {
+    with_tree(
+        "directory-split",
+        &support::split_reader_pages(),
+        |_scratch, root| {
+            support::assert_reader_split_contract(|options| {
+                Source::open(root, options).expect("opens")
+            });
+        },
+    );
+}
+
 // ---------------------------------------------------------------- the chosen order
 
 /// Task 3.4, and the defect the Go implementation shipped. Byte-lexical order gives

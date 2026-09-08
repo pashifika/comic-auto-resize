@@ -109,6 +109,9 @@ These are the binary's long options. Run `--help` for accepted values, defaults,
 | `--delete-org` | Delete the input archive only after successful output; refused for directories. |
 | `--auto-width <PIXELS>` | Target a common page width; defaults to 1280. |
 | `--ratio <PERCENT>` | Use 1–100% of each page's width (`-r`); cannot combine with `--auto-width`. |
+| `--split <PCT>` | Split width/height 1.05–1.60 spreads into two pages, each 1–50% of the source width; 50 halves, smaller values trim. Each piece is resized and numbered independently. Decoding may use full-size memory; off by default. |
+| `--split-pos <PX>` | Shift both windows right by source pixels; defaults to 0 and requires `--split`. Windows leaving the page are refused. |
+| `--reading-order <ORDER>` | Write the right half first (`r`, default) or the left half first (`l`); requires `--split`. |
 | `--quality <QUALITY>` | Set JPEG quality from 1 to 100 (`-q`); defaults to 90. |
 | `--dct <DCT>` | Select the JPEG DCT/IDCT method. |
 | `--progressive[=<BOOL>]` | Write progressive JPEGs by default; `--progressive=false` selects baseline. |
@@ -131,6 +134,7 @@ These are the binary's long options. Run `--help` for accepted values, defaults,
 - `--small-skip` is absent. Small-page protection is always applied; the old flag disabled all resizing, not just small-page resizing.
 - `-o out.cbz` writes `out.cbz`, not `out.cbz.zip`.
 - `--debug` and `--show-time` name the elapsed time as `1.23s`, where v1.1.2 printed `1.23/s`.
+- `--split` is new here; v1.1.2 had no spread splitting.
 
 ## Requirements
 
