@@ -50,6 +50,8 @@ use std::io::{Read, Seek, SeekFrom};
 
 use zip::{AesMode, HasZipMetadata, ZipArchive, ZipReadOptions};
 
+use crate::policy::Split;
+
 use super::charset::Stated;
 use super::probe::{self, MAGIC_MAX, Names, Naming};
 use super::{
@@ -68,6 +70,7 @@ pub struct ZipSource<R> {
     /// the archive held something that was not a page.
     next_index: u32,
     names: Names,
+    split: Option<Split>,
     /// Every entry's name, decoded once when the archive was opened, in table order. See the
     /// module doc for why it cannot be derived one entry at a time.
     decoded: Vec<String>,
@@ -101,7 +104,9 @@ impl<R: Read + Seek> ZipSource<R> {
         let names = match options.naming {
             Naming::Stored => Names::stored(),
             // The entry table is read by now, so the entry total costs nothing here.
-            Naming::ByPosition => Names::by_position(archive.len()),
+            Naming::ByPosition => {
+                Names::by_position(archive.len(), 1 + u32::from(options.split.is_some()))
+            }
         };
         let (stated, surveyed) = survey(&mut archive);
         let decoded = options.charset.decode_all(&stated)?;
@@ -110,6 +115,7 @@ impl<R: Read + Seek> ZipSource<R> {
             next_position: 0,
             next_index: 0,
             names,
+            split: options.split,
             decoded,
             surveyed,
             password: options.password.as_ref().map(|pw| pw.as_bytes().to_vec()),
@@ -304,11 +310,13 @@ impl<R: Read + Seek> ZipSource<R> {
             });
         }
 
+        let (name, spread) = self.names.of_entry(name, declared, &bytes, self.split);
         Yielded::Entry(Entry {
             index,
-            name: self.names.of(name),
+            name,
             format: declared,
             bytes,
+            spread,
         })
     }
 }

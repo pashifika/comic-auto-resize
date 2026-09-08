@@ -78,6 +78,8 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use sevenz_rust2::{ArchiveReader, Password};
 
+use crate::policy::Split;
+
 use super::probe::{self, MAGIC_MAX, Names, Naming};
 use super::{
     Entry, HINT_CEILING, MAX_ENTRY_BYTES, ReadOptions, SourceError, fill, is_directory, unsafe_name,
@@ -250,11 +252,15 @@ impl SevenZSource {
         let names = match options.naming {
             Naming::Stored => Names::stored(),
             // The header is parsed by now, so the entry total costs nothing here.
-            Naming::ByPosition => Names::by_position(reader.archive().files.len()),
+            Naming::ByPosition => Names::by_position(
+                reader.archive().files.len(),
+                1 + u32::from(options.split.is_some()),
+            ),
         };
 
+        let split = options.split;
         let (sender, entries) = bounded(0);
-        let decoder = std::thread::spawn(move || decode(reader, names, &sender));
+        let decoder = std::thread::spawn(move || decode(reader, names, split, &sender));
 
         Ok(Self {
             entries: Some(entries),
@@ -318,6 +324,7 @@ impl Drop for SevenZSource {
 fn decode(
     mut reader: ArchiveReader<std::fs::File>,
     mut names: Names,
+    split: Option<Split>,
     sender: &Sender<Result<Entry, SourceError>>,
 ) {
     let mut next_index = 0;
@@ -411,13 +418,15 @@ fn decode(
         }
 
         next_index += 1;
+        let (name, spread) = names.of_entry(&name, declared, &bytes, split);
         if offer(
             sender,
             Ok(Entry {
                 index,
-                name: names.of(&name),
+                name,
                 format: declared,
                 bytes,
+                spread,
             }),
         ) {
             Ok(true)

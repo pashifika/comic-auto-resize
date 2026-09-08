@@ -12,8 +12,8 @@
 //! ```
 //!
 //! One entry yields one or more *pieces*, delivered together in one worker result. The piece
-//! count is the vector's length, not a declaration separate from its delivery. Today every
-//! entry yields exactly one; splitting a spread needs no change to the ordering below.
+//! count is the vector's length, not a declaration separate from its delivery. A spread yields
+//! two pieces; the credit and ordering unit remains the entry.
 //!
 //! The writer runs on the caller's own thread rather than on one of its own, and the optional
 //! trace runs there with it: after the sink writes contiguous entries, their records are handed
@@ -81,7 +81,7 @@
 //! credit returns. The records therefore belong to at most `W` credit-holding entries,
 //! including records awaiting observation after their bytes were written: at most `W × n`
 //! records, or `(W - 1) × n` after the writer finishes a delivery. A record is a name and
-//! `Outcome`'s seven `Copy` fields; the piece index and count come from vector order and length.
+//! `Outcome`'s `Copy` fields; the piece index and count come from vector order and length.
 //! A run with no observer allocates no records or record vectors.
 //!
 //! # What the run's peak actually is, with every factor named
@@ -100,7 +100,7 @@
 //!
 //!   worker   = retained + max(decode, page + destination)
 //!   retained = 2 × max over the pages the worker has resized of
-//!                  src_width × dst_height × channels
+//!                  (coefficient_span × dst_height + 1) × channels
 //!   decode   = declared × scratch_factor(format, colour) + page   (page: only where both live)
 //! ```
 //!
@@ -114,6 +114,11 @@
 //! a separate window for each stage. Batching retains earlier encoded pieces until the entry
 //! is complete; it does not require two decoded pages or two resize destinations at once.
 //! Sequential crop/resize/encode determines those lifetimes, independently of message count.
+//! Under `--split`, the decoded page clears the piece's target and can reach full size. The
+//! destination is one piece; `coefficient_span` includes filter support beyond its crop, bounded
+//! by the decoded width. The extra pixel is dependency alignment space. For a 2612x2004 RGB
+//! spread split at 50% to 1280x1964, Lanczos3 spans 1309 columns: page 15.70 MB, destination
+//! 7.54 MB, retained bound `2 × (1309 × 1964 + 1) × 3 = 15.43 MB`. Encoded output uses `n = 2`.
 //! At two pieces of roughly 350 KB each, the difference from sending the first early is at
 //! most one encoded piece per worker, not another roughly 100 MB decoded working set. Even
 //! that saving depended on the bounded `done` channel and writer accepting the first piece.
@@ -278,9 +283,9 @@ use thiserror::Error;
 use crate::page::{
     DecodeSettings, EncodeSettings, Filter, Format, PageError, Resampler, decode, encode, header,
 };
-use crate::policy::{self, Plan, Target};
+use crate::policy::{self, Columns, Plan, Target};
 use crate::sink::{Page, Sink};
-use crate::source::{Entries, SourceError};
+use crate::source::{Entries, SourceError, Spread};
 
 /// How much work may be in flight, as a multiple of the worker count.
 ///
@@ -365,6 +370,8 @@ pub struct Report {
     /// event. The distinction is [`policy::plan`]'s rather than this module's, so a count
     /// and a decision cannot drift apart.
     pub below_floor: u32,
+    /// How many input entries yielded more than one page.
+    pub split: u32,
 }
 
 /// What the run decided about one page.
@@ -382,6 +389,8 @@ pub struct Outcome {
     pub format: Format,
     pub source_width: u32,
     pub source_height: u32,
+    /// The piece's columns in the original page, or the whole page when absent.
+    pub window: Option<Columns>,
     pub plan: Plan,
     /// Whether an alpha channel was composited onto white.
     pub composited: bool,
@@ -397,8 +406,7 @@ pub struct Outcome {
 /// observer that formats and drops it allocates nothing.
 ///
 /// `non_exhaustive` for [`Outcome`]'s reason: this is a view of a decision that will grow, and
-/// an observer only reads it. `piece` and `pieces` are carried but not yet printed by
-/// `--debug`: no input yields a second piece, so a marker would be untestable end to end.
+/// an observer only reads it. `--debug` identifies each piece of a split entry.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Trace<'a> {
@@ -406,7 +414,7 @@ pub struct Trace<'a> {
     pub position: u32,
     /// This piece's index within its entry, from zero.
     pub piece: u32,
-    /// How many pieces the entry yields. One today; nothing splits an entry yet.
+    /// How many pieces the entry yields.
     pub pieces: NonZeroU32,
     pub name: &'a str,
     pub outcome: Outcome,
@@ -546,12 +554,13 @@ pub fn run<S: Entries + Send>(
     // page, a central directory that will not write, and a flush that will not complete all
     // leave a file to remove.
     let failure = match outcome {
-        Ok((composited, below_floor)) => match sink.finish() {
+        Ok((composited, below_floor, split)) => match sink.finish() {
             Ok(pages) => {
                 return Ok(Report {
                     pages,
                     composited,
                     below_floor,
+                    split,
                 });
             }
             Err(error) => error,
@@ -577,6 +586,7 @@ struct Job {
     /// probes again.
     format: Format,
     bytes: Vec<u8>,
+    spread: Option<Spread>,
 }
 
 /// All of one entry's finished pieces, with each piece's outcome beside it.
@@ -590,9 +600,8 @@ struct Finished {
 
 /// The writer stage: takes finished entries, restores read order, and tallies their pieces.
 ///
-/// Returns the two counts, or the first failure it met. It is the one stage that sees every
-/// page exactly once and in one thread, which is why both the counting and the tracing happen
-/// here.
+/// Returns the outcome counts, or the first failure it met. Counting and tracing happen here,
+/// in the one stage that sees every page exactly once.
 ///
 /// The trace stops at the failure rather than after it: a [`Sink::accept`] that wrote a piece and
 /// then failed on the next reports only the error, so those pieces are not traced. They are also
@@ -603,13 +612,15 @@ fn write_in_order(
     done: &crossbeam_channel::Receiver<Result<Finished, PageError>>,
     credits: &crossbeam_channel::Sender<()>,
     mut trace: Option<&mut dyn FnMut(Trace<'_>)>,
-) -> Result<(u32, u32), RunError> {
+) -> Result<(u32, u32, u32), RunError> {
     let mut composited = 0;
     let mut below_floor = 0;
+    let mut split = 0;
     // One vector per entry, parallel to the sink's map, and only allocated for an observer.
     let mut pending: BTreeMap<u32, Vec<Record>> = BTreeMap::new();
     while let Ok(finished) = done.recv() {
         let finished = finished.map_err(RunError::Page)?;
+        split += u32::from(finished.pieces.len() > 1);
         let mut records = trace
             .as_ref()
             .map(|_| Vec::with_capacity(finished.pieces.len()));
@@ -658,7 +669,7 @@ fn write_in_order(
             let _ = credits.send(());
         }
     }
-    Ok((composited, below_floor))
+    Ok((composited, below_floor, split))
 }
 
 /// Reads the archive once, taking a credit before each entry.
@@ -677,11 +688,11 @@ fn read_entries<S: Entries>(
         };
         let entry = entry?;
         let job = Job {
-            // The reader hands over an entry; how many pieces it becomes is the worker's.
             index: entry.index,
             name: entry.name,
             format: entry.format,
             bytes: entry.bytes,
+            spread: entry.spread,
         };
         if work.send(job).is_err() {
             return Ok(());
@@ -689,7 +700,7 @@ fn read_entries<S: Entries>(
     }
 }
 
-/// Decode, plan, resize, encode — the whole of one page.
+/// Plan, decode once, then crop/resize and encode each piece in reading order.
 fn process(
     job: Job,
     resampler: &mut Resampler,
@@ -700,54 +711,94 @@ fn process(
         name,
         format,
         bytes,
+        spread,
     } = job;
-
-    // Before the decode, because `bytes` is what the archive held for this entry and the
-    // trace reports the reduction against it.
     let source_bytes = bytes.len();
-
-    // The header first, because the resize policy needs the source geometry to choose both
-    // the target height and whether to resize at all, and a scaled decode cannot be
-    // configured before that is known. The budget refusal itself is inside `decode`, at the
-    // point each decoder has parsed its header and before it allocates from it — for every
-    // format, including the three whose decoder cannot scale. The budget is passed here
-    // because reading a *png*'s header is itself an allocating operation.
     let (source_width, source_height) = header(&name, &bytes, format, settings.decode.budget)?;
-    // A ratio is a target width named relative to the page, so it is resolved here — where
-    // the page's own width is known — and `plan` takes the one number either way.
-    let target_width = settings.target.width_for(source_width);
-    let plan = policy::plan(source_width, source_height, target_width);
-
+    let windows = spread
+        .as_ref()
+        .map(|spread| spread.split.windows(source_width))
+        .transpose()
+        .map_err(|error| PageError::new(&name, error.into()))?;
+    let piece_width = windows.map_or(source_width, |windows| windows[0].width);
+    let plan = policy::plan(
+        piece_width,
+        source_height,
+        settings.target.width_for(piece_width),
+    );
+    // A reduced piece needs the entire decoded spread to clear its target scale.
+    let scale_to = plan
+        .scale_to(piece_width, source_height)
+        .map(|(width, height)| {
+            let spread_width =
+                (u64::from(width) * u64::from(source_width)).div_ceil(u64::from(piece_width));
+            (
+                u32::try_from(spread_width).expect("a downscale cannot exceed the source width"),
+                height,
+            )
+        });
     let decoded = decode(
         &name,
         &bytes,
         format,
         DecodeSettings {
-            scale_to: plan.scale_to(source_width, source_height),
+            scale_to,
             ..settings.decode
         },
     )?;
-    // Pass-through skips the resize and nothing else, whichever of the two reasons it was.
-    let page = match plan {
-        Plan::Resize { width } => resampler.resize(&name, &decoded.page, width, settings.filter)?,
-        Plan::PassThrough | Plan::BelowFloor => decoded.page,
-    };
-    let bytes = encode(&name, &page, settings.encode)?;
-
     let outcome = Outcome {
         format,
         source_width,
         source_height,
+        window: None,
         plan,
         composited: decoded.composited,
         source_bytes,
-        encoded_bytes: bytes.len(),
+        encoded_bytes: 0,
     };
-    Ok(Finished {
-        index,
-        // One produced piece, not a count declared separately from its delivery.
-        pieces: vec![(Page { name, bytes }, outcome)],
-    })
+    let pieces = if let (Some(spread), Some(windows)) = (spread, windows) {
+        windows
+            .into_iter()
+            .zip([name, spread.second_name])
+            .map(|(window, name)| {
+                let page = match plan {
+                    Plan::Resize { width } => resampler.resize_window(
+                        &name,
+                        &decoded.page,
+                        window,
+                        width,
+                        settings.filter,
+                    )?,
+                    Plan::PassThrough | Plan::BelowFloor => {
+                        decoded
+                            .page
+                            .crop_columns(&name, window, settings.decode.budget)?
+                    }
+                };
+                let bytes = encode(&name, &page, settings.encode)?;
+                let outcome = Outcome {
+                    window: Some(window),
+                    encoded_bytes: bytes.len(),
+                    ..outcome
+                };
+                Ok((Page { name, bytes }, outcome))
+            })
+            .collect::<Result<Vec<_>, PageError>>()?
+    } else {
+        let page = match plan {
+            Plan::Resize { width } => {
+                resampler.resize(&name, &decoded.page, width, settings.filter)?
+            }
+            Plan::PassThrough | Plan::BelowFloor => decoded.page,
+        };
+        let bytes = encode(&name, &page, settings.encode)?;
+        let outcome = Outcome {
+            encoded_bytes: bytes.len(),
+            ..outcome
+        };
+        vec![(Page { name, bytes }, outcome)]
+    };
+    Ok(Finished { index, pieces })
 }
 
 /// Why a run stopped.
@@ -915,6 +966,7 @@ mod tests {
                             format: Format::Jpeg,
                             source_width: 1520,
                             source_height: 2150,
+                            window: None,
                             plan: Plan::Resize { width: 1280 },
                             composited: false,
                             source_bytes: 16,

@@ -154,6 +154,15 @@ cp "$page" "$d/page01.jpeg"
 printf '<ComicInfo/>' > "$d/notes.xml"
 ( cd "$d" && "$rar" a -m0 -ma5 -idq "$out/mixed-entries.rar" page00.jpg notes.xml page01.jpeg )
 
+# The same spread, portrait, wide page and corrupt PNG header the other reader tests use.
+# Cargo runs only the ignored page generator; RARLAB still writes the archive itself.
+step "spread-pages.rar"
+d="$(build_dir spreads)"
+CAR_SPLIT_READER_PAGES="$d" cargo test --locked --manifest-path "$root/Cargo.toml" \
+    --test rar_source generate_split_reader_pages -- --ignored --exact
+( cd "$d" && "$rar" a -m0 -ma5 -idq "$out/spread-pages.rar" \
+    cover.png page3.png page4.png page5.png page6.png )
+
 # A stored name longer than the DLL's fixed 1024-wchar field. The dependency used to hand
 # back a name cut at 1023 characters with nothing to say it had been, so the page lost its
 # extension and was passed over — a page silently missing from the book. Two entries, so a

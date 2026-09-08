@@ -241,7 +241,8 @@ impl Sink {
         // rename that caused it, so the collision is caught here where both halves are known.
         // The set costs no asymptotic memory the writer was not already paying: it holds every
         // name for the central directory regardless.
-        if !self.names.insert(page.name.clone()) {
+        // Both separators name one archive directory, as in the positional naming rule.
+        if !self.names.insert(page.name.replace('\\', "/")) {
             return Err(RunError::NameCollision {
                 name: page.name.clone(),
             });

@@ -70,6 +70,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::page::Format;
+use crate::policy::Split;
 
 use super::probe::{self, MAGIC_MAX, Names, Naming};
 use super::{Entry, HINT_CEILING, MAX_ENTRY_BYTES, ReadOptions, SourceError, fill, unsafe_name};
@@ -81,6 +82,7 @@ pub struct DirectorySource {
     pages: std::vec::IntoIter<Page>,
     next_index: u32,
     names: Names,
+    split: Option<Split>,
 }
 
 /// One file the listing accepted as a candidate page.
@@ -116,13 +118,16 @@ impl DirectorySource {
             // The listing is made anyway, so the entry total is free. It counts the pages the
             // extension filter kept rather than every file, which is the one format where an
             // exact candidate count costs nothing.
-            Naming::ByPosition => Names::by_position(pages.len()),
+            Naming::ByPosition => {
+                Names::by_position(pages.len(), 1 + u32::from(options.split.is_some()))
+            }
         };
 
         Ok(Self {
             pages: pages.into_iter(),
             next_index: 0,
             names,
+            split: options.split,
         })
     }
 
@@ -234,11 +239,13 @@ impl DirectorySource {
 
         let index = self.next_index;
         self.next_index += 1;
+        let (name, spread) = self.names.of_entry(name, declared, &bytes, self.split);
         Ok(Entry {
             index,
-            name: self.names.of(name),
+            name,
             format: declared,
             bytes,
+            spread,
         })
     }
 }

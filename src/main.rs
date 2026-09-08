@@ -21,15 +21,9 @@
 //! same numbers the page lines below it are read against. A trace whose target width is not
 //! stated cannot be interpreted.
 //!
-//! `--fix-idx` was the first flag added since the rewrite began; `--charset` and `--pwd`
-//! joined it, then `-o/--out` and `--delete-org`, then `-r/--ratio` and `--jobs`, then
-//! `--progressive` and `--optimizer`, and these two join now — each in the Change that
-//! implements it, which is that rule read the other way round.
-//!
-//! `--jobs` is the one flag here with no reference-tool equivalent: the Go implementation
-//! derives its worker count from the host and offers no way to say otherwise. `-r/--ratio`
-//! is the one whose meaning deliberately diverges, and its help says so, because that is
-//! where the user who needs to know is looking.
+//! `--jobs` and the split flags have no reference-tool equivalent. The former controls
+//! parallelism; the latter turn a spread into two independently normalised pages.
+//! `-r/--ratio` deliberately diverges from Go, and its help states the migration.
 //!
 //! `--charset` is the first flag whose default is not "off", and the asymmetry is the point:
 //! `--fix-idx` defaults to off because the default path is *correct* and renaming is a
@@ -63,7 +57,7 @@ use std::time::Instant;
 use clap::{ArgAction, CommandFactory, Parser, builder::TypedValueParser};
 use comic_auto_resize::page::{DctMethod, DecodeSettings, EncodeSettings, Filter};
 use comic_auto_resize::pipeline::{self, Report, Settings};
-use comic_auto_resize::policy::{AUTO_WIDTH, Plan, Target};
+use comic_auto_resize::policy::{AUTO_WIDTH, Plan, ReadingOrder, Split, Target};
 use comic_auto_resize::sink::{InputKind, durable_directory_entry, resolve_output};
 use comic_auto_resize::source::{Charset, DEFAULT_LABELS, Naming, ReadOptions, Source};
 use thiserror::Error;
@@ -139,6 +133,35 @@ struct Cli {
     )]
     ratio: Option<u8>,
 
+    /// Split pages whose width/height is 1.05 to 1.60 into two pages in reading order.
+    /// 50 halves a spread; smaller values trim the gutter and outer margins. Each half is
+    /// normalised against its own width and numbered on its own under `--fix-idx`. The spread
+    /// is decoded at up to full size to serve each half, increasing memory use; lower `--jobs`
+    /// if needed. Off unless given.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u8).range(1..=50),
+        value_name = "PCT",
+    )]
+    split: Option<u8>,
+
+    /// Shift both split windows right by this many source pixels. Requires `--split`; a
+    /// window leaving the page is refused, not clamped.
+    #[arg(long, default_value_t = 0, requires = "split", value_name = "PX")]
+    split_pos: u32,
+
+    /// Which half is written first: `r` is right then left (manga order), `l` is left then
+    /// right. Requires `--split`.
+    #[arg(
+        long,
+        default_value_t = ReadingOrder::Right,
+        requires = "split",
+        value_parser = clap::builder::PossibleValuesParser::new(["r", "l"])
+            .map(|value| value.parse::<ReadingOrder>().expect("the parser accepted r or l")),
+        value_name = "ORDER",
+    )]
+    reading_order: ReadingOrder,
+
     /// Encoder quality, 1 to 100.
     #[arg(
         short,
@@ -190,9 +213,9 @@ struct Cli {
 
     /// Rewrite each page's name to carry its own position: the trailing digits of the name
     /// are replaced by the page's place in read order, restarting at one inside each
-    /// directory, zero-padded to the width the entry total needs. The number the input
-    /// recorded is not consulted and a name with no trailing digits is left alone. Off by
-    /// default; enable it when a viewer orders pages by name rather than numerically.
+    /// directory, zero-padded to the width the entry total needs (twice the total with
+    /// `--split`). The number the input recorded is not consulted and a name with no trailing
+    /// digits is left alone. Off by default; enable it when a viewer orders pages by name.
     #[arg(long)]
     fix_idx: bool,
 
@@ -313,6 +336,9 @@ fn main() -> ExitCode {
                     report.below_floor
                 ));
             }
+            if report.split > 0 {
+                notes.push(format!("{} spread(s) split", report.split));
+            }
             let notes = if notes.is_empty() {
                 String::new()
             } else {
@@ -351,34 +377,34 @@ fn main() -> ExitCode {
     }
 }
 
-/// The resize run. `input` is the positional the parser required, passed separately because
-/// the completion entry point is the one arm of the surface that has none.
-fn run(cli: &Cli, input: &Path) -> Result<(Report, PathBuf), CliError> {
-    // Option values were range-checked by the parser, before this point and before the
-    // input is opened. The remaining checks are on the input itself.
-    let settings = Settings {
+fn page_settings(cli: &Cli) -> Result<Settings, CliError> {
+    let dct_method = cli.dct.parse().map_err(CliError::Dct)?;
+    Ok(Settings {
         jobs: cli.jobs,
-        // The parser refused the two together, so this is a choice between them rather than
-        // a precedence nobody asked for.
         target: match cli.ratio {
             Some(percent) => Target::Ratio(percent),
             None => Target::Width(cli.auto_width),
         },
         filter: cli.resize_mode.parse().map_err(CliError::Filter)?,
         decode: DecodeSettings {
-            dct_method: cli.dct.parse().map_err(CliError::Dct)?,
+            dct_method,
             ..DecodeSettings::default()
         },
-        // Every field named, and no `..default()` spread: each of the four settings the
-        // encoder carries now has a flag, so a spread here would only hide which of them the
-        // command line reaches.
         encode: EncodeSettings {
             quality: cli.quality,
             optimize_coding: cli.optimizer,
             progressive: cli.progressive,
-            dct_method: cli.dct.parse().map_err(CliError::Dct)?,
+            dct_method,
         },
-    };
+    })
+}
+
+/// The resize run. `input` is the positional the parser required, passed separately because
+/// the completion entry point is the one arm of the surface that has none.
+fn run(cli: &Cli, input: &Path) -> Result<(Report, PathBuf), CliError> {
+    // Option values were range-checked by the parser, before this point and before the
+    // input is opened. The remaining checks are on the input itself.
+    let settings = page_settings(cli)?;
     // Every option is settled before the input is opened: an unknown `--charset` label was
     // refused by the parser, and the encoding list is resolved rather than a string the reader
     // would have to parse per archive.
@@ -390,6 +416,10 @@ fn run(cli: &Cli, input: &Path) -> Result<(Report, PathBuf), CliError> {
         },
         charset: cli.charset.clone(),
         password: cli.pwd.clone(),
+        split: cli.split.map(|percent| {
+            Split::new(percent, cli.split_pos, cli.reading_order)
+                .expect("the parser accepted a split percentage in 1..=50")
+        }),
     };
 
     // The input's *kind* is established before its format, and both before anything is
@@ -466,7 +496,9 @@ fn run(cli: &Cli, input: &Path) -> Result<(Report, PathBuf), CliError> {
         note(format_args!("debug: {}", described(&options, &settings)));
     }
     let mut observe = |page: pipeline::Trace<'_>| {
-        totals.0 = totals.0.saturating_add(page.outcome.source_bytes);
+        if page.piece == 0 {
+            totals.0 = totals.0.saturating_add(page.outcome.source_bytes);
+        }
         totals.1 = totals.1.saturating_add(page.outcome.encoded_bytes);
         note(format_args!("debug: {}", traced(&page)));
     };
@@ -726,34 +758,68 @@ fn described(options: &ReadOptions, settings: &Settings) -> String {
 ///
 /// [`Outcome`]: pipeline::Outcome
 fn traced(page: &pipeline::Trace<'_>) -> String {
+    use std::fmt::Write as _;
+
     let pipeline::Outcome {
         format,
         source_width,
         source_height,
+        window,
         plan,
         composited,
         source_bytes,
         encoded_bytes,
         ..
     } = page.outcome;
-    let size = match plan.scale_to(source_width, source_height) {
-        Some((width, height)) => format!("{source_width}x{source_height} -> {width}x{height}"),
-        None => format!(
-            "{source_width}x{source_height} kept ({})",
+    let mut line = page.position.saturating_add(1).to_string();
+    if page.pieces.get() > 1 {
+        write!(line, "[{}/{}]", page.piece.saturating_add(1), page.pieces)
+            .expect("writing to a String cannot fail");
+    }
+    write!(
+        line,
+        " {}: {} {source_width}x{source_height}",
+        page.name.escape_debug(),
+        format.name(),
+    )
+    .expect("writing to a String cannot fail");
+    let piece_width = if let Some(window) = window {
+        write!(
+            line,
+            " [{},{})",
+            window.left,
+            u64::from(window.left) + u64::from(window.width),
+        )
+        .expect("writing to a String cannot fail");
+        window.width
+    } else {
+        source_width
+    };
+    if let Some((width, height)) = plan.scale_to(piece_width, source_height) {
+        write!(line, " -> {width}x{height}").expect("writing to a String cannot fail");
+    } else {
+        if window.is_some() {
+            write!(line, " -> {piece_width}x{source_height}")
+                .expect("writing to a String cannot fail");
+        }
+        write!(
+            line,
+            " kept ({})",
             if matches!(plan, Plan::BelowFloor) {
                 "below floor"
             } else {
                 "at or below target"
             },
-        ),
-    };
-    format!(
-        "{} {}: {} {size}, {source_bytes} -> {encoded_bytes} bytes{}",
-        page.position.saturating_add(1),
-        page.name.escape_debug(),
-        format.name(),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    write!(
+        line,
+        ", {source_bytes} -> {encoded_bytes} bytes{}",
         if composited { ", composited" } else { "" },
     )
+    .expect("writing to a String cannot fail");
+    line
 }
 
 #[derive(Debug, Error)]

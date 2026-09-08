@@ -462,6 +462,12 @@ mod tests {
     }
 
     #[test]
+    fn a_split_target_clears_the_piece_in_the_whole_page_frame() {
+        assert_eq!(scale_numerator(2612, 2004, 2560, 1964), None);
+        assert_eq!(scale_numerator(2612, 2004, 1280, 982), Some(4));
+    }
+
+    #[test]
     fn skips_scaling_when_the_target_is_not_smaller() {
         assert_eq!(scale_numerator(1520, 2150, 1520, 2150), None);
         assert_eq!(scale_numerator(1000, 1400, 2000, 2800), None);

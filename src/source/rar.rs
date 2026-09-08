@@ -44,6 +44,8 @@ use unrar_ng::{
     error::{Code, When},
 };
 
+use crate::policy::Split;
+
 use super::probe::{self, MAGIC_MAX, Names, Naming};
 use super::{
     Entry, HINT_CEILING, MAX_ENTRY_BYTES, ReadOptions, SourceError, is_directory, unsafe_name,
@@ -71,6 +73,7 @@ pub struct RarSource {
     /// the archive held something that was not a page.
     next_index: u32,
     names: Names,
+    split: Option<Split>,
     /// Whether a password was supplied, which is all this reader needs: `unrar` was given it
     /// at open, so an encrypted entry either reads or reports its own failure. Without one, an
     /// encrypted entry is refused by name rather than handed to a decoder that will guess.
@@ -102,7 +105,9 @@ impl RarSource {
 
         let names = match options.naming {
             Naming::Stored => Names::stored(),
-            Naming::ByPosition => Names::by_position(count_entries(path)?),
+            Naming::ByPosition => {
+                Names::by_position(count_entries(path)?, 1 + u32::from(options.split.is_some()))
+            }
         };
 
         // `options.charset` is not consulted, and this is the module the reason belongs in:
@@ -116,6 +121,7 @@ impl RarSource {
             archive: Some(archive.open_for_processing()?),
             next_index: 0,
             names,
+            split: options.split,
             has_password: options.password.is_some(),
         })
     }
@@ -277,11 +283,13 @@ impl RarSource {
             self.archive = Some(next);
 
             self.next_index += 1;
+            let (name, spread) = self.names.of_entry(&name, declared, &bytes, self.split);
             return Some(Ok(Entry {
                 index,
-                name: self.names.of(&name),
+                name,
                 format: declared,
                 bytes,
+                spread,
             }));
         }
     }

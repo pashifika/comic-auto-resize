@@ -9,7 +9,10 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::page::{ENCODED_FORMAT, Format, SOI_MARKER};
+use crate::page::{Budget, ENCODED_FORMAT, Format, SOI_MARKER, header};
+use crate::policy::{Split, is_spread};
+
+use super::Spread;
 
 /// One format's identifying bytes: fixed bytes, positions whose value is not compared, then
 /// fixed bytes again.
@@ -235,12 +238,11 @@ pub struct Names {
 /// The state [`Naming::ByPosition`] needs: one width, and one counter per directory.
 #[derive(Debug)]
 struct Positions {
-    /// `digits(total)`, which is the smallest width at which ordering by name agrees with
-    /// ordering by number.
+    /// `digits(total * max_pieces)`, fixed before the first page is read.
     width: usize,
-    /// Directory component of the entry name to the next position within it. A flat archive
-    /// holds exactly one entry, keyed by the empty string.
-    next: HashMap<String, u32>,
+    /// Directory component to its last assigned position. Pieces can outnumber the u32
+    /// input index, so the counter is u64; a flat archive has one bucket.
+    next: HashMap<String, u64>,
 }
 
 impl Names {
@@ -250,86 +252,122 @@ impl Names {
         Self { positions: None }
     }
 
-    /// Names carry their own position, at the width `total` entries require.
+    /// Names carry their own position, at the width `total * max_pieces` requires.
     ///
     /// `total` is the entry total rather than a count of pages. An exact page count would
     /// make the counting pass duplicate the extension filter to move a digit in a book of
     /// exactly 100 candidate pages holding one entry that is not a page, so the width is
     /// allowed to be one wider than strictly needed.
+    /// `max_pieces` is two when splitting is requested, otherwise one; the actual piece
+    /// total is not available until the end of the stream.
     #[must_use]
-    pub fn by_position(total: usize) -> Self {
+    pub fn by_position(total: usize, max_pieces: u32) -> Self {
         Self {
             positions: Some(Positions {
-                width: digits(total),
+                width: digits(total as u128 * u128::from(max_pieces)),
                 next: HashMap::new(),
             }),
         }
     }
 
-    /// The output name for `stored`, advancing the position counter when it renames.
-    pub fn of(&mut self, stored: &str) -> String {
+    /// One name, or two in reading order when `split` is true. Counters advance per piece;
+    /// an unnumbered stem follows stored naming and consumes no position.
+    ///
+    /// A fixed pair avoids a collection allocation on every unsplit entry.
+    pub fn of_pieces(&mut self, stored: &str, split: bool) -> (String, Option<String>) {
         match &mut self.positions {
-            None => output_name(stored),
-            Some(positions) => positions.of(stored),
+            None => stored_pieces(stored, split),
+            Some(positions) => positions.of_pieces(stored, split),
         }
+    }
+
+    /// The shared reader gate, after format probing and name safety checks.
+    pub(super) fn of_entry(
+        &mut self,
+        stored: &str,
+        format: Format,
+        bytes: &[u8],
+        split: Option<Split>,
+    ) -> (String, Option<Spread>) {
+        // No option means no header parse. A failed header stays the worker's page error,
+        // with the ordinary single-piece name, rather than becoming a source error.
+        let split = split.filter(|_| {
+            header(stored, bytes, format, Budget::default())
+                .is_ok_and(|(width, height)| is_spread(width, height))
+        });
+        let (name, second_name) = self.of_pieces(stored, split.is_some());
+        let spread = split
+            .zip(second_name)
+            .map(|(split, second_name)| Spread { split, second_name });
+        (name, spread)
     }
 }
 
+fn stored_pieces(stored: &str, split: bool) -> (String, Option<String>) {
+    if !split {
+        return (output_name(stored), None);
+    }
+    let (stem, _) = split_extension(stored);
+    let extension = ENCODED_FORMAT.extension();
+    let suffixed = |piece| {
+        let mut name = String::with_capacity(stem.len() + 3 + extension.len());
+        name.push_str(stem);
+        name.push('-');
+        name.push(piece);
+        name.push('.');
+        name.push_str(extension);
+        name
+    };
+    // '-' is immediately below '.', but neighbours continuing with either byte can
+    // interleave. Other byte-order comparisons survive inserting this suffix.
+    (suffixed('1'), Some(suffixed('2')))
+}
+
 impl Positions {
-    fn of(&mut self, stored: &str) -> String {
+    fn of_pieces(&mut self, stored: &str, split: bool) -> (String, Option<String>) {
         let (stem, _) = split_extension(stored);
         let prefix = stem.trim_end_matches(|character: char| character.is_ascii_digit());
-        // No trailing digit run, so there is nothing for the rule to replace and it does
-        // not run. Not a case carved out of the rule: `cover.jpg` keeps its name, and the
-        // counter does not advance, so an unnumbered entry consumes no page number.
+        // No trailing digit run: keep stored naming, including a split suffix, without
+        // consuming any position.
         if prefix.len() == stem.len() {
-            return output_name(stored);
+            return stored_pieces(stored, split);
         }
-        // Per directory *component of the entry name*, whatever the input's kind: an archive
-        // stores `/` in an entry name as readily as a filesystem does, so `ch1/` and `ch2/`
-        // are two runs of pages either way.
-        //
-        // The key folds `\` to `/`, and that is what makes the collision-freedom claim true
-        // of *paths* rather than only of strings. An archive written on Windows stores `\`,
-        // so `ch1/page5.jpg` and `ch1\page9.jpg` are two spellings of one directory: two
-        // buckets would give both position one, two distinct zip entry names, and one file
-        // once extracted on Windows — with the writer's duplicate-name refusal comparing
-        // exact strings and so unable to fire. One bucket, one sequence, no collision. The
-        // output name keeps the separator the input used; only the counter is shared.
+        // Chapters have separate counters, but '/' and '\\' spell the same directory.
+        // Separate buckets would assign duplicate extracted paths that the writer's exact
+        // string comparison could not catch. Keep the stored spelling in the output.
+        // Unnumbered split suffixes can still collide; those are the writer's to refuse.
         let directory = &prefix[..prefix.rfind(['/', '\\']).map_or(0, |at| at + 1)];
-        let position = self
-            .next
-            .entry(directory.replace('\\', "/"))
-            .and_modify(|next| *next += 1)
-            .or_insert(1);
+        let position = self.next.entry(directory.replace('\\', "/")).or_insert(0);
 
         let extension = ENCODED_FORMAT.extension();
-        let mut renamed =
-            String::with_capacity(prefix.len() + 1 + self.width + 1 + extension.len());
-        renamed.push_str(prefix);
+        let width = self.width;
         // Omitted where the file part of the prefix is empty, so `1.jpg` becomes `001.jpg`,
         // and where it does not end in an alphanumeric, so `page_1.jpg` does not gain a
         // second underscore.
-        if prefix.len() > directory.len()
+        let separator = prefix.len() > directory.len()
             && prefix
                 .chars()
                 .next_back()
-                .is_some_and(char::is_alphanumeric)
-        {
-            renamed.push('_');
-        }
-        // The position rather than the number the input recorded, which is what makes the
-        // rule statable without deciding which digits in a name were meant to be the page.
-        write!(renamed, "{position:0width$}", width = self.width)
-            .expect("writing to a String cannot fail");
-        renamed.push('.');
-        renamed.push_str(extension);
-        renamed
+                .is_some_and(char::is_alphanumeric);
+        let mut renamed = || {
+            *position += 1;
+            let mut name = String::with_capacity(prefix.len() + 1 + width + 1 + extension.len());
+            name.push_str(prefix);
+            if separator {
+                name.push('_');
+            }
+            // The position, not the number the input recorded.
+            write!(name, "{position:0width$}").expect("writing to a String cannot fail");
+            name.push('.');
+            name.push_str(extension);
+            name
+        };
+        (renamed(), split.then(renamed))
     }
 }
 
 /// How many decimal digits `total` occupies, and never fewer than one.
-fn digits(total: usize) -> usize {
+fn digits(total: u128) -> usize {
     let mut digits = 1;
     let mut remaining = total / 10;
     while remaining > 0 {
@@ -371,8 +409,11 @@ mod tests {
 
     /// Every name a `Names` produces for `stored`, in order.
     fn renamed(total: usize, stored: &[&str]) -> Vec<String> {
-        let mut names = Names::by_position(total);
-        stored.iter().map(|name| names.of(name)).collect()
+        let mut names = Names::by_position(total, 1);
+        stored
+            .iter()
+            .map(|name| names.of_pieces(name, false).0)
+            .collect()
     }
 
     #[test]
@@ -488,8 +529,128 @@ mod tests {
     #[test]
     fn the_default_naming_rewrites_only_the_extension() {
         let mut names = Names::stored();
-        assert_eq!(names.of("page1.jpeg"), "page1.jpg");
-        assert_eq!(names.of("ch1/cover.JPG"), "ch1/cover.jpg");
+        assert_eq!(
+            names.of_pieces("page1.jpeg", false),
+            ("page1.jpg".to_owned(), None)
+        );
+        assert_eq!(
+            names.of_pieces("ch1/cover.JPG", false),
+            ("ch1/cover.jpg".to_owned(), None)
+        );
+    }
+
+    #[test]
+    fn stored_split_names_keep_the_directory_and_follow_the_encoder_extension() {
+        let mut names = Names::stored();
+        for (stored, first, second) in [
+            ("002.jpg", "002-1.jpg", "002-2.jpg"),
+            ("ch1/page3.webp", "ch1/page3-1.jpg", "ch1/page3-2.jpg"),
+            ("ch1\\page3.png", "ch1\\page3-1.jpg", "ch1\\page3-2.jpg"),
+            ("v1.2/page3.jpeg", "v1.2/page3-1.jpg", "v1.2/page3-2.jpg"),
+        ] {
+            assert_eq!(
+                names.of_pieces(stored, true),
+                (first.to_owned(), Some(second.to_owned()))
+            );
+        }
+    }
+
+    #[test]
+    fn split_positions_count_pieces_but_not_unnumbered_covers() {
+        let mut names = Names::by_position(5, 2);
+        for (stored, split, first, second) in [
+            ("cover.jpg", true, "cover-1.jpg", Some("cover-2.jpg")),
+            ("page8.jpg", false, "page_01.jpg", None),
+            (
+                "ch1/page3.webp",
+                true,
+                "ch1/page_01.jpg",
+                Some("ch1/page_02.jpg"),
+            ),
+            ("ch1\\page9.png", false, "ch1\\page_03.jpg", None),
+            ("ch2/07.jpeg", true, "ch2/01.jpg", Some("ch2/02.jpg")),
+        ] {
+            assert_eq!(
+                names.of_pieces(stored, split),
+                (first.to_owned(), second.map(str::to_owned))
+            );
+        }
+    }
+
+    #[test]
+    fn requesting_splitting_widens_positions_even_without_a_spread() {
+        let mut names = Names::by_position(95, 2);
+        assert_eq!(names.of_pieces("page7.jpg", false).0, "page_001.jpg");
+    }
+
+    fn assert_neighbour_order(stem: &str, first: &str, second: &str, neighbour: &str) {
+        if neighbour
+            .strip_prefix(stem)
+            .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('.'))
+        {
+            return;
+        }
+        let original = format!("{stem}.jpg");
+        let expected = original.as_str().cmp(neighbour);
+        assert_eq!(
+            first.cmp(neighbour),
+            expected,
+            "{original:?}, {neighbour:?}"
+        );
+        assert_eq!(
+            second.cmp(neighbour),
+            expected,
+            "{original:?}, {neighbour:?}"
+        );
+    }
+
+    #[test]
+    fn split_names_preserve_byte_order_against_generated_neighbours() {
+        // Deterministic Cartesian generation, including shared prefixes, prefixes ending
+        // before the stem, controls, separators and multibyte characters. No random seed or
+        // property-test dependency is needed to vary the first divergent byte and its tail.
+        let atoms = [
+            "",
+            "\0",
+            " ",
+            "-",
+            ".",
+            "/",
+            "0",
+            "2",
+            "9",
+            "_",
+            "表",
+            "\u{1fb80}",
+        ];
+        for stem in ["002", "ch1/page3", "v1.2/002", "表紙"] {
+            let (first, second) = Names::stored().of_pieces(&format!("{stem}.jpg"), true);
+            let second = second.expect("two pieces");
+            for at in (0..=stem.len()).filter(|at| stem.is_char_boundary(*at)) {
+                for a in atoms {
+                    for b in atoms {
+                        for c in atoms {
+                            let neighbour = format!("{}{a}{b}{c}", &stem[..at]);
+                            assert_neighbour_order(stem, &first, &second, &neighbour);
+                        }
+                    }
+                }
+            }
+        }
+        let (first, second) = Names::stored().of_pieces("002.jpg", true);
+        for neighbour in ["001.jpg", "003.jpg", "0020.jpg", "002 (2).jpg"] {
+            assert_neighbour_order("002", &first, second.as_deref().expect("two"), neighbour);
+        }
+    }
+
+    #[test]
+    fn neighbours_continuing_with_dash_or_dot_are_outside_the_sort_guarantee() {
+        let (first, second) = Names::stored().of_pieces("002.jpg", true);
+        for neighbour in ["002-5.jpg", "002.a.jpg", "002.jpeg", "002.jpg"] {
+            let original = "002.jpg".cmp(neighbour);
+            assert_ne!(first.as_str().cmp(neighbour), original);
+            assert_ne!(second.as_deref().expect("two").cmp(neighbour), original);
+        }
     }
 
     #[test]
@@ -716,8 +877,14 @@ mod tests {
             }
         }
         let mut names = Names::stored();
-        assert_eq!(names.of("pages/page01.png"), "pages/page01.jpg");
-        let mut positional = Names::by_position(9);
-        assert_eq!(positional.of("pages/page3.webp"), "pages/page_1.jpg");
+        assert_eq!(
+            names.of_pieces("pages/page01.png", false).0,
+            "pages/page01.jpg"
+        );
+        let mut positional = Names::by_position(9, 1);
+        assert_eq!(
+            positional.of_pieces("pages/page3.webp", false).0,
+            "pages/page_1.jpg"
+        );
     }
 }

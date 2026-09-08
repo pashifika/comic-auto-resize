@@ -19,7 +19,12 @@ use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use comic_auto_resize::page::{Channels, EncodeSettings, Format, PageImage, encode};
+use comic_auto_resize::page::{
+    Channels, DecodeSettings, EncodeSettings, Filter, Format, PageImage, encode,
+};
+use comic_auto_resize::pipeline::{self, RunError, Settings};
+use comic_auto_resize::policy::{ReadingOrder, Split, Target};
+use comic_auto_resize::source::{Entries, Naming, ReadOptions};
 use flate2::write::{DeflateEncoder, ZlibEncoder};
 use flate2::{Compression, Crc};
 use image::{DynamicImage, GrayImage, ImageBuffer, ImageFormat, Rgb, RgbImage, Rgba, RgbaImage};
@@ -98,6 +103,116 @@ pub fn png_page(width: u32, height: u32) -> Vec<u8> {
         ),
         ImageFormat::Png,
     )
+}
+
+/// Shared split-gate fixture, also emitted for the manual RAR fixture builder.
+pub fn split_reader_pages() -> [(&'static str, Vec<u8>); 5] {
+    [
+        ("cover.png", png_page(140, 100)),
+        ("page3.png", png_page(140, 100)),
+        ("page4.png", png_page(100, 140)),
+        ("page5.png", png_page(172, 100)),
+        // Enough magic to pass the source probe, but no image header.
+        ("page6.png", b"\x89PNG\r\n\x1a\n".to_vec()),
+    ]
+}
+
+/// Every container must admit the same spreads, name pieces in read order, and leave an
+/// unreadable header to the worker's named error path.
+pub fn assert_reader_split_contract<S>(mut open: impl FnMut(&ReadOptions) -> S)
+where
+    S: Entries + Send,
+{
+    let scratch = TempDir::new("reader-split-contract");
+    let output = scratch.join("out.zip");
+    let settings = Settings {
+        jobs: std::num::NonZeroUsize::new(1).expect("non-zero"),
+        target: Target::Width(1280),
+        filter: Filter::default(),
+        decode: DecodeSettings::default(),
+        encode: EncodeSettings::default(),
+    };
+    for naming in [Naming::Stored, Naming::ByPosition] {
+        for split in [
+            None,
+            Some(Split::new(45, 2, ReadingOrder::Left).expect("valid split")),
+        ] {
+            let options = ReadOptions {
+                naming,
+                split,
+                ..Default::default()
+            };
+            let expected = match (naming, split.is_some()) {
+                (Naming::Stored, false) => [
+                    ("cover.jpg", None),
+                    ("page3.jpg", None),
+                    ("page4.jpg", None),
+                    ("page5.jpg", None),
+                    ("page6.jpg", None),
+                ],
+                (Naming::Stored, true) => [
+                    ("cover-1.jpg", Some("cover-2.jpg")),
+                    ("page3-1.jpg", Some("page3-2.jpg")),
+                    ("page4.jpg", None),
+                    ("page5.jpg", None),
+                    ("page6.jpg", None),
+                ],
+                (Naming::ByPosition, false) => [
+                    ("cover.jpg", None),
+                    ("page_1.jpg", None),
+                    ("page_2.jpg", None),
+                    ("page_3.jpg", None),
+                    ("page_4.jpg", None),
+                ],
+                (Naming::ByPosition, true) => [
+                    ("cover-1.jpg", Some("cover-2.jpg")),
+                    ("page_01.jpg", Some("page_02.jpg")),
+                    ("page_03.jpg", None),
+                    ("page_04.jpg", None),
+                    ("page_05.jpg", None),
+                ],
+            };
+            let mut source = open(&options);
+            for (index, (name, second)) in expected.into_iter().enumerate() {
+                let entry = source
+                    .next_entry()
+                    .expect("an entry")
+                    .expect("reader succeeds");
+                assert_eq!(entry.index, u32::try_from(index).expect("five entries"));
+                assert_eq!(entry.name, name);
+                assert_eq!(
+                    entry
+                        .spread
+                        .as_ref()
+                        .map(|spread| spread.second_name.as_str()),
+                    second,
+                    "{name}"
+                );
+            }
+            assert!(
+                source.next_entry().is_none(),
+                "one index per input, not per piece"
+            );
+            drop(source);
+
+            let error = pipeline::run(open(&options), &output, &settings, None)
+                .expect_err("the unreadable header must still fail in the worker");
+            match error {
+                RunError::Page(error) => {
+                    assert_eq!(error.name, expected[4].0);
+                    assert!(matches!(
+                        error.kind,
+                        comic_auto_resize::page::PageErrorKind::Decode {
+                            format: Format::Png,
+                            ..
+                        }
+                    ));
+                }
+                other => panic!("expected the worker's page error, got {other}"),
+            }
+            assert!(!output.exists(), "the failed run leaves no shortened book");
+        }
+    }
 }
 
 /// The same page encoded as bmp.
@@ -1066,8 +1181,7 @@ pub fn corrupt_scan(jpeg: &[u8], offset: usize) -> Vec<u8> {
     damaged
 }
 
-/// The options `--fix-idx` produces, which is the only naming a test ever asks for beside the
-/// default.
+/// The options `--fix-idx` produces without splitting.
 pub fn by_position() -> comic_auto_resize::source::ReadOptions {
     comic_auto_resize::source::ReadOptions {
         naming: comic_auto_resize::source::Naming::ByPosition,

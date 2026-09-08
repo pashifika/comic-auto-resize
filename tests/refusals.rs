@@ -209,6 +209,9 @@ fn a_value_inside_its_range_is_accepted() {
         vec!["--dct", "islow"],
         vec!["--resize-mode", "nearest-neighbor"],
         vec!["--progressive=false"],
+        vec!["--split=1"],
+        vec!["--split=50", "--split-pos=0", "--reading-order=r"],
+        vec!["--split=50", "--reading-order=l"],
     ] {
         let directory = TempDir::new("in-range");
         let input = valid_input(&directory);
@@ -374,6 +377,46 @@ fn the_option_fault_wins_over_the_input_fault() {
     );
 }
 
+/// Split parameters are parser faults even when the input cannot be opened or read.
+#[test]
+fn invalid_split_parameters_are_refused_before_the_input() {
+    let directory = TempDir::new("split-parameters");
+    let missing = directory.join("missing.zip");
+    let decoy = directory.join("decoy.zip");
+    fs::write(&decoy, b"not an archive").expect("writes the decoy");
+    let cases: &[(&[&str], &[&str])] = &[
+        (&["--split=0"], &["--split", "1..=50"]),
+        (&["--split=51"], &["--split", "1..=50"]),
+        (&["--split-pos", "10"], &["--split"]),
+        (&["--split-pos", "0"], &["--split"]),
+        (&["--reading-order", "l"], &["--split"]),
+        (&["--reading-order", "r"], &["--split"]),
+        (&["--split=50", "--split-pos=-1"], &["--split-pos"]),
+        (&["--split=50", "--split-pos=4294967296"], &["--split-pos"]),
+        (&["--split=50", "--reading-order=x"], &["--reading-order"]),
+    ];
+    for broken in [&missing, &decoy] {
+        for (flags, expected) in cases {
+            let mut args: Vec<&OsStr> = flags.iter().map(OsStr::new).collect();
+            args.push(broken.as_os_str());
+            let (code, message) = refusal(&args);
+            assert_eq!(code, USAGE, "{flags:?}: {message}");
+            for &text in *expected {
+                assert!(message.contains(text), "{flags:?}: {message}");
+            }
+            assert!(
+                !message.contains(&broken.display().to_string()),
+                "the input fault won over {flags:?}: {message}"
+            );
+            assert!(!default_output(broken).exists());
+        }
+
+        let (code, message) = refusal(&["--split=50".as_ref(), broken.as_ref()]);
+        assert_eq!(code, RUNTIME, "{message}");
+        assert!(message.contains(&broken.display().to_string()), "{message}");
+    }
+}
+
 /// A value drawn from a fixed set is refused with the set listed, on every flag that has one.
 ///
 /// One rule over three flags from three Changes, so the completion generator's unknown-shell
@@ -407,6 +450,20 @@ fn a_rejected_value_from_a_fixed_set_lists_the_set() {
         assert!(
             message.contains(shell),
             "`{shell}` is missing from: {message}"
+        );
+    }
+
+    let (code, message) = refusal(&[
+        "--split=50".as_ref(),
+        "--reading-order=x".as_ref(),
+        input.as_ref(),
+    ]);
+    assert_eq!(code, USAGE, "{message}");
+    let words: Vec<&str> = message.split(|c: char| !c.is_alphanumeric()).collect();
+    for order in ["r", "l"] {
+        assert!(
+            words.contains(&order),
+            "`{order}` is missing from: {message}"
         );
     }
 }
