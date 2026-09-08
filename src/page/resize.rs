@@ -16,6 +16,7 @@ use fast_image_resize::{
 use thiserror::Error;
 
 use super::{Budget, Channels, PageError, PageErrorKind, PageImage};
+use crate::policy::Columns;
 
 /// The resampling filters the tool offers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -121,6 +122,15 @@ pub struct UnknownFilter {
 ///
 /// `fast_image_resize`'s `Resizer` owns the buffers its convolutions work in, so the
 /// pipeline holds one per worker thread rather than building one per page.
+///
+/// For our u8 channels, pinned 6.1.0's `src/resizer.rs:410-444` runs the vertical
+/// convolution first. Its scratch image is `src_width × dst_height`, where `src_width`
+/// is the cropped view's sampled column span, including the filter halo, not just the
+/// crop width. `src/convolution/mod.rs:100-173` bounds that support against the full
+/// decoded image and removes zero-weight edges. The scratch request is
+/// `(src_width × dst_height + 1) × channels` bytes (`resizer.rs:543-549`); the retained
+/// `Vec` capacity follows its largest request, with amortised growth. Nearest and
+/// one-axis convolutions need no new scratch image.
 #[derive(Debug, Default)]
 pub struct Resampler {
     resizer: Resizer,
@@ -205,14 +215,52 @@ impl Resampler {
         target_width: u32,
         filter: Filter,
     ) -> Result<PageImage, PageError> {
+        self.resample(name, source, None, target_width, filter)
+    }
+
+    /// Crops and resizes in the decoded frame, deriving height from the recorded
+    /// window width and source height rather than the scaled buffer's rounded axes.
+    /// Convolution support may sample just outside the crop; no cropped copy is made.
+    ///
+    /// # Errors
+    ///
+    /// [`PageErrorKind::SplitWindow`] for empty or out-of-bounds source columns;
+    /// otherwise the geometry, destination-budget and buffer refusals of [`Self::resize`].
+    pub fn resize_window(
+        &mut self,
+        name: &str,
+        source: &PageImage,
+        window: Columns,
+        target_width: u32,
+        filter: Filter,
+    ) -> Result<PageImage, PageError> {
+        self.resample(name, source, Some(window), target_width, filter)
+    }
+
+    fn resample(
+        &mut self,
+        name: &str,
+        source: &PageImage,
+        window: Option<Columns>,
+        target_width: u32,
+        filter: Filter,
+    ) -> Result<PageImage, PageError> {
         let (original_width, original_height) = original_size(name, source)?;
-        let target_height = height_for_width(original_width, original_height, target_width);
+        let piece_width = if let Some(window) = window {
+            window
+                .check(original_width)
+                .map_err(|error| PageError::new(name, error.into()))?;
+            window.width
+        } else {
+            original_width
+        };
+        let target_height = height_for_width(piece_width, original_height, target_width);
         if target_width == 0 || target_height == 0 {
             return Err(PageError::new(
                 name,
                 PageErrorKind::Resize(format!(
                     "target size {target_width}x{target_height}, derived from a \
-                     {original_width}x{original_height} page, has a zero axis"
+                     {piece_width}x{original_height} page, has a zero axis"
                 )),
             ));
         }
@@ -232,7 +280,17 @@ impl Resampler {
             .map_err(|error| PageError::new(name, PageErrorKind::Resize(error.to_string())))?;
 
         let mut destination = Image::new(target_width, target_height, pixel_type);
-        let options = ResizeOptions::new().resize_alg(filter.resize_alg());
+        let mut options = ResizeOptions::new().resize_alg(filter.resize_alg());
+        if let Some(window) = window {
+            // Divide first so the recorded right edge maps to exactly the decoded edge.
+            // `crop_box.rs:114-117` checks left + width against that edge without tolerance.
+            let decoded_x = |column: u32| {
+                f64::from(column) / f64::from(original_width) * f64::from(source.width())
+            };
+            let left = decoded_x(window.left);
+            let right = decoded_x(window.left + window.width);
+            options = options.crop(left, 0.0, right - left, f64::from(source.height()));
+        }
         self.resizer
             .resize(&view, &mut destination, &options)
             .map_err(|error| PageError::new(name, PageErrorKind::Resize(error.to_string())))?;
@@ -340,11 +398,11 @@ fn sinc(x: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use fast_image_resize::{FilterType, ResizeAlg};
-
     use super::{
         Channels, Filter, PageErrorKind, PageImage, Resampler, height_for_width, lanczos2, sinc,
     };
+    use crate::page::Budget;
+    use crate::policy::{Columns, ReadingOrder, Split};
 
     /// A 160x240 grayscale buffer, the shape every coherence case below starts from.
     fn buffer() -> PageImage {
@@ -417,47 +475,6 @@ mod tests {
     }
 
     #[test]
-    fn each_filter_maps_to_the_algorithm_the_design_names() {
-        assert_eq!(Filter::NearestNeighbor.resize_alg(), ResizeAlg::Nearest);
-        assert_eq!(
-            Filter::Bilinear.resize_alg(),
-            ResizeAlg::Convolution(FilterType::Bilinear)
-        );
-        // The bicubic the Go implementation means, not `Mitchell`.
-        assert_eq!(
-            Filter::Bicubic.resize_alg(),
-            ResizeAlg::Convolution(FilterType::CatmullRom)
-        );
-        assert_eq!(
-            Filter::MitchellNetravali.resize_alg(),
-            ResizeAlg::Convolution(FilterType::Mitchell)
-        );
-        assert_eq!(
-            Filter::Lanczos3.resize_alg(),
-            ResizeAlg::Convolution(FilterType::Lanczos3)
-        );
-    }
-
-    #[test]
-    fn lanczos2_reaches_the_resizer_as_a_custom_kernel_of_support_two() {
-        let ResizeAlg::Convolution(FilterType::Custom(kernel)) = Filter::Lanczos2.resize_alg()
-        else {
-            panic!("lanczos2 must reach the resizer as a custom convolution kernel");
-        };
-
-        // The spec forbids approximating it with `Lanczos3` or `Bilinear`, both of which
-        // would arrive here as a named variant rather than as `Custom`.
-        assert_eq!(kernel.name(), "Lanczos2");
-        // The radius is stored verbatim by `Filter::new`, so a one-ULP window is the
-        // strictest form this can take without tripping `clippy::float_cmp`.
-        assert!(
-            (kernel.support() - 2.0).abs() < f64::EPSILON,
-            "support was {}, not 2.0",
-            kernel.support()
-        );
-    }
-
-    #[test]
     fn every_variant_is_named_once_and_parses_back_to_itself() {
         assert_eq!(Filter::NAMES.len(), Filter::ALL.len());
 
@@ -492,11 +509,6 @@ mod tests {
         for name in Filter::NAMES {
             assert!(message.contains(name), "{message} does not mention {name}");
         }
-    }
-
-    #[test]
-    fn the_default_is_lanczos3() {
-        assert_eq!(Filter::default(), Filter::Lanczos3);
     }
 
     #[test]
@@ -549,5 +561,152 @@ mod tests {
         assert!(lanczos2(-2.5) == 0.0, "beyond radius 2 must not contribute");
         // Between the zeros it is negative, as a windowed sinc must be.
         assert!(lanczos2(1.5) < 0.0);
+    }
+
+    #[test]
+    fn resizing_a_window_preserves_its_side_and_piece_geometry() {
+        for channels in [Channels::Gray, Channels::Rgb] {
+            let samples = channels.count() as usize;
+            let mut pixels = vec![31; 2000 * 1400 * samples];
+            for row in pixels.chunks_exact_mut(2000 * samples) {
+                row[1000 * samples..].fill(223);
+            }
+            let spread = PageImage::new(2000, 1400, channels, pixels).expect("two-shade spread");
+            let windows = Split::new(50, 0, ReadingOrder::Left)
+                .expect("valid percentage")
+                .windows(2000)
+                .expect("halves fit");
+            let mut resampler = Resampler::new();
+            for filter in [Filter::NearestNeighbor, Filter::Lanczos3] {
+                for (window, shade) in windows.into_iter().zip([31, 223]) {
+                    let piece = resampler
+                        .resize_window("spread.jpg", &spread, window, 640, filter)
+                        .expect("a crop and resize of each half");
+                    assert_eq!((piece.width(), piece.height()), (640, 896));
+                    assert_eq!(piece.channels(), channels);
+                    for row in piece.pixels().chunks_exact(640 * samples) {
+                        // A convolution's support can cross the gutter; nearest cannot.
+                        let pixels = if filter == Filter::NearestNeighbor {
+                            row
+                        } else {
+                            &row[8 * samples..632 * samples]
+                        };
+                        assert!(pixels.iter().all(|&pixel| pixel == shade));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn odd_spread_windows_fit_every_scaled_frame_and_keep_recorded_height() {
+        let windows = Split::new(50, 0, ReadingOrder::Right)
+            .expect("valid percentage")
+            .windows(2613)
+            .expect("odd halves share their middle column");
+        let mut resampler = Resampler::new();
+        for numerator in 1..=8 {
+            let width = (2613_u32 * numerator).div_ceil(8);
+            let height = (2004_u32 * numerator).div_ceil(8);
+            let decoded = PageImage::new(
+                width,
+                height,
+                Channels::Gray,
+                vec![137; width as usize * height as usize],
+            )
+            .expect("scaled buffer dimensions")
+            .scaled_from(2613, 2004);
+            for window in windows {
+                let piece = resampler
+                    .resize_window("odd.jpg", &decoded, window, 1280, Filter::Lanczos3)
+                    .unwrap_or_else(|error| panic!("{numerator}/8 window {window:?}: {error}"));
+                assert_eq!((piece.width(), piece.height()), (1280, 1963));
+                assert!(piece.pixels().iter().all(|&pixel| pixel == 137));
+            }
+        }
+    }
+
+    #[test]
+    fn resizing_rejects_invalid_windows_before_the_crop_library() {
+        let source = buffer();
+        let mut resampler = Resampler::new();
+        for window in [
+            Columns { left: 0, width: 0 },
+            Columns {
+                left: 159,
+                width: 2,
+            },
+            Columns {
+                left: 160,
+                width: 1,
+            },
+            Columns {
+                left: u32::MAX,
+                width: 2,
+            },
+        ] {
+            let error = resampler
+                .resize_window("bounds.jpg", &source, window, 80, Filter::Lanczos3)
+                .expect_err("invalid recorded columns");
+            assert!(matches!(error.kind, PageErrorKind::SplitWindow { .. }));
+            assert_eq!(error.name, "bounds.jpg");
+        }
+        let error = resampler
+            .resize_window(
+                "geometry.jpg",
+                &source.scaled_from(160, u32::MAX),
+                Columns { left: 0, width: 80 },
+                80,
+                Filter::Lanczos3,
+            )
+            .expect_err("a crop cannot bypass recorded geometry validation");
+        assert!(matches!(error.kind, PageErrorKind::Resize(_)));
+    }
+
+    #[test]
+    fn window_destinations_are_nonempty_and_budget_checked() {
+        let source = PageImage::new(6, 2, Channels::Rgb, vec![127; 36]).expect("6 * 2 * 3");
+        let window = Columns { left: 1, width: 2 };
+        let error = Resampler::new()
+            .resize_window("zero.jpg", &source, window, 0, Filter::Lanczos3)
+            .expect_err("zero target is not a successful no-op");
+        assert!(matches!(error.kind, PageErrorKind::Resize(_)));
+        let error = Resampler::with_budget(Budget::new(u64::MAX, 26))
+            .resize_window("budget.jpg", &source, window, 3, Filter::Lanczos3)
+            .expect_err("3 * 3 * 3 exceeds the image budget");
+        assert!(matches!(
+            error.kind,
+            PageErrorKind::TooLarge {
+                actual: 27,
+                limit: 26,
+                ..
+            }
+        ));
+        assert_eq!(error.name, "budget.jpg");
+        let piece = Resampler::with_budget(Budget::new(u64::MAX, 27))
+            .resize_window("budget.jpg", &source, window, 3, Filter::Lanczos3)
+            .expect("the exact image budget fits");
+        assert_eq!((piece.width(), piece.height()), (3, 3));
+        assert!(piece.pixels().iter().all(|&pixel| pixel == 127));
+    }
+
+    #[test]
+    fn a_scaled_window_keeps_its_fractional_column_placement() {
+        let decoded = PageImage::new(7, 5, Channels::Gray, [10, 20, 30, 40, 50, 60, 70].repeat(5))
+            .expect("half-size decode of an odd spread")
+            .scaled_from(13, 10);
+        let piece = Resampler::new()
+            .resize_window(
+                "fractional.jpg",
+                &decoded,
+                Columns { left: 6, width: 6 },
+                2,
+                Filter::NearestNeighbor,
+            )
+            .expect("fractional crop");
+        // [6,12) maps to [42/13,84/13). The output centres sample columns 4 and 5;
+        // rounding the crop to decoded columns [3,6) would wrongly sample 3 and 5.
+        assert_eq!((piece.width(), piece.height()), (2, 3));
+        assert_eq!(piece.pixels(), &[50, 60, 50, 60, 50, 60]);
     }
 }

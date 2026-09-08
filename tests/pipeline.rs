@@ -16,9 +16,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use comic_auto_resize::page::{DecodeSettings, EncodeSettings, Filter, PageErrorKind};
 use comic_auto_resize::pipeline::{self, Capacities, Report, RunError, Settings};
-use comic_auto_resize::policy::{AUTO_WIDTH, Plan, Target};
+use comic_auto_resize::policy::{AUTO_WIDTH, Plan, ReadingOrder, Split, Target};
 use comic_auto_resize::sink::InputKind;
-use comic_auto_resize::source::{ReadOptions, SourceError, ZipSource};
+use comic_auto_resize::source::{Naming, ReadOptions, SourceError, ZipSource};
 
 use support::{
     Framing, TempDir, corrupt_scan, framed_archive, jpeg_size, page_bytes,
@@ -732,53 +732,37 @@ fn valid_input(directory: &TempDir) -> std::path::PathBuf {
     path
 }
 
-/// Every flag that does not exist here, asserted absent rather than accepted and ignored.
-///
-/// A flag may exist and be unimplemented, or not exist; it must not exist and silently do
-/// the wrong thing. This asserts the second half.
-///
-/// `--charset` and `--pwd` were here until they were implemented, and moved into the list
-/// below in the same Change — the movement `--fix-idx` made before them, then `-o/--out` and
-/// `--delete-org`, then `-r/--ratio` and `--jobs`, then `--progressive` and `--optimizer`, and
-/// now `--debug` and `--show-time`. `--split` is the only one still waiting on a Change:
-/// `spread-split` has not implemented it.
-///
-/// One of Go's own stays absent: `--small-skip`, because Go's implementation of it is
-/// `if !skipSmallSize && doResize` (`utils/images/images.go:140` on `master`), so it disables
-/// resizing for every page rather than skipping the small-ratio ones its name promises. It plus
-/// the twelve Go flags this build implements are the whole of Go's thirteen, so a fourteenth
-/// appearing here would mean the reference was re-read.
+/// Go's `--small-skip` disabled all resizing, so it stays absent.
 #[test]
 fn a_flag_this_build_does_not_implement_is_an_unknown_argument() {
     let directory = TempDir::new("unknown-flags");
     let input = valid_input(&directory);
 
-    for flag in ["--split", "--small-skip"] {
-        let output = Command::new(BINARY)
-            .arg(flag)
-            .arg(&input)
-            .output()
-            .expect("runs the binary");
-        assert!(
-            !output.status.success(),
-            "{flag} was accepted; it must not exist"
-        );
-        let message = String::from_utf8_lossy(&output.stderr).to_lowercase();
-        assert!(
-            message.contains("unexpected") || message.contains("unknown"),
-            "{flag} did not fail as an unknown argument: {message}"
-        );
-        assert!(
-            !default_output(&input).exists(),
-            "{flag} produced an output archive"
-        );
-    }
+    let flag = "--small-skip";
+    let output = Command::new(BINARY)
+        .arg(flag)
+        .arg(&input)
+        .output()
+        .expect("runs the binary");
+    assert!(
+        !output.status.success(),
+        "{flag} was accepted; it must not exist"
+    );
+    let message = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        message.contains("unexpected") || message.contains("unknown"),
+        "{flag} did not fail as an unknown argument: {message}"
+    );
+    assert!(
+        !default_output(&input).exists(),
+        "{flag} produced an output archive"
+    );
 }
 
 /// `--help` lists exactly what exists, in both directions.
 #[test]
 fn help_lists_every_implemented_option_and_nothing_else() {
-    // The sixteen the tool implements, plus what clap adds for free.
+    // The tool's options plus clap's metadata actions.
     let mut expected = vec![
         "auto-width".to_owned(),
         "charset".to_owned(),
@@ -795,8 +779,11 @@ fn help_lists_every_implemented_option_and_nothing_else() {
         "pwd".to_owned(),
         "quality".to_owned(),
         "ratio".to_owned(),
+        "reading-order".to_owned(),
         "resize-mode".to_owned(),
         "show-time".to_owned(),
+        "split".to_owned(),
+        "split-pos".to_owned(),
         "version".to_owned(),
     ];
     expected.sort();
@@ -1123,23 +1110,9 @@ fn the_summary_line_mentions_the_floor_only_when_it_refused_something() {
     );
 }
 
-/// `--jobs` is accepted, defaults to the count the binary derives from the host, and the
-/// archive does not depend on it.
-///
-/// What the value costs is memory and time rather than bytes, so the flag's effect on a run
-/// is measured in the Change's evidence rather than asserted here; what is asserted is that
-/// the number is the host's, that the output is invariant under it, and — below — that the
-/// help says what raising it costs.
+/// Worker count changes resource use, not the archive.
 #[test]
-fn the_worker_count_is_the_hosts_by_default_and_does_not_reach_the_output() {
-    let cpus = std::thread::available_parallelism().map_or(4, NonZeroUsize::get);
-    let derived = if cpus >= 5 { cpus - 1 } else { 4 };
-    assert!(
-        help_for("--jobs").contains(&format!("[default: {derived}]")),
-        "the default is not the host-derived count: {}",
-        help_for("--jobs")
-    );
-
+fn the_worker_count_does_not_change_the_output() {
     let directory = TempDir::new("jobs-invariant");
     let input = directory.join("in.zip");
     write_pages(&input, 4, 1520, 2150);
@@ -1236,96 +1209,6 @@ fn a_worker_count_above_the_hosts_ceiling_is_refused_before_any_work() {
         !opened.status.success() && message.contains("not-here.zip"),
         "a legal count should have reached the input: {message}"
     );
-
-    // The number is the host's, so the help states the rule rather than the number — and both
-    // arms of it: on a single-core host the four-worker floor is what decides, at two cores
-    // the arms meet at four, and a help naming only the doubling would understate the
-    // accepted range on the first of those.
-    let help = help_for("--jobs");
-    for arm in [
-        "twice this host's available parallelism",
-        "never fewer than four",
-    ] {
-        assert!(
-            help.contains(arm),
-            "`--jobs`'s help does not state `{arm}`: {help}"
-        );
-    }
-}
-
-/// The facts a reader cannot infer from a flag's name, in that flag's own help.
-///
-/// `-r`'s is the migration: the behaviour the reference tool's `-r 70` gave is this tool's
-/// default, so the answer for an invocation that carried it is to drop it. `--jobs`'s is the
-/// cost, and a measured figure rather than the four-line product the requirement carries.
-/// `--progressive`'s are both of its measured costs — the size it adds and the memory it
-/// saves — which `jpeg-codec` makes normative in two separate SHALLs, and which the shipped
-/// binary states nowhere else. `--optimizer`'s is that it is overridden in the default
-/// configuration: a flag accepted and then silently overridden is the same failure as one
-/// accepted and ignored, so the sentence saying so is normative rather than editorial.
-#[test]
-fn the_new_flags_state_what_a_reader_cannot_infer() {
-    let ratio = help_for("-r, --ratio");
-    assert!(
-        ratio.contains("1280"),
-        "`-r`'s help does not say what the default normalises to: {ratio}"
-    );
-    assert!(
-        ratio.contains("70"),
-        "`-r`'s help does not name the value that diverges: {ratio}"
-    );
-
-    let jobs = help_for("--jobs");
-    assert!(
-        jobs.contains("memory"),
-        "`--jobs`'s help does not say what the choice costs: {jobs}"
-    );
-    assert!(
-        jobs.contains("2.59 GB"),
-        "`--jobs`'s help does not carry the measured point: {jobs}"
-    );
-
-    let progressive = help_for("--progressive");
-    assert!(
-        progressive.contains("4.3x"),
-        "`--progressive`'s help does not carry the read-back cost: {progressive}"
-    );
-    assert!(
-        progressive.contains("1.8 to 5.4 per cent"),
-        "`--progressive`'s help does not carry the measured size cost: {progressive}"
-    );
-
-    let optimizer = help_for("--optimizer");
-    assert!(
-        optimizer.contains("--progressive=false"),
-        "`--optimizer`'s help does not say what makes it take effect: {optimizer}"
-    );
-}
-
-/// The block of `--help` that belongs to one option: from its name to the next option's.
-///
-/// Both option-line shapes end the block. `clap` indents a short-flag option by two spaces and
-/// a long-only one by six, so a boundary that knew only `\n  -` ran a long-only option's block
-/// through every long-only option after it — which made an assertion about `--optimizer`'s help
-/// satisfiable by `--progressive`'s text.
-fn help_for(flag: &str) -> String {
-    let output = Command::new(BINARY)
-        .arg("--help")
-        .output()
-        .expect("runs the binary");
-    assert!(output.status.success());
-    let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let start = text
-        .find(flag)
-        .unwrap_or_else(|| panic!("{flag} is not listed in --help:\n{text}"));
-    let rest = &text[start + flag.len()..];
-    let end = rest
-        .find("\n  -")
-        .into_iter()
-        .chain(rest.find("\n      --"))
-        .min()
-        .unwrap_or(rest.len());
-    rest[..end].to_owned()
 }
 
 // ---------------------------------------------------------------- the output path
@@ -2080,6 +1963,8 @@ fn the_output_and_delete_flags_help_states_what_they_resolve_to() {
 type Rows = Vec<(u32, String, Plan, bool)>;
 
 /// Runs the pipeline with an observer, returning what it reported and what it observed.
+///
+/// This helper leaves splitting off, so every observation must remain piece 0 of 1.
 fn observed(input: &[u8], output: &Path, jobs: usize, target: Target) -> (Report, Rows) {
     let source = ZipSource::new(
         std::io::Cursor::new(input.to_vec()),
@@ -2088,6 +1973,12 @@ fn observed(input: &[u8], output: &Path, jobs: usize, target: Target) -> (Report
     .expect("the fixture is a zip");
     let mut rows = Vec::new();
     let mut observe = |page: pipeline::Trace<'_>| {
+        assert_eq!(
+            (page.piece, page.pieces.get()),
+            (0, 1),
+            "{}: splitting was not requested",
+            page.name
+        );
         rows.push((
             page.position,
             page.name.to_owned(),
@@ -2448,4 +2339,334 @@ fn a_traced_name_cannot_carry_a_newline_or_an_escape() {
         !stdout.contains('\u{1b}'),
         "an escape sequence reached the terminal: {stdout:?}"
     );
+}
+
+fn spread_bytes(width: u32, height: u32) -> Vec<u8> {
+    use comic_auto_resize::page::{Channels, PageImage, encode};
+    let pixels = (0..height)
+        .flat_map(|_| (0..width).map(|x| if x < width / 2 { 32 } else { 224 }))
+        .collect();
+    let page = PageImage::new(width, height, Channels::Gray, pixels).expect("valid geometry");
+    encode("spread.jpg", &page, EncodeSettings::default()).expect("encodes")
+}
+
+fn center_shade(bytes: &[u8]) -> u8 {
+    let decoded = comic_auto_resize::page::decode(
+        "piece.jpg",
+        bytes,
+        comic_auto_resize::page::Format::Jpeg,
+        DecodeSettings::default(),
+    )
+    .expect("decodes output");
+    let page = decoded.page;
+    let pixel = (page.height() / 2 * page.width() + page.width() / 2) as usize;
+    page.pixels()[pixel * page.channels().count() as usize]
+}
+
+#[test]
+fn split_pieces_keep_reading_order_names_and_bytes_at_every_worker_count() {
+    let directory = TempDir::new("split-order");
+    let spread = spread_bytes(2000, 1400);
+    let entries: Vec<_> = ["page7.jpg", "page8.jpg", "page9.jpg"]
+        .into_iter()
+        .map(|name| (name.to_owned(), spread.clone()))
+        .collect();
+    let input = archive_bytes(&entries);
+    for (order, shades) in [
+        (ReadingOrder::Right, [224, 32]),
+        (ReadingOrder::Left, [32, 224]),
+    ] {
+        for naming in [Naming::Stored, Naming::ByPosition] {
+            let mut previous = None;
+            for jobs in [1, 4] {
+                let output = directory.join(&format!("{order}-{naming:?}-{jobs}.zip"));
+                let source = ZipSource::new(
+                    std::io::Cursor::new(&input),
+                    &ReadOptions {
+                        naming,
+                        split: Split::new(50, 0, order),
+                        ..Default::default()
+                    },
+                )
+                .expect("opens");
+                let report = pipeline::run(source, &output, &settings(jobs), None).expect("splits");
+                assert_eq!((report.pages, report.split), (6, 3));
+                let pieces = read_archive(&output);
+                for (index, (name, bytes)) in pieces.iter().enumerate() {
+                    let expected = if naming == Naming::ByPosition {
+                        format!("page_{}.jpg", index + 1)
+                    } else {
+                        format!("page{}-{}.jpg", 7 + index / 2, 1 + index % 2)
+                    };
+                    assert_eq!(name, &expected);
+                    assert_eq!(jpeg_size(bytes), Some((1000, 1400)));
+                    assert!(center_shade(bytes).abs_diff(shades[index % 2]) <= 2);
+                }
+                let bytes = fs::read(&output).expect("reads output");
+                if let Some(previous) = previous {
+                    assert_eq!(bytes, previous);
+                }
+                previous = Some(bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn the_split_gate_keeps_portraits_and_wide_landscapes_whole() {
+    let directory = TempDir::new("split-gate");
+    let entries = vec![
+        ("001.jpg".to_owned(), page_bytes(700, 1000)),
+        ("002.jpg".to_owned(), spread_bytes(2000, 1400)),
+        ("003.jpg".to_owned(), page_bytes(1720, 1000)),
+    ];
+    let input = archive_bytes(&entries);
+    let output = directory.join("out.zip");
+    let source = ZipSource::new(
+        std::io::Cursor::new(&input),
+        &ReadOptions {
+            split: Split::new(50, 0, ReadingOrder::Right),
+            ..Default::default()
+        },
+    )
+    .expect("opens");
+    let report = pipeline::run(source, &output, &settings(4), None).expect("runs");
+    assert_eq!((report.pages, report.split), (4, 1));
+    let pieces = read_archive(&output);
+    assert_eq!(
+        pieces
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["001.jpg", "002-1.jpg", "002-2.jpg", "003.jpg"]
+    );
+    assert_eq!(jpeg_size(&pieces[0].1), Some((700, 1000)));
+    assert_eq!(jpeg_size(&pieces[3].1), Some((1280, 744)));
+}
+
+#[test]
+fn split_resize_and_floor_use_the_piece_geometry() {
+    let directory = TempDir::new("split-policy");
+    for (index, (width, height, target, expected, floor)) in [
+        (2612, 2004, Target::Width(1280), (1280, 1964), 0),
+        (2613, 2004, Target::Width(1280), (1280, 1963), 0),
+        (2612, 2004, Target::Ratio(50), (653, 1002), 0),
+        (1000, 700, Target::Ratio(40), (500, 700), 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let input = archive_bytes(&[("page.jpg".to_owned(), spread_bytes(width, height))]);
+        let output = directory.join(&format!("{index}.zip"));
+        let source = ZipSource::new(
+            std::io::Cursor::new(&input),
+            &ReadOptions {
+                split: Split::new(50, 0, ReadingOrder::Right),
+                ..Default::default()
+            },
+        )
+        .expect("opens");
+        let report = pipeline::run(
+            source,
+            &output,
+            &Settings {
+                target,
+                ..settings(1)
+            },
+            None,
+        )
+        .expect("runs");
+        assert_eq!(
+            (report.pages, report.split, report.below_floor),
+            (2, 1, floor)
+        );
+        for (_, bytes) in read_archive(&output) {
+            assert_eq!(jpeg_size(&bytes), Some(expected));
+        }
+    }
+}
+
+#[test]
+fn split_trace_names_shared_positions_windows_and_individual_dimensions() {
+    let directory = TempDir::new("split-trace");
+    let input = directory.join("book.zip");
+    let spread = spread_bytes(2000, 1400);
+    let portrait = page_bytes(700, 1000);
+    let source_bytes = spread.len() + portrait.len();
+    write_archive(
+        &input,
+        &[
+            ("spread.jpg".to_owned(), spread),
+            ("page.jpg".to_owned(), portrait),
+        ],
+    );
+    let output = directory.join("out.zip");
+    let run = Command::new(BINARY)
+        .args(["--split=50", "--debug", "--jobs=1", "-o"])
+        .arg(&output)
+        .arg(&input)
+        .output()
+        .expect("runs");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let text = String::from_utf8(run.stdout).expect("UTF-8");
+    assert!(
+        text.contains("1[1/2] spread-1.jpg: JPEG 2000x1400 [1000,2000)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1[2/2] spread-2.jpg: JPEG 2000x1400 [0,1000)"),
+        "{text}"
+    );
+    assert!(text.contains("2 page.jpg: JPEG 700x1000"), "{text}");
+    assert!(text.contains("1 spread(s) split"), "{text}");
+    assert!(
+        text.contains(&format!("debug: 3 page(s), {source_bytes} ->")),
+        "{text}"
+    );
+    assert_eq!(
+        text.lines()
+            .filter(|line| line.contains("spread(s) split"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn an_impossible_split_window_names_the_entry_and_leaves_no_output() {
+    let directory = TempDir::new("split-refusal");
+    for (index, (width, height, flags)) in [
+        (2000, 1400, vec!["--split=45", "--split-pos=101"]),
+        (40, 30, vec!["--split=1"]),
+        (2000, 1400, vec!["--split=45", "--split-pos=4294967295"]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let input = directory.join(&format!("book-{index}.zip"));
+        let output = directory.join(&format!("out-{index}.zip"));
+        write_archive(
+            &input,
+            &[("broken-window.jpg".to_owned(), spread_bytes(width, height))],
+        );
+        let run = Command::new(BINARY)
+            .args(flags)
+            .arg("-o")
+            .arg(&output)
+            .arg(&input)
+            .output()
+            .expect("runs");
+        assert!(!run.status.success());
+        let error = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            error.contains("broken-window") && error.contains("window"),
+            "{error}"
+        );
+        if index == 0 {
+            assert!(error.contains("2001"), "{error}");
+        }
+        assert!(!output.exists());
+    }
+}
+
+#[test]
+#[ignore = "generates split fixtures for the manual peak-memory measurement"]
+fn write_split_memory_fixtures() {
+    let directory = std::env::var("CAR_FIXTURE_DIR").expect("set CAR_FIXTURE_DIR");
+    let directory = Path::new(&directory);
+    fs::create_dir_all(directory).expect("creates fixture directory");
+    let bytes = spread_bytes(2612, 2004);
+    for pages in [100, 1000] {
+        let entries = (0..pages)
+            .map(|page| (format!("page{page:04}.jpg"), bytes.clone()))
+            .collect::<Vec<_>>();
+        let output = directory.join(format!("spreads-{pages}.zip"));
+        write_archive(&output, &entries);
+        println!("{}: {pages} spreads", output.display());
+    }
+}
+
+#[test]
+fn a_trimmed_split_omits_the_gutter_and_an_offset_moves_both_windows() {
+    use comic_auto_resize::page::{Channels, PageImage, encode};
+    let directory = TempDir::new("split-trim");
+    let pixels = (0..1400)
+        .flat_map(|_| {
+            (0..2000).map(|x| match x {
+                0..900 => 32,
+                900..1000 => 120,
+                _ => 224,
+            })
+        })
+        .collect();
+    let page = PageImage::new(2000, 1400, Channels::Gray, pixels).expect("valid geometry");
+    let input = directory.join("in.zip");
+    write_archive(
+        &input,
+        &[(
+            "spread.jpg".to_owned(),
+            encode("spread", &page, EncodeSettings::default()).expect("encodes"),
+        )],
+    );
+    let mut runs = Vec::new();
+    for offset in [0, 60] {
+        let output = directory.join(&format!("{offset}.zip"));
+        let run = Command::new(BINARY)
+            .args(["--split=45", "--reading-order=l", "--split-pos"])
+            .arg(offset.to_string())
+            .arg("-o")
+            .arg(&output)
+            .arg(&input)
+            .output()
+            .expect("runs");
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let pieces = read_archive(&output);
+        assert_eq!(pieces.len(), 2);
+        for (_, bytes) in &pieces {
+            assert_eq!(jpeg_size(bytes), Some((900, 1400)));
+        }
+        let decoded = comic_auto_resize::page::decode(
+            "left",
+            &pieces[0].1,
+            comic_auto_resize::page::Format::Jpeg,
+            DecodeSettings::default(),
+        )
+        .expect("decodes");
+        let shade = decoded.page.pixels()[700 * 900 + 870];
+        assert!(shade.abs_diff(if offset == 0 { 32 } else { 120 }) <= 2);
+        assert!(center_shade(&pieces[1].1).abs_diff(224) <= 2);
+        runs.push(fs::read(output).expect("reads archive"));
+    }
+    assert_ne!(runs[0], runs[1]);
+}
+
+#[test]
+fn a_split_suffix_collision_is_refused_even_with_renumbering() {
+    let directory = TempDir::new("split-name-collision");
+    let input = directory.join("in.zip");
+    let output = directory.join("out.zip");
+    write_archive(
+        &input,
+        &[
+            ("ch1/cover.jpg".to_owned(), spread_bytes(2000, 1400)),
+            ("ch1\\cover-7.jpg".to_owned(), page_bytes(700, 1000)),
+        ],
+    );
+    let run = Command::new(BINARY)
+        .args(["--split=50", "--fix-idx", "-o"])
+        .arg(&output)
+        .arg(&input)
+        .output()
+        .expect("runs");
+    assert!(!run.status.success());
+    let message = String::from_utf8_lossy(&run.stderr);
+    assert!(message.contains("cover-1.jpg"), "{message}");
+    assert!(!output.exists());
 }

@@ -118,9 +118,9 @@ fn equals_only_options(command: &Command) -> Vec<(String, BTreeSet<String>)> {
 /// Options whose value is a path, sorted.
 ///
 /// `clap`'s question, not this module's: `Arg::get_value_hint` infers `AnyPath` from a
-/// `PathBuf` value parser, so `-o/--out` answers and `--ratio`, `--quality`, `--jobs`,
-/// `--charset` and `--pwd` do not. Reading "has no possible values" as "takes a path" was a
-/// review finding — it made `--ratio=sr` complete to `--ratio=src`, which the parser refuses.
+/// `PathBuf` value parser, so `-o/--out` answers and numeric options such as `--split` and
+/// `--split-pos` do not. Reading "has no possible values" as "takes a path" would offer
+/// filenames the parser refuses.
 fn path_options(command: &Command) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
     for argument in command.get_opts().filter(|arg| !arg.is_hide_set()) {
@@ -157,7 +157,7 @@ fn guarded_bash(generated: &[u8], command: &Command) -> Vec<u8> {
     .into_bytes()
 }
 
-/// Rewrites every arm that offers a value set, and returns the attached-value options.
+/// Rewrites every value-set arm and handles its attached spelling too.
 ///
 /// The two bashes disagree about `=`, and that is the difficulty. bash 5 has it in
 /// `COMP_WORDBREAKS`, so `--progressive ` and `--progressive=` both reach the generated `prev`
@@ -179,6 +179,10 @@ fn bash_value_arms(script: &mut String, command: &Command) -> Vec<(String, Strin
             continue;
         }
         for option in option_names(argument) {
+            attached.push((
+                option.clone(),
+                values.iter().cloned().collect::<Vec<_>>().join(" "),
+            ));
             // The emitted `COMPREPLY=` line is reused verbatim rather than rebuilt: it
             // carries upstream's value order and quoting, and rebuilding it was how the first
             // attempt at this guard broke — the graph's values are sorted, the emitted ones
@@ -198,10 +202,6 @@ fn bash_value_arms(script: &mut String, command: &Command) -> Vec<(String, Strin
                 })
                 .to_owned();
             let guarded = if equals_only.contains(&option) {
-                attached.push((
-                    option.clone(),
-                    values.iter().cloned().collect::<Vec<_>>().join(" "),
-                ));
                 let nested = bash_no_match_guard("                        ");
                 format!(
                     "                    if [[ \"${{COMP_WORDS[COMP_CWORD]}}\" == \"=\" ]]; then\n\

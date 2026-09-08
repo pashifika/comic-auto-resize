@@ -4,6 +4,11 @@
 //! selection: a comic page's width is what a reader's viewport constrains, and the height
 //! follows from the source's aspect ratio.
 
+use std::fmt;
+use std::str::FromStr;
+
+use thiserror::Error;
+
 use crate::page::height_for_width;
 
 /// The default target width, as in the Go implementation.
@@ -20,6 +25,143 @@ pub const AUTO_WIDTH: u32 = 1280;
 /// passes through at full size, which is the conservative outcome, so there is nothing to
 /// tune.
 const MIN_EDGE: u32 = 250;
+
+/// Decision 12: book spreads cluster at 1.13–1.42; portraits at 0.57–0.71 and strips
+/// near 3.8. This closed gate leaves margin without admitting either neighbouring shape.
+const SPREAD_ASPECT_MIN_PERCENT: u32 = 105;
+const SPREAD_ASPECT_MAX_PERCENT: u32 = 160;
+
+/// Whether non-empty header geometry is inside the spread gate, without float rounding.
+#[must_use]
+pub fn is_spread(width: u32, height: u32) -> bool {
+    let width = u64::from(width) * 100;
+    let height = u64::from(height);
+    height != 0
+        && u64::from(SPREAD_ASPECT_MIN_PERCENT) * height <= width
+        && width <= u64::from(SPREAD_ASPECT_MAX_PERCENT) * height
+}
+
+/// Which side of a spread becomes its first page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadingOrder {
+    Right,
+    Left,
+}
+
+impl fmt::Display for ReadingOrder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Right => "r",
+            Self::Left => "l",
+        })
+    }
+}
+
+impl FromStr for ReadingOrder {
+    type Err = UnknownReadingOrder;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "r" => Ok(Self::Right),
+            "l" => Ok(Self::Left),
+            _ => Err(UnknownReadingOrder {
+                name: name.to_owned(),
+            }),
+        }
+    }
+}
+
+/// A reading order outside the two supported directions.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("unknown reading order `{name}`; supported: r, l")]
+pub struct UnknownReadingOrder {
+    pub name: String,
+}
+
+/// A full-height column window, in the page's recorded source pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Columns {
+    pub left: u32,
+    pub width: u32,
+}
+
+impl Columns {
+    pub(crate) fn check(self, page_width: u32) -> Result<(), SplitWindow> {
+        if self.width == 0 || u64::from(self.left) + u64::from(self.width) > u64::from(page_width) {
+            Err(SplitWindow {
+                left: u64::from(self.left),
+                width: self.width,
+                page_width,
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Validated split parameters; the percentage cannot exceed half the source width.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Split {
+    percent: u8,
+    offset: u32,
+    order: ReadingOrder,
+}
+
+impl Split {
+    /// Refuses percentages outside `1..=50`; window bounds depend on the page.
+    #[must_use]
+    pub const fn new(percent: u8, offset: u32, order: ReadingOrder) -> Option<Self> {
+        if percent >= 1 && percent <= 50 {
+            Some(Self {
+                percent,
+                offset,
+                order,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Half-up widths and a floored midpoint, returned in reading order.
+    ///
+    /// # Errors
+    ///
+    /// [`SplitWindow`] if either window is empty or extends past the page. The right
+    /// window binds both bounds; its start is widened before adding the offset.
+    pub fn windows(self, page_width: u32) -> Result<[Columns; 2], SplitWindow> {
+        let width = Target::Ratio(self.percent).width_for(page_width);
+        let right_left = u64::from(page_width / 2) + u64::from(self.offset);
+        let failed = SplitWindow {
+            left: right_left,
+            width,
+            page_width,
+        };
+        if width == 0 || right_left + u64::from(width) > u64::from(page_width) {
+            return Err(failed);
+        }
+        let left = Columns {
+            left: self.offset,
+            width,
+        };
+        let right = Columns {
+            left: u32::try_from(right_left).map_err(|_| failed)?,
+            width,
+        };
+        Ok(match self.order {
+            ReadingOrder::Right => [right, left],
+            ReadingOrder::Left => [left, right],
+        })
+    }
+}
+
+/// A window that cannot be cut. The start can exceed `u32` when offset plus midpoint
+/// overflows; preserving it makes the page error report the actual request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SplitWindow {
+    pub left: u64,
+    pub width: u32,
+    pub page_width: u32,
+}
 
 /// How one page's target width is chosen.
 ///
@@ -127,14 +269,10 @@ pub fn plan(src_width: u32, src_height: u32, target_width: u32) -> Plan {
 
 #[cfg(test)]
 mod tests {
-    use super::{AUTO_WIDTH, MIN_EDGE, Plan, Target, plan};
+    use super::{
+        AUTO_WIDTH, Columns, Plan, ReadingOrder, Split, SplitWindow, Target, is_spread, plan,
+    };
     use crate::page::height_for_width;
-
-    #[test]
-    fn the_defaults_match_the_reference_tool() {
-        assert_eq!(AUTO_WIDTH, 1280);
-        assert_eq!(MIN_EDGE, 250);
-    }
 
     #[test]
     fn a_page_wider_than_the_target_is_normalised() {
@@ -345,5 +483,148 @@ mod tests {
         // Where the rounding does not pull them apart, the two agree.
         assert_eq!(Target::Ratio(50).width_for(1000), 500);
         assert_eq!(height_for_width(1000, 1400, 500), 700);
+    }
+
+    #[test]
+    fn the_spread_gate_includes_its_endpoints_but_no_empty_page() {
+        assert!(is_spread(1050, 1000));
+        assert!(!is_spread(1049, 1000));
+        assert!(is_spread(1600, 1000));
+        assert!(!is_spread(1601, 1000));
+        assert!(!is_spread(0, 1000));
+        assert!(!is_spread(1000, 0));
+        assert!(!is_spread(0, 0));
+        assert!(is_spread(u32::MAX, 3_000_000_000));
+    }
+
+    #[test]
+    fn reading_order_parses_and_displays_only_the_two_directions() {
+        for (name, order) in [("r", ReadingOrder::Right), ("l", ReadingOrder::Left)] {
+            assert_eq!(name.parse::<ReadingOrder>().expect("known order"), order);
+            assert_eq!(order.to_string(), name);
+        }
+        for name in ["", "x", "R", "right"] {
+            assert!(name.parse::<ReadingOrder>().is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn split_percentages_must_leave_room_for_two_windows() {
+        for percent in [0, 51, u8::MAX] {
+            assert!(Split::new(percent, 0, ReadingOrder::Right).is_none());
+        }
+        assert!(Split::new(1, 0, ReadingOrder::Right).is_some());
+        assert!(Split::new(50, 0, ReadingOrder::Right).is_some());
+    }
+
+    #[test]
+    fn split_windows_trim_shift_and_follow_reading_order() {
+        for (percent, offset, width) in [(50, 0, 1000), (45, 0, 900), (45, 60, 900), (45, 100, 900)]
+        {
+            let left = Columns {
+                left: offset,
+                width,
+            };
+            let right = Columns {
+                left: 1000 + offset,
+                width,
+            };
+            for (order, expected) in [
+                (ReadingOrder::Right, [right, left]),
+                (ReadingOrder::Left, [left, right]),
+            ] {
+                let windows = Split::new(percent, offset, order)
+                    .expect("valid percentage")
+                    .windows(2000)
+                    .expect("both windows fit");
+                assert_eq!(windows, expected);
+            }
+        }
+        let error = Split::new(45, 101, ReadingOrder::Right)
+            .expect("valid percentage")
+            .windows(2000)
+            .expect_err("right edge is 2001");
+        assert_eq!(
+            error,
+            SplitWindow {
+                left: 1101,
+                width: 900,
+                page_width: 2000
+            }
+        );
+        for offset in [1, 60, 100, 101] {
+            let error = Split::new(50, offset, ReadingOrder::Right)
+                .expect("valid percentage")
+                .windows(2000)
+                .expect_err("a full half has no room to shift right");
+            assert_eq!(
+                error,
+                SplitWindow {
+                    left: 1000 + u64::from(offset),
+                    width: 1000,
+                    page_width: 2000,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_odd_spread_shares_the_middle_column() {
+        let windows = Split::new(50, 0, ReadingOrder::Left)
+            .expect("valid percentage")
+            .windows(2001)
+            .expect("odd width fits");
+        assert_eq!(
+            windows,
+            [
+                Columns {
+                    left: 0,
+                    width: 1001
+                },
+                Columns {
+                    left: 1000,
+                    width: 1001
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_and_overflowing_windows_are_refused_without_wrapping() {
+        for width in [0, 40] {
+            let error = Split::new(1, 0, ReadingOrder::Right)
+                .expect("valid percentage")
+                .windows(width)
+                .expect_err("window has no columns");
+            assert_eq!(error.width, 0);
+        }
+        let error = Split::new(50, u32::MAX, ReadingOrder::Right)
+            .expect("offset is checked against each page")
+            .windows(2000)
+            .expect_err("offset plus midpoint exceeds u32");
+        assert_eq!(
+            error,
+            SplitWindow {
+                left: 4_294_968_295,
+                width: 1000,
+                page_width: 2000,
+            }
+        );
+        assert_eq!(
+            Split::new(50, 0, ReadingOrder::Right)
+                .expect("valid percentage")
+                .windows(u32::MAX)
+                .expect("largest odd width fits"),
+            [
+                Columns {
+                    left: 2_147_483_647,
+                    width: 2_147_483_648
+                },
+                Columns {
+                    left: 0,
+                    width: 2_147_483_648
+                },
+            ]
+        );
     }
 }

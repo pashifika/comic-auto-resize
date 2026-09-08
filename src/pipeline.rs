@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! credits ─────────────────────────────────────────────────────────┐
-//!    │ capacity W                                                  │ one per entry written
+//!    │ capacity W                                                  │ one per entry completed
 //!    ▼                                                             │
 //! reader (1 thread*) ─► work ─► workers (J) ─► done ─► writer (caller's thread)
 //!    entry bytes    capacity J   decode      capacity J   BTreeMap ─► ZipWriter
@@ -11,9 +11,14 @@
 //!                               encode
 //! ```
 //!
+//! One entry yields one or more *pieces*, delivered together in one worker result. The piece
+//! count is the vector's length, not a declaration separate from its delivery. A spread yields
+//! two pieces; the credit and ordering unit remains the entry.
+//!
 //! The writer runs on the caller's own thread rather than on one of its own, and the optional
-//! trace runs there with it: each page's record is handed to the observer as that page is
-//! written and before its credit goes back, so an observer that blocks stalls the reader too.
+//! trace runs there with it: after the sink writes contiguous entries, their records are handed
+//! to the observer in the same order. Each entry's credit goes back after its records, so an
+//! observer that blocks stalls the reader too.
 //!
 //! # Why peak memory is `O(J)`
 //!
@@ -29,15 +34,31 @@
 //! this pass exists to replace, moved one layer down.
 //!
 //! The `credits` channel is what actually bounds it. It starts holding `W` tokens; the
-//! reader takes one before reading an entry and the writer returns one after writing an
-//! entry. So at most `W` entries exist anywhere in the system at once — unread but
-//! permitted, in `work`, inside a worker, or waiting in the map — and the map alone can hold
-//! no more than `W`.
+//! reader takes one before reading an entry and the writer returns one after that entry's
+//! **last** piece is written and observed. So at most `W` entries hold credits at once —
+//! permitted but unread, in `work`, inside a worker, in `done`, or held by the writer. Both
+//! writer maps are keyed by entry, with vectors in piece order. Each has at most `W` vectors
+//! containing at most `W × n` pieces or records, where `n` is the largest entry's piece count.
+//! After the sink drains contiguous entries, its map has at most `W - 1` entries: the missing
+//! expected entry holds the other credit. This is `(W - 1) × n` pieces, not `W` pieces. For
+//! `J = 2`, `W = 4`, `n = 2`, entries 1, 2 and 3 can leave six pieces waiting for entry 0.
+//! The transient insertion of entry 0 reaches `W × n`. With `W = 2J` and fixed `n` this is
+//! `O(J)`; allowing `n` to grow makes it `O(Jn)`.
 //!
-//! It cannot deadlock. The entry the writer is waiting for took its credit before every
-//! entry behind it, so it is already in flight and no later entry can take its place; when
-//! it is written a credit is returned. `credits` never blocks the writer either: at most `W`
-//! tokens exist, and the entry just written holds one of them, so there is always room.
+//! The channels cannot form a circular wait while processing, I/O and the observer terminate.
+//! Entries are dispatched in read order, so the expected entry took its credit before any
+//! later entry. It is being read, queued, in a worker or in `done`; no later entry can displace
+//! it. The writer drains `done` even while that entry is missing, so a worker blocked sending
+//! it can proceed. A worker sends exactly one result per job: either the complete vector or
+//! an error, including a caught processing panic. There is no separately declared remainder
+//! for the writer to wait for after a worker has moved on to the next job.
+//!
+//! Writing and observing the expected entry returns its credit and lets the reader proceed,
+//! including taking a credit to check EOF. The writer's credit send cannot block: at most `W`
+//! tokens exist and the completed entry still holds the one being returned, so there is room.
+//! On error the writer returns and `run` drops `done_rx` and `credit_tx`, releasing blocked
+//! workers and the reader before joining them. This argument does not rely on joining workers
+//! to detect a missing piece; one delivery contains every piece of its entry.
 //!
 //! ## `W + 1` for a source whose decoder pushes
 //!
@@ -55,10 +76,13 @@
 //!
 //! ## The trace's records are inside the same window
 //!
-//! An observer adds a second map beside the sink's, holding one record per page the sink has
-//! taken and not yet written. It is populated from the same entries the credits count and
-//! drained as the sink writes them, so it holds no more than `W` either, and a record is a
-//! name and seven `Copy` fields rather than a page. A run with no observer allocates none.
+//! An observer adds `BTreeMap<u32, Vec<Record>>` beside the sink's entry map. One record is
+//! created per delivered piece and one vector is removed per completed entry, before its
+//! credit returns. The records therefore belong to at most `W` credit-holding entries,
+//! including records awaiting observation after their bytes were written: at most `W × n`
+//! records, or `(W - 1) × n` after the writer finishes a delivery. A record is a name and
+//! `Outcome`'s `Copy` fields; the piece index and count come from vector order and length.
+//! A run with no observer allocates no records or record vectors.
 //!
 //! # What the run's peak actually is, with every factor named
 //!
@@ -72,11 +96,11 @@
 //! than by the archive.
 //!
 //! ```text
-//! peak ≈ J × worker + W × MAX_ENTRY_BYTES + base
+//! peak ≈ J × worker + W × (MAX_ENTRY_BYTES + n × E) + base
 //!
 //!   worker   = retained + max(decode, page + destination)
 //!   retained = 2 × max over the pages the worker has resized of
-//!                  src_width × dst_height × channels
+//!                  (coefficient_span × dst_height + 1) × channels
 //!   decode   = declared × scratch_factor(format, colour) + page   (page: only where both live)
 //! ```
 //!
@@ -84,6 +108,26 @@
 //! `ImageDecoder::total_bytes()`, `scratch_factor` is stated per arm in `page::decode`'s raster
 //! module, `page` is the decoded page and `destination` the resampler's output buffer, and
 //! `MAX_ENTRY_BYTES` bounds the entry each credit holds.
+//!
+//! Encoded output adds at most `W × n × E`, with `E` the largest encoded piece's allocation.
+//! This covers the pieces retained by workers as well as those in `done` and the writer, not
+//! a separate window for each stage. Batching retains earlier encoded pieces until the entry
+//! is complete; it does not require two decoded pages or two resize destinations at once.
+//! Sequential crop/resize/encode determines those lifetimes, independently of message count.
+//! Under `--split`, the decoded page clears the piece's target and can reach full size. The
+//! destination is one piece; `coefficient_span` includes filter support beyond its crop, bounded
+//! by the decoded width. The extra pixel is dependency alignment space. For a 2612x2004 RGB
+//! spread split at 50% to 1280x1964, Lanczos3 spans 1309 columns: page 15.70 MB, destination
+//! 7.54 MB, retained bound `2 × (1309 × 1964 + 1) × 3 = 15.43 MB`. Encoded output uses `n = 2`.
+//! At two pieces of roughly 350 KB each, the difference from sending the first early is at
+//! most one encoded piece per worker, not another roughly 100 MB decoded working set. Even
+//! that saving depended on the bounded `done` channel and writer accepting the first piece.
+//!
+//! On the 95-spread corpus at 50%, peak RSS was 98.17 MB at `J = 1` and 784.83 MB at `J = 9`.
+//! Using the measured one-worker footprint as a conservative product gives 883.56 MB at nine.
+//! This is a sample calibration, not a JPEG allocation bound: the libjpeg term below remains
+//! uncharged. At fixed `J = 4`, 100 versus 1000 identical 2612x2004 spreads used 131.17 and
+//! 131.84 MB (1.0051x), producing 200 and 2000 pieces. Credits still count input entries.
 //!
 //! `retained` sits under both stages rather than on one side of the maximum, and that is what
 //! this shape corrects. The buffer is `fast_image_resize`'s two-pass scratch
@@ -234,7 +278,7 @@
 //! the count is exactly one and it is this module's choice rather than the host's.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -245,9 +289,9 @@ use thiserror::Error;
 use crate::page::{
     DecodeSettings, EncodeSettings, Filter, Format, PageError, Resampler, decode, encode, header,
 };
-use crate::policy::{self, Plan, Target};
-use crate::sink::{Page, PageKey, Sink};
-use crate::source::{Entries, SourceError};
+use crate::policy::{self, Columns, Plan, Target};
+use crate::sink::{Page, Sink};
+use crate::source::{Entries, SourceError, Spread};
 
 /// How much work may be in flight, as a multiple of the worker count.
 ///
@@ -332,6 +376,8 @@ pub struct Report {
     /// event. The distinction is [`policy::plan`]'s rather than this module's, so a count
     /// and a decision cannot drift apart.
     pub below_floor: u32,
+    /// How many input entries yielded more than one page.
+    pub split: u32,
 }
 
 /// What the run decided about one page.
@@ -349,6 +395,8 @@ pub struct Outcome {
     pub format: Format,
     pub source_width: u32,
     pub source_height: u32,
+    /// The piece's columns in the original page, or the whole page when absent.
+    pub window: Option<Columns>,
     pub plan: Plan,
     /// Whether an alpha channel was composited onto white.
     pub composited: bool,
@@ -358,27 +406,30 @@ pub struct Outcome {
     pub encoded_bytes: usize,
 }
 
-/// One page, handed to the observer as that page is written.
+/// One written piece, handed to the observer as that piece is written.
 ///
-/// Borrowed: `name` points into the record the writer holds until the page is written, so an
+/// Borrowed: `name` points into the record the writer holds until the piece is written, so an
 /// observer that formats and drops it allocates nothing.
 ///
-/// `non_exhaustive` for [`Outcome`]'s reason and one of its own: `position` is
-/// [`PageKey`]'s entry index, and the key's second field exists for the day a spread is split
-/// into two pages. Both halves would share this position, so that day adds a field here.
+/// `non_exhaustive` for [`Outcome`]'s reason: this is a view of a decision that will grow, and
+/// an observer only reads it. `--debug` identifies each piece of a split entry.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Trace<'a> {
-    /// Position in read order, from zero.
+    /// The entry's position in read order, from zero. An entry's pieces share it.
     pub position: u32,
+    /// This piece's index within its entry, from zero.
+    pub piece: u32,
+    /// How many pieces the entry yields.
+    pub pieces: NonZeroU32,
     pub name: &'a str,
     pub outcome: Outcome,
 }
 
-/// One page's outcome, held from the moment the sink takes the page until it writes it.
+/// One piece's outcome, held until its entry has been written and observed.
 ///
 /// Owns the name because [`Sink::accept`] takes the page by value. That is one clone per
-/// page, paid only while an observer is watching.
+/// piece, paid only while an observer is watching.
 struct Record {
     name: String,
     outcome: Outcome,
@@ -391,7 +442,7 @@ struct Record {
 /// the failure is not traced, and is not in any archive either. A run that passes `None` keeps
 /// no record and copies no name.
 ///
-/// It is called on **this** thread, synchronously, before that page's credit is returned to the
+/// It is called on **this** thread, synchronously, before that entry's credit is returned to the
 /// reader, so an observer that blocks stalls the writer and then the whole pipeline. `FnMut`
 /// rather than `Fn` because the observers that exist keep running totals, and the single call
 /// site needs no more than a mutable borrow.
@@ -509,12 +560,13 @@ pub fn run<S: Entries + Send>(
     // page, a central directory that will not write, and a flush that will not complete all
     // leave a file to remove.
     let failure = match outcome {
-        Ok((composited, below_floor)) => match sink.finish() {
+        Ok((composited, below_floor, split)) => match sink.finish() {
             Ok(pages) => {
                 return Ok(Report {
                     pages,
                     composited,
                     below_floor,
+                    split,
                 });
             }
             Err(error) => error,
@@ -533,75 +585,97 @@ pub fn run<S: Entries + Send>(
 
 /// One entry on its way to a worker.
 struct Job {
-    key: PageKey,
+    index: u32,
     name: String,
     /// The format the entry's *bytes* selected, which is what decides the decoder. The
     /// reader established it and refused a disagreement with the extension, so nothing here
     /// probes again.
     format: Format,
     bytes: Vec<u8>,
+    spread: Option<Spread>,
 }
 
-/// One finished page and what the run has to remember about it.
+/// All of one entry's finished pieces, with each piece's outcome beside it.
 ///
 /// The outcome rides here rather than on [`Page`] because the sink writes bytes and has no use
 /// for the page's provenance; only the tally and the observer do.
 struct Finished {
-    page: Page,
-    outcome: Outcome,
+    index: u32,
+    pieces: Vec<(Page, Outcome)>,
 }
 
-/// The writer stage: takes finished pages, restores read order, and tallies what it wrote.
+/// The writer stage: takes finished entries, restores read order, and tallies their pieces.
 ///
-/// Returns the two counts, or the first failure it met. It is the one stage that sees every
-/// page exactly once and in one thread, which is why both the counting and the tracing happen
-/// here.
+/// Returns the outcome counts, or the first failure it met. Counting and tracing happen here,
+/// in the one stage that sees every page exactly once.
 ///
-/// The trace stops at the failure rather than after it: a [`Sink::accept`] that wrote a page and
-/// then failed on the next reports only the error, so those pages are not traced. They are also
-/// not in any archive — the run removes its output — so the untraced pages are pages that no
+/// The trace stops at the failure rather than after it: a [`Sink::accept`] that wrote a piece and
+/// then failed on the next reports only the error, so those pieces are not traced. They are also
+/// not in any archive — the run removes its output — so the untraced pieces are pieces that no
 /// longer exist. Reporting them would mean widening `accept`'s error to carry a count.
 fn write_in_order(
     sink: &mut Sink,
     done: &crossbeam_channel::Receiver<Result<Finished, PageError>>,
     credits: &crossbeam_channel::Sender<()>,
     mut trace: Option<&mut dyn FnMut(Trace<'_>)>,
-) -> Result<(u32, u32), RunError> {
+) -> Result<(u32, u32, u32), RunError> {
     let mut composited = 0;
     let mut below_floor = 0;
-    // Outcomes for pages the sink has taken and not yet written, kept only while an observer
-    // is watching. Bounded by the credit window, like the sink's own map.
-    let mut pending: BTreeMap<PageKey, Record> = BTreeMap::new();
+    let mut split = 0;
+    // One vector per entry, parallel to the sink's map, and only allocated for an observer.
+    let mut pending: BTreeMap<u32, Vec<Record>> = BTreeMap::new();
     while let Ok(finished) = done.recv() {
         let finished = finished.map_err(RunError::Page)?;
-        composited += u32::from(finished.outcome.composited);
-        below_floor += u32::from(matches!(finished.outcome.plan, Plan::BelowFloor));
-        if trace.is_some() {
-            pending.insert(
-                finished.page.key,
-                Record {
-                    name: finished.page.name.clone(),
-                    outcome: finished.outcome,
-                },
-            );
+        split += u32::from(finished.pieces.len() > 1);
+        let mut records = trace
+            .as_ref()
+            .map(|_| Vec::with_capacity(finished.pieces.len()));
+        let pages = finished
+            .pieces
+            .into_iter()
+            .map(|(page, outcome)| {
+                composited += u32::from(outcome.composited);
+                below_floor += u32::from(matches!(outcome.plan, Plan::BelowFloor));
+                if let Some(records) = &mut records {
+                    records.push(Record {
+                        name: page.name.clone(),
+                        outcome,
+                    });
+                }
+                page
+            })
+            .collect();
+        if let Some(records) = records {
+            pending.insert(finished.index, records);
         }
-        for _ in 0..sink.accept(finished.page)? {
-            // The sink writes in key order, so the lowest records are the pages it just
-            // wrote, in the order it wrote them.
-            if let Some(observe) = trace.as_deref_mut()
-                && let Some((key, record)) = pending.pop_first()
-            {
-                observe(Trace {
-                    position: key.0,
-                    name: &record.name,
-                    outcome: record.outcome,
-                });
+        let completed = sink.accept(finished.index, pages)?;
+        for _ in 0..completed {
+            // The sink writes whole entries in index order, so the lowest vector describes
+            // the next entry it wrote. Its length is the delivered piece count.
+            if let Some(observe) = trace.as_deref_mut() {
+                let (position, records) = pending
+                    .pop_first()
+                    .expect("every observed entry has a record vector");
+                let pieces = NonZeroU32::new(
+                    u32::try_from(records.len()).expect("the output page count fits u32"),
+                )
+                .expect("the sink refused an empty entry");
+                for (piece, record) in (0..pieces.get()).zip(records) {
+                    observe(Trace {
+                        position,
+                        piece,
+                        pieces,
+                        name: &record.name,
+                        outcome: record.outcome,
+                    });
+                }
             }
-            // The reader may already be gone; that is not a failure.
+            // One credit after all of this entry's pieces and records. The reader may
+            // already be gone; that is not a failure.
             let _ = credits.send(());
         }
     }
-    Ok((composited, below_floor))
+    Ok((composited, below_floor, split))
 }
 
 /// Reads the archive once, taking a credit before each entry.
@@ -620,10 +694,11 @@ fn read_entries<S: Entries>(
         };
         let entry = entry?;
         let job = Job {
-            key: (entry.index, 0),
+            index: entry.index,
             name: entry.name,
             format: entry.format,
             bytes: entry.bytes,
+            spread: entry.spread,
         };
         if work.send(job).is_err() {
             return Ok(());
@@ -631,63 +706,105 @@ fn read_entries<S: Entries>(
     }
 }
 
-/// Decode, plan, resize, encode — the whole of one page.
+/// Plan, decode once, then crop/resize and encode each piece in reading order.
 fn process(
     job: Job,
     resampler: &mut Resampler,
     settings: &Settings,
 ) -> Result<Finished, PageError> {
     let Job {
-        key,
+        index,
         name,
         format,
         bytes,
+        spread,
     } = job;
-
-    // Before the decode, because `bytes` is what the archive held for this entry and the
-    // trace reports the reduction against it.
     let source_bytes = bytes.len();
-
-    // The header first, because the resize policy needs the source geometry to choose both
-    // the target height and whether to resize at all, and a scaled decode cannot be
-    // configured before that is known. The budget refusal itself is inside `decode`, at the
-    // point each decoder has parsed its header and before it allocates from it — for every
-    // format, including the three whose decoder cannot scale. The budget is passed here
-    // because reading a *png*'s header is itself an allocating operation.
     let (source_width, source_height) = header(&name, &bytes, format, settings.decode.budget)?;
-    // A ratio is a target width named relative to the page, so it is resolved here — where
-    // the page's own width is known — and `plan` takes the one number either way.
-    let target_width = settings.target.width_for(source_width);
-    let plan = policy::plan(source_width, source_height, target_width);
-
+    let windows = spread
+        .as_ref()
+        .map(|spread| spread.split.windows(source_width))
+        .transpose()
+        .map_err(|error| PageError::new(&name, error.into()))?;
+    let piece_width = windows.map_or(source_width, |windows| windows[0].width);
+    let plan = policy::plan(
+        piece_width,
+        source_height,
+        settings.target.width_for(piece_width),
+    );
+    // A reduced piece needs the entire decoded spread to clear its target scale.
+    let scale_to = plan
+        .scale_to(piece_width, source_height)
+        .map(|(width, height)| {
+            let spread_width =
+                (u64::from(width) * u64::from(source_width)).div_ceil(u64::from(piece_width));
+            (
+                u32::try_from(spread_width).expect("a downscale cannot exceed the source width"),
+                height,
+            )
+        });
     let decoded = decode(
         &name,
         &bytes,
         format,
         DecodeSettings {
-            scale_to: plan.scale_to(source_width, source_height),
+            scale_to,
             ..settings.decode
         },
     )?;
-    // Pass-through skips the resize and nothing else, whichever of the two reasons it was.
-    let page = match plan {
-        Plan::Resize { width } => resampler.resize(&name, &decoded.page, width, settings.filter)?,
-        Plan::PassThrough | Plan::BelowFloor => decoded.page,
+    let outcome = Outcome {
+        format,
+        source_width,
+        source_height,
+        window: None,
+        plan,
+        composited: decoded.composited,
+        source_bytes,
+        encoded_bytes: 0,
     };
-    let bytes = encode(&name, &page, settings.encode)?;
-
-    Ok(Finished {
-        outcome: Outcome {
-            format,
-            source_width,
-            source_height,
-            plan,
-            composited: decoded.composited,
-            source_bytes,
+    let pieces = if let (Some(spread), Some(windows)) = (spread, windows) {
+        windows
+            .into_iter()
+            .zip([name, spread.second_name])
+            .map(|(window, name)| {
+                let page = match plan {
+                    Plan::Resize { width } => resampler.resize_window(
+                        &name,
+                        &decoded.page,
+                        window,
+                        width,
+                        settings.filter,
+                    )?,
+                    Plan::PassThrough | Plan::BelowFloor => {
+                        decoded
+                            .page
+                            .crop_columns(&name, window, settings.decode.budget)?
+                    }
+                };
+                let bytes = encode(&name, &page, settings.encode)?;
+                let outcome = Outcome {
+                    window: Some(window),
+                    encoded_bytes: bytes.len(),
+                    ..outcome
+                };
+                Ok((Page { name, bytes }, outcome))
+            })
+            .collect::<Result<Vec<_>, PageError>>()?
+    } else {
+        let page = match plan {
+            Plan::Resize { width } => {
+                resampler.resize(&name, &decoded.page, width, settings.filter)?
+            }
+            Plan::PassThrough | Plan::BelowFloor => decoded.page,
+        };
+        let bytes = encode(&name, &page, settings.encode)?;
+        let outcome = Outcome {
             encoded_bytes: bytes.len(),
-        },
-        page: Page { key, name, bytes },
-    })
+            ..outcome
+        };
+        vec![(Page { name, bytes }, outcome)]
+    };
+    Ok(Finished { index, pieces })
 }
 
 /// Why a run stopped.
@@ -749,10 +866,15 @@ pub enum RunError {
         "{name}: two entries would be written under this name once renamed to the encoder's extension"
     )]
     NameCollision { name: String },
-    /// The ordering invariant broke: a page above the one being waited for was left over
-    /// after every worker finished.
+    /// A completed entry is stranded above an entry the caller never delivered.
     #[error("page {expected} never arrived, but page {stranded} did")]
     Incomplete { expected: u32, stranded: u32 },
+    /// A caller delivered an entry without any output piece.
+    #[error("entry {index}: no output pieces were delivered")]
+    EmptyEntry { index: u32 },
+    /// An entry index was already accepted, whether pending or written.
+    #[error("entry {index}: already delivered")]
+    RepeatedEntry { index: u32 },
     /// A directory input with no name of its own — `.`, `..`, or the filesystem root — so
     /// there is nothing to derive an output name from. Reached only after the path has been
     /// resolved, so `.` is the directory the user is standing in rather than this case.
@@ -808,6 +930,8 @@ impl RunError {
             | Self::StagePanicked { .. }
             | Self::Empty
             | Self::NameCollision { .. }
+            | Self::EmptyEntry { .. }
+            | Self::RepeatedEntry { .. }
             | Self::Incomplete { .. } => true,
             Self::OutputExists { .. }
             | Self::StrayOutput { .. }
@@ -822,10 +946,144 @@ impl RunError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Capacities, PageError, RunError, SourceError, WINDOW_PER_JOB};
+    use super::{
+        Capacities, Finished, Format, Outcome, Page, PageError, Plan, RunError, Sink, SourceError,
+        Trace, WINDOW_PER_JOB, bounded, write_in_order,
+    };
+    use crate::sink::tests::{Scratch, stored_pages};
     use std::io;
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
+
+    /// Distinct output bytes keep name order and payload order independently observable.
+    fn finished(entry: u32, payloads: &[&[u8]]) -> Finished {
+        Finished {
+            index: entry,
+            pieces: payloads
+                .iter()
+                .enumerate()
+                .map(|(index, bytes)| {
+                    (
+                        Page {
+                            name: format!("{entry}-{index}.jpg"),
+                            bytes: bytes.to_vec(),
+                        },
+                        Outcome {
+                            format: Format::Jpeg,
+                            source_width: 1520,
+                            source_height: 2150,
+                            window: None,
+                            plan: Plan::Resize { width: 1280 },
+                            composited: false,
+                            source_bytes: 16,
+                            encoded_bytes: bytes.len(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// The writer's whole contract for pieces, over a hand-fed channel: an entry's pieces are
+    /// written together and in order however entries arrive, a later entry waits behind them, the
+    /// observer sees every piece once in write order, and **one credit comes back per entry**
+    /// rather than per piece — which is what keeps the read-ahead window counting entries.
+    #[test]
+    fn pieces_are_written_in_order_and_one_credit_returns_per_entry() {
+        let scratch = Scratch::new("writer");
+        let output = scratch.0.join("out.zip");
+        let mut sink = Sink::create(&output).expect("the output is free");
+
+        let (done_tx, done_rx) = bounded::<Result<Finished, PageError>>(8);
+        let (credit_tx, credit_rx) = bounded::<()>(8);
+        // The later entry completes before the first entry's complete vector arrives.
+        for entry in [
+            finished(1, &[b"later"]),
+            finished(0, &[b"first", b"second"]),
+        ] {
+            done_tx.send(Ok(entry)).expect("the channel has room");
+        }
+        drop(done_tx);
+
+        let mut traced = Vec::new();
+        let mut observe = |page: Trace<'_>| {
+            assert_eq!(
+                credit_rx.len(),
+                usize::try_from(page.position).expect("two entries"),
+                "an entry's credit must stay held through its last observation"
+            );
+            traced.push((
+                page.position,
+                page.piece,
+                page.pieces.get(),
+                page.name.to_owned(),
+            ));
+        };
+        write_in_order(&mut sink, &done_rx, &credit_tx, Some(&mut observe))
+            .expect("every piece was accepted");
+
+        assert_eq!(
+            traced,
+            vec![
+                (0, 0, 2, "0-0.jpg".to_owned()),
+                (0, 1, 2, "0-1.jpg".to_owned()),
+                (1, 0, 1, "1-0.jpg".to_owned()),
+            ],
+            "the observer sees pieces in write order, with the entry's position shared"
+        );
+        assert_eq!(
+            credit_rx.len(),
+            2,
+            "two entries were completed, so two read-ahead permits come back"
+        );
+        assert_eq!(sink.finish().expect("nothing was left over"), 3);
+
+        assert_eq!(
+            stored_pages(&output),
+            [
+                ("0-0.jpg".to_owned(), b"first".to_vec()),
+                ("0-1.jpg".to_owned(), b"second".to_vec()),
+                ("1-0.jpg".to_owned(), b"later".to_vec()),
+            ],
+            "the archive, not just its observer, holds each piece's own bytes in order"
+        );
+    }
+
+    /// Failure on a later piece must not release the entry or observe a partial archive.
+    #[test]
+    fn a_failure_in_an_entry_returns_no_credit_or_observation() {
+        let scratch = Scratch::new("writer-piece-failure");
+        let output = scratch.0.join("out.zip");
+        let mut sink = Sink::create(&output).expect("the output is free");
+        let (done_tx, done_rx) = bounded::<Result<Finished, PageError>>(1);
+        let (credit_tx, credit_rx) = bounded::<()>(1);
+        let mut entry = finished(0, &[b"first", b"second"]);
+        entry.pieces[1].0.name = "0-0.jpg".to_owned();
+        done_tx.send(Ok(entry)).expect("the channel has room");
+        drop(done_tx);
+
+        let mut traced = Vec::new();
+        let mut observe = |page: Trace<'_>| traced.push(page.name.to_owned());
+        let error = write_in_order(&mut sink, &done_rx, &credit_tx, Some(&mut observe))
+            .expect_err("the second piece repeats the first piece's name");
+        assert!(
+            matches!(error, RunError::NameCollision { ref name } if name == "0-0.jpg"),
+            "{error}"
+        );
+        assert!(
+            credit_rx.is_empty(),
+            "a partially written entry returned a credit"
+        );
+        assert!(
+            traced.is_empty(),
+            "a failed delivery was observed as written"
+        );
+        drop(sink);
+        assert!(
+            !output.exists(),
+            "the failed delivery left an archive behind"
+        );
+    }
 
     #[test]
     fn every_channel_has_a_finite_capacity_that_scales_with_the_worker_count() {
@@ -920,6 +1178,8 @@ mod tests {
                 expected: 7,
                 stranded: 9,
             },
+            RunError::EmptyEntry { index: 7 },
+            RunError::RepeatedEntry { index: 7 },
             // The one variant about the input that names the input itself: a directory with no
             // name of its own is the input, and there is nothing to derive an output from.
             RunError::UnnamedInput {
@@ -946,6 +1206,8 @@ mod tests {
                 | RunError::StagePanicked { .. }
                 | RunError::Empty
                 | RunError::NameCollision { .. }
+                | RunError::EmptyEntry { .. }
+                | RunError::RepeatedEntry { .. }
                 | RunError::Incomplete { .. } => None,
                 RunError::UnnamedInput { .. } => Some(INPUT),
                 RunError::OutputExists { .. }

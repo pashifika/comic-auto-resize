@@ -10,13 +10,13 @@ Four kinds of case, one per property the surface has:
 
   syntax          the shell parses and sources the script without complaint
   option-prefix   an option name completes from a prefix
-  enum-values     a value enum's variants complete, for `--dct` and `--resize-mode`
+  enum-values     a value enum's variants complete, including both reading orders
   path            a path completes, for the positional input and for `--out`
 
 Modelled on `skillmount/.github/scripts/shell_completion_acceptance.py` and scaled to this
 surface: that CLI has subcommand trees, directory-only and executable-only value hints, and
 thirteen cases per shell. This one has a single positional that is an archive or a directory,
-one subcommand, and two value enums.
+no subcommands, and a shared case list for all four shells.
 """
 
 from __future__ import annotations
@@ -50,6 +50,9 @@ CASE_ORDER = (
     "option-prefix",
     "dct-values",
     "resize-mode-values",
+    "reading-order-values",
+    "reading-order-attached",
+    "split-prefix",
     "attached-only-space",
     "attached-only-value",
     "positional-path",
@@ -69,7 +72,7 @@ ANSI_ESCAPE = re.compile(rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)
 # the candidate list being wrong.
 SHELL_ERROR_MARKERS = ("unknown match specification", "compopt:", "command not found")
 
-# The two value enums, which are the reason completion is worth more here than a file list.
+# Fixed value sets, which make completion worth more here than a file list.
 DCT_METHODS = ("float", "ifast", "islow")
 RESIZE_MODES = (
     "nearest-neighbor",
@@ -79,6 +82,7 @@ RESIZE_MODES = (
     "lanczos2",
     "lanczos3",
 )
+READING_ORDERS = ("r", "l")
 
 # What the fixture's working directory holds. `zzz.cbz` shares no prefix with the rest, which
 # is what makes an empty-prefix case assertable on a terminal shell: with a common prefix the
@@ -159,7 +163,7 @@ def completion_cases() -> tuple[CompletionCase, ...]:
         CompletionCase(
             name="option-prefix",
             line=f"{PRODUCT} --r",
-            expected=("--ratio", "--resize-mode"),
+            expected=("--ratio", "--reading-order", "--resize-mode"),
             forbidden=("--dct", "page-one.zip"),
         ),
         CompletionCase(
@@ -173,6 +177,25 @@ def completion_cases() -> tuple[CompletionCase, ...]:
             line=f"{PRODUCT} --resize-mode ",
             expected=RESIZE_MODES,
             forbidden=("--resize-mode", "--quality", "page-one.zip"),
+        ),
+        CompletionCase(
+            name="reading-order-values",
+            line=f"{PRODUCT} --split=50 --reading-order ",
+            expected=READING_ORDERS,
+            forbidden=("--reading-order", "--split", "page-one.zip"),
+        ),
+        CompletionCase(
+            name="reading-order-attached",
+            line=f"{PRODUCT} --split=50 --reading-order=",
+            expected=READING_ORDERS,
+            forbidden=("page-one.zip",),
+            attached="--reading-order=",
+        ),
+        CompletionCase(
+            name="split-prefix",
+            line=f"{PRODUCT} --split",
+            expected=("--split", "--split-pos"),
+            forbidden=("--show-time", "page-one.zip"),
         ),
         # `--progressive` takes its value only when attached, so the next word is the input
         # path. Every shell offered `true`/`false` there until the guards landed, and picking
@@ -258,17 +281,16 @@ def completion_cases() -> tuple[CompletionCase, ...]:
             tabs=1,
         ),
         # After `--` every word is the input path, so no option name belongs there. bash and
-        # PowerShell both offered `--ratio` and `--resize-mode` until the guards landed.
+        # PowerShell both offered options until the guards landed.
         #
-        # Two tabs and no buffer assertion, and the reason is the defect's own shape: the two
-        # options share the prefix `--r`, so a shell that wrongly offers them inserts nothing
-        # on the first tab and leaves the line looking untouched. Only the menu the second tab
-        # prints shows what happened.
+        # Two tabs and no buffer assertion: these options share the prefix `--r`, so a
+        # shell that wrongly offers them inserts nothing on the first tab. Only the menu
+        # the second tab prints shows what happened.
         CompletionCase(
             name="after-terminator",
             line=f"{PRODUCT} -- --r",
             expected=(),
-            forbidden=("--ratio", "--resize-mode"),
+            forbidden=("--ratio", "--reading-order", "--resize-mode"),
         ),
     )
 

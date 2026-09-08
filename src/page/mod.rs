@@ -34,6 +34,8 @@ use std::str::FromStr;
 
 use thiserror::Error;
 
+use crate::policy::{Columns, SplitWindow};
+
 /// JPEG's start-of-image marker, which every JPEG stream begins with.
 pub const SOI_MARKER: [u8; 2] = [0xFF, 0xD8];
 
@@ -297,6 +299,51 @@ impl PageImage {
         &self.pixels
     }
 
+    /// Copies a full-height source-pixel window without resampling.
+    ///
+    /// # Errors
+    ///
+    /// [`PageErrorKind::SplitWindow`] for empty or out-of-bounds columns,
+    /// [`PageErrorKind::Resize`] for a scaled buffer or a zero height, and
+    /// [`PageErrorKind::TooLarge`] before allocating a crop that exceeds `budget`.
+    pub fn crop_columns(
+        &self,
+        name: &str,
+        window: Columns,
+        budget: Budget,
+    ) -> Result<Self, PageError> {
+        window
+            .check(self.original_width)
+            .map_err(|error| PageError::new(name, error.into()))?;
+        if self.width != self.original_width
+            || self.height != self.original_height
+            || self.height == 0
+        {
+            return Err(PageError::new(
+                name,
+                PageErrorKind::Resize(format!(
+                    "cannot copy source columns from a {}x{} buffer recorded as {}x{}",
+                    self.width, self.height, self.original_width, self.original_height
+                )),
+            ));
+        }
+        budget
+            .allow_image(window.width, self.height, self.channels)
+            .map_err(|kind| PageError::new(name, kind))?;
+
+        // All products are bounded by the validated source buffer's length.
+        let channels = self.channels.count() as usize;
+        let row_bytes = self.pixels.len() / self.height as usize;
+        let left = window.left as usize * channels;
+        let width = window.width as usize * channels;
+        let mut pixels = Vec::with_capacity(width * self.height as usize);
+        for row in self.pixels.chunks_exact(row_bytes) {
+            pixels.extend_from_slice(&row[left..left + width]);
+        }
+        Self::new(window.width, self.height, self.channels, pixels)
+            .map_err(|error| PageError::new(name, error.into()))
+    }
+
     /// Records that this buffer is a scaled decode of an `original_width` ×
     /// `original_height` page.
     ///
@@ -338,7 +385,7 @@ pub struct PageError {
 }
 
 impl PageError {
-    fn new(name: &str, kind: PageErrorKind) -> Self {
+    pub(crate) fn new(name: &str, kind: PageErrorKind) -> Self {
         Self {
             name: name.to_owned(),
             kind,
@@ -373,6 +420,16 @@ pub enum PageErrorKind {
     Decode { format: Format, reason: String },
     #[error("resize failed: {0}")]
     Resize(String),
+    /// A source-pixel window that is empty or extends past the page.
+    #[error(
+        "split window [{left},{}) of width {width} cannot be cut from a page {page_width} columns wide",
+        u128::from(*.left) + u128::from(*.width)
+    )]
+    SplitWindow {
+        left: u64,
+        width: u32,
+        page_width: u32,
+    },
     #[error("JPEG encode failed: {0}")]
     Encode(String),
     /// A quality outside libjpeg's scale, rejected rather than silently clamped by it.
@@ -413,6 +470,16 @@ pub enum PageErrorKind {
     /// is `#[non_exhaustive]` upstream — a variant added there has no `&'static str` here.
     #[error("{} decoded to {shape}, which no narrowing rule covers", format.name())]
     Pixels { format: Format, shape: String },
+}
+
+impl From<SplitWindow> for PageErrorKind {
+    fn from(window: SplitWindow) -> Self {
+        Self::SplitWindow {
+            left: window.left,
+            width: window.width,
+            page_width: window.page_width,
+        }
+    }
 }
 
 impl From<io::Error> for PageErrorKind {
@@ -465,7 +532,8 @@ fn unwind_reason(payload: &(dyn Any + Send)) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Channels, InvalidPixelBuffer, PageImage};
+    use super::{Budget, Channels, InvalidPixelBuffer, PageError, PageErrorKind, PageImage};
+    use crate::policy::{Columns, ReadingOrder, Split};
 
     #[test]
     fn a_buffer_matching_its_dimensions_is_accepted() {
@@ -506,5 +574,105 @@ mod tests {
         let error = PageImage::new(u32::MAX, u32::MAX, Channels::Rgb, Vec::new())
             .expect_err("no buffer is u32::MAX squared pixels of RGB");
         assert_eq!(error.expected, 55_340_232_195_358_851_075);
+    }
+
+    #[test]
+    fn cropping_keeps_exact_source_pixels_and_channel_layout() {
+        for channels in [Channels::Gray, Channels::Rgb] {
+            let samples = channels.count() as usize;
+            let mut pixels = vec![31; 2000 * 1400 * samples];
+            for row in pixels.chunks_exact_mut(2000 * samples) {
+                row[1000 * samples..].fill(223);
+            }
+            let spread = PageImage::new(2000, 1400, channels, pixels).expect("two-shade spread");
+            let windows = Split::new(50, 0, ReadingOrder::Left)
+                .expect("valid percentage")
+                .windows(2000)
+                .expect("halves fit");
+            for (window, shade) in windows.into_iter().zip([31, 223]) {
+                let piece = spread
+                    .crop_columns("spread.jpg", window, Budget::default())
+                    .expect("source-resolution crop");
+                assert_eq!((piece.width(), piece.height()), (1000, 1400));
+                assert_eq!(piece.channels(), channels);
+                assert!(piece.pixels().iter().all(|&pixel| pixel == shade));
+            }
+        }
+    }
+
+    #[test]
+    fn cropping_respects_the_exact_byte_budget() {
+        let source = PageImage::new(6, 2, Channels::Rgb, (0..36).collect())
+            .expect("distinct samples expose row and channel offsets");
+        let window = Columns { left: 1, width: 2 };
+        let error = source
+            .crop_columns("budget.jpg", window, Budget::new(u64::MAX, 11))
+            .expect_err("two RGB columns in two rows cost twelve bytes");
+        assert!(matches!(
+            error.kind,
+            PageErrorKind::TooLarge {
+                actual: 12,
+                limit: 11,
+                ..
+            }
+        ));
+        assert_eq!(error.name, "budget.jpg");
+        let piece = source
+            .crop_columns("budget.jpg", window, Budget::new(u64::MAX, 12))
+            .expect("the budget boundary is inclusive");
+        assert_eq!(piece.pixels(), &[3, 4, 5, 6, 7, 8, 21, 22, 23, 24, 25, 26]);
+        assert_eq!((piece.original_width(), piece.original_height()), (2, 2));
+    }
+
+    #[test]
+    fn cropping_rejects_empty_outside_and_overflowing_windows() {
+        let source = PageImage::new(4, 2, Channels::Gray, vec![0; 8]).expect("4 * 2");
+        for window in [
+            Columns { left: 0, width: 0 },
+            Columns { left: 3, width: 2 },
+            Columns { left: 4, width: 1 },
+            Columns {
+                left: u32::MAX,
+                width: 2,
+            },
+        ] {
+            let error = source
+                .crop_columns("bounds.jpg", window, Budget::default())
+                .expect_err("invalid source columns");
+            assert!(matches!(error.kind, PageErrorKind::SplitWindow { .. }));
+            assert_eq!(error.name, "bounds.jpg");
+        }
+    }
+
+    #[test]
+    fn source_resolution_cropping_refuses_scaled_or_empty_rows() {
+        for source in [
+            PageImage::new(4, 2, Channels::Gray, vec![0; 8])
+                .expect("4 * 2")
+                .scaled_from(8, 4),
+            PageImage::new(4, 0, Channels::Gray, Vec::new()).expect("zero rows"),
+        ] {
+            let error = source
+                .crop_columns(
+                    "scaled.jpg",
+                    Columns { left: 0, width: 2 },
+                    Budget::default(),
+                )
+                .expect_err("a source-resolution crop needs the recorded pixels");
+            assert!(matches!(error.kind, PageErrorKind::Resize(_)));
+        }
+    }
+
+    #[test]
+    fn a_split_error_names_the_entry_and_the_unclamped_window() {
+        let window = Split::new(45, 101, ReadingOrder::Right)
+            .expect("valid percentage")
+            .windows(2000)
+            .expect_err("the right window ends past the spread");
+        let error = PageError::new("chapter/spread.jpg", window.into());
+        let message = error.to_string();
+        assert!(message.contains("chapter/spread.jpg"));
+        assert!(message.contains("[1101,2001)"));
+        assert!(message.contains("2000"));
     }
 }

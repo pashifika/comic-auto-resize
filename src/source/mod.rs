@@ -53,6 +53,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use crate::page::Format;
+use crate::policy::Split;
 
 /// The most bytes one entry may occupy in memory.
 ///
@@ -98,15 +99,24 @@ use crate::page::Format;
 /// limit fired.
 pub const MAX_ENTRY_BYTES: u64 = 64 << 20;
 
-/// One page read out of an archive.
+/// One input entry, yielding one page or a spread's two pages.
 pub struct Entry {
-    /// Position in the sequence of yielded pages, from zero. The writer orders on it.
+    /// Position in the sequence of yielded entries, from zero. The writer orders on it.
     pub index: u32,
-    /// The name the output entry is written under: the stored name with its extension
-    /// replaced by the encoder's.
+    /// The first output name, after extension rewriting and any requested renumbering or
+    /// split suffix.
     pub name: String,
     pub format: Format,
     pub bytes: Vec<u8>,
+    /// Split parameters and the second output name, admitted together by the header gate.
+    pub spread: Option<Spread>,
+}
+
+/// A spread admitted by the reader, with both parameters and its second name.
+#[derive(Debug)]
+pub struct Spread {
+    pub split: Split,
+    pub second_name: String,
 }
 
 /// Hand-written rather than derived: `bytes` is a whole page, and a derive would put it in
@@ -118,6 +128,7 @@ impl std::fmt::Debug for Entry {
             .field("name", &self.name)
             .field("format", &self.format)
             .field("bytes", &self.bytes.len())
+            .field("spread", &self.spread)
             .finish()
     }
 }
@@ -136,14 +147,14 @@ pub trait Entries {
 
 /// What a reader needs from the command line, settled before the input is opened.
 ///
-/// One struct rather than three parameters on five constructors, and the fields are what the
+/// One struct rather than separate parameters on five constructors, and the fields are what the
 /// *rule* needs rather than what each format uses: only zip consults `charset`, and 7z
 /// consults neither it nor `password`, because that is a property of those formats and not of
 /// the options. A reader ignoring a field says so where it ignores it.
 ///
 /// [`Default`] is today's behaviour with nothing chosen — stored names, no encoding, no
-/// password. The guess is the command line's to make, so `--charset`'s non-empty default lives
-/// in `main` and not here.
+/// password, no splitting. The guess is the command line's to make, so `--charset`'s non-empty
+/// default lives in `main` and not here.
 #[derive(Clone, Debug, Default)]
 pub struct ReadOptions {
     pub naming: Naming,
@@ -153,6 +164,8 @@ pub struct ReadOptions {
     /// The password for an encrypted entry. `None` refuses one rather than reading its
     /// ciphertext as though it were a page.
     pub password: Option<String>,
+    /// Read header geometry to admit spreads only when splitting was requested.
+    pub split: Option<Split>,
 }
 
 /// An input being read once, in the order its entries are recorded in — or, for a directory,

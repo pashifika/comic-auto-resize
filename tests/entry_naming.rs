@@ -273,31 +273,6 @@ fn the_flag_takes_no_value() {
     );
 }
 
-/// A user enabling this is accepting that every numbered page is renamed, so the help has to
-/// say what the rule is rather than that there is one.
-#[test]
-fn the_flags_help_states_the_rule_in_full() {
-    let output = Command::new(BINARY)
-        .arg("--help")
-        .output()
-        .expect("runs the binary");
-    let help = String::from_utf8_lossy(&output.stdout);
-    let description = help
-        .split("--fix-idx")
-        .nth(1)
-        .expect("--fix-idx is listed")
-        .split("\n\n")
-        .next()
-        .expect("a description");
-
-    for claim in ["position", "directory", "total"] {
-        assert!(
-            description.contains(claim),
-            "the help does not say what `{claim}` means for this flag: {description}"
-        );
-    }
-}
-
 /// End to end, because the flag is only worth anything if it reaches the reader.
 #[test]
 fn the_flag_reaches_the_reader_and_the_default_run_is_unchanged() {

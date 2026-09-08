@@ -59,6 +59,30 @@ fn error_text(path: &Path) -> String {
         .map_or_else(|| "no error".to_owned(), |error| error.to_string())
 }
 
+#[test]
+fn sevenz_keeps_the_shared_split_and_corrupt_header_contract() {
+    with_archive(
+        "sevenz-split",
+        &support::split_reader_pages(),
+        &["-ms=on"],
+        |archive| {
+            assert_eq!(
+                seven_zip_listing(archive),
+                [
+                    "cover.png",
+                    "page3.png",
+                    "page4.png",
+                    "page5.png",
+                    "page6.png"
+                ]
+            );
+            support::assert_reader_split_contract(|options| {
+                Source::open(archive, options).expect("opens")
+            });
+        },
+    );
+}
+
 // ---------------------------------------------------------------- the shared contract
 
 /// Task 3.1. 7-Zip sorts by name when it writes, so `page1`, `page10`, `page2` *is* the
