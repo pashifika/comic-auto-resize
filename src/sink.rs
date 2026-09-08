@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use zip::write::SimpleFileOptions;
@@ -17,17 +18,30 @@ use zip::{CompressionMethod, ZipWriter};
 
 use crate::pipeline::RunError;
 
-/// Where a finished page belongs in the output.
+/// Where a finished piece belongs in the output: `(entry index, piece index)`.
 ///
-/// `sub_index` is always zero today. It exists so that splitting a spread into two pieces
-/// later needs no change to the ordering key.
+/// One entry yields one or more pieces and each piece is one output entry, so the key orders
+/// pieces within an entry and entries within the archive.
 pub type PageKey = (u32, u32);
 
-/// One finished page, waiting for its turn.
+/// One finished piece, waiting for its turn.
 pub struct Page {
     pub key: PageKey,
+    /// How many pieces this piece's entry yields. Carried on every piece so the writer learns
+    /// it from whichever piece arrives first and needs no announcement ahead of them.
+    pub pieces: NonZeroU32,
     pub name: String,
     pub bytes: Vec<u8>,
+}
+
+/// What one [`Sink::accept`] flushed.
+///
+/// Two counts rather than one: the trace observes pieces and the read-ahead window counts
+/// entries, so a caller that conflated them would return a credit per piece.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Flushed {
+    pub pieces: u32,
+    pub entries: u32,
 }
 
 /// The output archive, fed in read order from completions that may arrive out of order.
@@ -35,10 +49,11 @@ pub struct Sink {
     /// `Option` only so `finish` can take it: `ZipWriter::finish` consumes, and `Sink` has a
     /// `Drop`. It is `Some` for the whole life of the sink until then.
     archive: Option<ZipWriter<File>>,
-    /// Completed pages above the one being waited for. Bounded by the pipeline's read-ahead
+    /// Completed pieces above the one being waited for. Bounded by the pipeline's read-ahead
     /// window, not by the page count — see [`crate::pipeline`].
     pending: BTreeMap<PageKey, Page>,
-    next_index: u32,
+    /// The piece the writer is waiting for.
+    next_key: PageKey,
     written: u32,
     /// The output's own path, claimed at creation and built in place.
     path: PathBuf,
@@ -110,7 +125,7 @@ impl Sink {
         Ok(Self {
             archive: Some(ZipWriter::new(file)),
             pending: BTreeMap::new(),
-            next_index: 0,
+            next_key: (0, 0),
             written: 0,
             names: HashSet::new(),
             path: path.to_path_buf(),
@@ -118,24 +133,35 @@ impl Sink {
         })
     }
 
-    /// Takes a finished page and writes everything that has become contiguous.
-    ///
-    /// Returns how many entries were written, which is how many read-ahead credits the
-    /// pipeline may return.
+    /// Takes a finished piece and writes everything that has become contiguous.
     ///
     /// # Errors
     ///
-    /// [`RunError::Archive`] or [`RunError::Io`] if the archive cannot be extended.
-    pub fn accept(&mut self, page: Page) -> Result<u32, RunError> {
+    /// [`RunError::MisplacedPiece`] if the piece's index is not below its entry's piece count,
+    /// and [`RunError::Archive`] or [`RunError::Io`] if the archive cannot be extended.
+    pub fn accept(&mut self, page: Page) -> Result<Flushed, RunError> {
+        if page.key.1 >= page.pieces.get() {
+            return Err(RunError::MisplacedPiece {
+                name: page.name,
+                piece: page.key.1,
+                pieces: page.pieces.get(),
+            });
+        }
         self.pending.insert(page.key, page);
 
-        let mut flushed = 0;
-        // Only `sub_index` zero exists, so one entry advances the index by one. Splitting
-        // would make this a range over the entry's piece count.
-        while let Some(page) = self.pending.remove(&(self.next_index, 0)) {
+        let mut flushed = Flushed::default();
+        // The expected key stays inside the entry until its last piece is written, which is
+        // what makes an entry's pieces contiguous without collecting them first.
+        while let Some(page) = self.pending.remove(&self.next_key) {
+            let last = page.key.1 + 1 == page.pieces.get();
             self.write(&page)?;
-            self.next_index += 1;
-            flushed += 1;
+            flushed.pieces += 1;
+            if last {
+                self.next_key = (self.next_key.0 + 1, 0);
+                flushed.entries += 1;
+            } else {
+                self.next_key.1 += 1;
+            }
         }
         Ok(flushed)
     }
@@ -159,17 +185,20 @@ impl Sink {
     ///
     /// # Errors
     ///
-    /// [`RunError::Empty`] when no page was written, [`RunError::Incomplete`] if a page never
-    /// arrived, [`RunError::Archive`] if the archive cannot be closed, and [`RunError::Io`] if
-    /// it cannot be flushed.
+    /// [`RunError::Incomplete`] if a piece never arrived — either one stranded above the piece
+    /// being waited for, or the writer left inside an entry — [`RunError::Empty`] when nothing
+    /// was written, [`RunError::Archive`] if the archive cannot be closed, and [`RunError::Io`]
+    /// if it cannot be flushed.
     pub fn finish(&mut self) -> Result<u32, RunError> {
-        if let Some(key) = self.pending.keys().next().copied() {
-            // Every page that was read is accounted for by the time the workers are joined,
-            // so a leftover here means the ordering invariant broke rather than that a page
-            // failed. Reported instead of silently writing a book with a gap.
+        // Every piece that was read is accounted for by the time the workers are joined, so a
+        // leftover here, or an entry the writer never got to the end of, means the ordering
+        // invariant broke rather than that a page failed. Reported instead of silently writing
+        // a book with a gap.
+        let stranded = self.pending.keys().next().copied();
+        if stranded.is_some() || self.next_key.1 != 0 {
             return Err(RunError::Incomplete {
-                expected: self.next_index,
-                stranded: key.0,
+                expected: self.next_key,
+                stranded,
             });
         }
         if self.written == 0 {
@@ -496,7 +525,11 @@ fn resolved(input: &Path) -> Result<PathBuf, RunError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputKind, default_output, durable_directory_entry, output_directory};
+    use super::{
+        Flushed, InputKind, NonZeroU32, Page, RunError, Sink, default_output,
+        durable_directory_entry, output_directory,
+    };
+    use std::fs::File;
     use std::path::{Path, PathBuf};
 
     fn file(input: &str) -> PathBuf {
@@ -613,5 +646,165 @@ mod tests {
             Path::new("dest")
         );
         assert_eq!(output_directory(Path::new("/out.zip")), Path::new("/"));
+    }
+
+    /// A scratch directory of this test's own, removed when it is dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "comic-auto-resize-{label}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&path).expect("creates the scratch directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn piece(entry: u32, index: u32, pieces: u32) -> Page {
+        Page {
+            key: (entry, index),
+            pieces: NonZeroU32::new(pieces).expect("a piece count is never zero"),
+            name: format!("{entry}-{index}.jpg"),
+            bytes: vec![0u8; 4],
+        }
+    }
+
+    /// The names the finished archive holds, in stored order.
+    fn stored_names(path: &Path) -> Vec<String> {
+        let file = File::open(path).expect("the archive was written");
+        let mut archive = ::zip::ZipArchive::new(file).expect("a readable zip");
+        (0..archive.len())
+            .map(|index| {
+                archive
+                    .by_index(index)
+                    .expect("an entry the central directory names")
+                    .name()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// An entry's pieces stay together and a later entry waits behind them, whatever order the
+    /// workers finish in — and one entry releases one read-ahead credit, not one per piece.
+    #[test]
+    fn an_entrys_pieces_are_written_together_and_release_one_credit() {
+        let scratch = Scratch::new("pieces-order");
+        let output = scratch.0.join("out.zip");
+        let mut sink = Sink::create(&output).expect("the output is free");
+
+        assert_eq!(
+            sink.accept(piece(0, 0, 2)).expect("the first piece"),
+            Flushed {
+                pieces: 1,
+                entries: 0
+            },
+            "a piece is written as soon as it is expected, but its entry is not complete"
+        );
+        assert_eq!(
+            sink.accept(piece(1, 0, 1)).expect("a later entry"),
+            Flushed::default(),
+            "the next entry waits while the current one is unfinished"
+        );
+        assert_eq!(
+            sink.accept(piece(0, 1, 2)).expect("the second piece"),
+            Flushed {
+                pieces: 2,
+                entries: 2
+            },
+            "completing the entry releases it and the entry queued behind it"
+        );
+
+        assert_eq!(sink.finish().expect("every piece arrived"), 3);
+        assert_eq!(stored_names(&output), ["0-0.jpg", "0-1.jpg", "1-0.jpg"]);
+    }
+
+    /// Arrival order inside an entry is not relied on either.
+    #[test]
+    fn a_piece_that_arrives_before_its_predecessor_waits_for_it() {
+        let scratch = Scratch::new("pieces-reorder");
+        let output = scratch.0.join("out.zip");
+        let mut sink = Sink::create(&output).expect("the output is free");
+
+        assert_eq!(
+            sink.accept(piece(0, 1, 2)).expect("the second piece first"),
+            Flushed::default()
+        );
+        assert_eq!(
+            sink.accept(piece(0, 0, 2)).expect("then the first"),
+            Flushed {
+                pieces: 2,
+                entries: 1
+            }
+        );
+
+        sink.finish().expect("every piece arrived");
+        assert_eq!(stored_names(&output), ["0-0.jpg", "0-1.jpg"]);
+    }
+
+    /// An entry whose later pieces never arrived is a book with a gap, so it is refused even
+    /// though nothing is stranded above it and the archive would close cleanly.
+    #[test]
+    fn an_entry_the_writer_never_finished_is_refused() {
+        let scratch = Scratch::new("pieces-short");
+        let output = scratch.0.join("out.zip");
+        let mut sink = Sink::create(&output).expect("the output is free");
+
+        sink.accept(piece(0, 0, 2)).expect("the first piece");
+        let error = sink
+            .finish()
+            .expect_err("an entry missing its second piece must not be closed over");
+        assert!(
+            matches!(
+                error,
+                RunError::Incomplete {
+                    expected: (0, 1),
+                    stranded: None
+                }
+            ),
+            "{error}"
+        );
+
+        drop(sink);
+        assert!(!output.exists(), "the unfinished archive was left behind");
+    }
+
+    /// A piece outside its own entry is refused where both numbers are known, rather than
+    /// waiting in the map for a turn that never comes.
+    #[test]
+    fn a_piece_outside_its_entrys_range_is_refused() {
+        let scratch = Scratch::new("pieces-misplaced");
+        let output = scratch.0.join("out.zip");
+        let mut sink = Sink::create(&output).expect("the output is free");
+
+        let error = sink
+            .accept(piece(0, 2, 2))
+            .expect_err("piece 2 of 2 does not exist");
+        assert!(
+            matches!(
+                error,
+                RunError::MisplacedPiece {
+                    piece: 2,
+                    pieces: 2,
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("0-2.jpg"),
+            "the refusal does not name the entry: {error}"
+        );
+
+        drop(sink);
+        assert!(!output.exists(), "the refused run left its archive behind");
     }
 }

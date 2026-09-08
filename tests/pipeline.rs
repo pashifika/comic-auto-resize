@@ -2080,6 +2080,9 @@ fn the_output_and_delete_flags_help_states_what_they_resolve_to() {
 type Rows = Vec<(u32, String, Plan, bool)>;
 
 /// Runs the pipeline with an observer, returning what it reported and what it observed.
+///
+/// Every observation is checked to be piece 0 of 1 here rather than in one test: nothing splits
+/// an entry yet, so it is a property of every run through this helper.
 fn observed(input: &[u8], output: &Path, jobs: usize, target: Target) -> (Report, Rows) {
     let source = ZipSource::new(
         std::io::Cursor::new(input.to_vec()),
@@ -2088,6 +2091,12 @@ fn observed(input: &[u8], output: &Path, jobs: usize, target: Target) -> (Report
     .expect("the fixture is a zip");
     let mut rows = Vec::new();
     let mut observe = |page: pipeline::Trace<'_>| {
+        assert_eq!(
+            (page.piece, page.pieces.get()),
+            (0, 1),
+            "{}: no input yields a second piece yet",
+            page.name
+        );
         rows.push((
             page.position,
             page.name.to_owned(),

@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! credits ─────────────────────────────────────────────────────────┐
-//!    │ capacity W                                                  │ one per entry written
+//!    │ capacity W                                                  │ one per entry completed
 //!    ▼                                                             │
 //! reader (1 thread*) ─► work ─► workers (J) ─► done ─► writer (caller's thread)
 //!    entry bytes    capacity J   decode      capacity J   BTreeMap ─► ZipWriter
@@ -11,9 +11,14 @@
 //!                               encode
 //! ```
 //!
+//! One entry yields one or more *pieces*, and each piece is one output entry. Today every
+//! entry yields exactly one; the seam exists so that splitting a spread into two pages needs
+//! no change to the ordering or to the bound below.
+//!
 //! The writer runs on the caller's own thread rather than on one of its own, and the optional
-//! trace runs there with it: each page's record is handed to the observer as that page is
-//! written and before its credit goes back, so an observer that blocks stalls the reader too.
+//! trace runs there with it: each piece's record is handed to the observer as that piece is
+//! written, and an entry's credit goes back after its last piece, so an observer that blocks
+//! stalls the reader too.
 //!
 //! # Why peak memory is `O(J)`
 //!
@@ -29,15 +34,25 @@
 //! this pass exists to replace, moved one layer down.
 //!
 //! The `credits` channel is what actually bounds it. It starts holding `W` tokens; the
-//! reader takes one before reading an entry and the writer returns one after writing an
-//! entry. So at most `W` entries exist anywhere in the system at once — unread but
-//! permitted, in `work`, inside a worker, or waiting in the map — and the map alone can hold
-//! no more than `W`.
+//! reader takes one before reading an entry and the writer returns one after that entry's
+//! **last** piece is written. So at most `W` entries exist anywhere in the system at once —
+//! unread but permitted, in `work`, inside a worker, or waiting in the map — whatever their
+//! piece counts. The map holds the pieces of those entries and no others, so it is bounded by
+//! `W × n` pieces for a largest piece count `n`, a constant factor rather than the page count.
+//! In practice it is `W`: a worker sends an entry's pieces in order down one FIFO channel, and
+//! the writer emits a piece as soon as it is the expected one rather than collecting the entry
+//! first, so no piece of the entry being written waits in the map.
 //!
-//! It cannot deadlock. The entry the writer is waiting for took its credit before every
-//! entry behind it, so it is already in flight and no later entry can take its place; when
-//! it is written a credit is returned. `credits` never blocks the writer either: at most `W`
-//! tokens exist, and the entry just written holds one of them, so there is always room.
+//! It cannot deadlock. The entry the writer is waiting for took its credit before every entry
+//! behind it, so it is already in flight — queued, inside a worker, or with its earlier pieces
+//! written and the worker producing the next — and no later entry can take its place; when its
+//! last piece is written a credit is returned. `credits` never blocks the writer either: at
+//! most `W` tokens exist, and the entry just completed holds one of them, so there is always
+//! room.
+//!
+//! A worker that declared `n` pieces and sent fewer would leave the writer waiting for a piece
+//! that never arrives. That is a bug rather than an input condition, and it is caught: the run
+//! ends when the workers are joined and [`Sink::finish`] refuses a writer left inside an entry.
 //!
 //! ## `W + 1` for a source whose decoder pushes
 //!
@@ -55,10 +70,10 @@
 //!
 //! ## The trace's records are inside the same window
 //!
-//! An observer adds a second map beside the sink's, holding one record per page the sink has
+//! An observer adds a second map beside the sink's, holding one record per piece the sink has
 //! taken and not yet written. It is populated from the same entries the credits count and
-//! drained as the sink writes them, so it holds no more than `W` either, and a record is a
-//! name and seven `Copy` fields rather than a page. A run with no observer allocates none.
+//! drained as the sink writes them, so it is bounded exactly as the sink's map is, and a record
+//! is a name and nine `Copy` fields rather than a page. A run with no observer allocates none.
 //!
 //! # What the run's peak actually is, with every factor named
 //!
@@ -234,7 +249,7 @@
 //! the count is exactly one and it is this module's choice rather than the host's.
 
 use std::collections::BTreeMap;
-use std::num::NonZeroUsize;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -358,28 +373,33 @@ pub struct Outcome {
     pub encoded_bytes: usize,
 }
 
-/// One page, handed to the observer as that page is written.
+/// One written piece, handed to the observer as that piece is written.
 ///
-/// Borrowed: `name` points into the record the writer holds until the page is written, so an
+/// Borrowed: `name` points into the record the writer holds until the piece is written, so an
 /// observer that formats and drops it allocates nothing.
 ///
-/// `non_exhaustive` for [`Outcome`]'s reason and one of its own: `position` is
-/// [`PageKey`]'s entry index, and the key's second field exists for the day a spread is split
-/// into two pages. Both halves would share this position, so that day adds a field here.
+/// `non_exhaustive` for [`Outcome`]'s reason: this is a view of a decision that will grow, and
+/// an observer only reads it. `piece` and `pieces` are carried but not yet printed by
+/// `--debug`: no input yields a second piece, so a marker would be untestable end to end.
 #[derive(Clone, Copy, Debug)]
 #[non_exhaustive]
 pub struct Trace<'a> {
-    /// Position in read order, from zero.
+    /// The entry's position in read order, from zero. An entry's pieces share it.
     pub position: u32,
+    /// This piece's index within its entry, from zero.
+    pub piece: u32,
+    /// How many pieces the entry yields. One today; nothing splits an entry yet.
+    pub pieces: NonZeroU32,
     pub name: &'a str,
     pub outcome: Outcome,
 }
 
-/// One page's outcome, held from the moment the sink takes the page until it writes it.
+/// One piece's outcome, held from the moment the sink takes the piece until it writes it.
 ///
 /// Owns the name because [`Sink::accept`] takes the page by value. That is one clone per
-/// page, paid only while an observer is watching.
+/// piece, paid only while an observer is watching.
 struct Record {
+    pieces: NonZeroU32,
     name: String,
     outcome: Outcome,
 }
@@ -557,9 +577,9 @@ struct Finished {
 /// page exactly once and in one thread, which is why both the counting and the tracing happen
 /// here.
 ///
-/// The trace stops at the failure rather than after it: a [`Sink::accept`] that wrote a page and
-/// then failed on the next reports only the error, so those pages are not traced. They are also
-/// not in any archive — the run removes its output — so the untraced pages are pages that no
+/// The trace stops at the failure rather than after it: a [`Sink::accept`] that wrote a piece and
+/// then failed on the next reports only the error, so those pieces are not traced. They are also
+/// not in any archive — the run removes its output — so the untraced pieces are pieces that no
 /// longer exist. Reporting them would mean widening `accept`'s error to carry a count.
 fn write_in_order(
     sink: &mut Sink,
@@ -569,7 +589,7 @@ fn write_in_order(
 ) -> Result<(u32, u32), RunError> {
     let mut composited = 0;
     let mut below_floor = 0;
-    // Outcomes for pages the sink has taken and not yet written, kept only while an observer
+    // Outcomes for pieces the sink has taken and not yet written, kept only while an observer
     // is watching. Bounded by the credit window, like the sink's own map.
     let mut pending: BTreeMap<PageKey, Record> = BTreeMap::new();
     while let Ok(finished) = done.recv() {
@@ -580,23 +600,30 @@ fn write_in_order(
             pending.insert(
                 finished.page.key,
                 Record {
+                    pieces: finished.page.pieces,
                     name: finished.page.name.clone(),
                     outcome: finished.outcome,
                 },
             );
         }
-        for _ in 0..sink.accept(finished.page)? {
-            // The sink writes in key order, so the lowest records are the pages it just
+        let flushed = sink.accept(finished.page)?;
+        for _ in 0..flushed.pieces {
+            // The sink writes in key order, so the lowest records are the pieces it just
             // wrote, in the order it wrote them.
             if let Some(observe) = trace.as_deref_mut()
                 && let Some((key, record)) = pending.pop_first()
             {
                 observe(Trace {
                     position: key.0,
+                    piece: key.1,
+                    pieces: record.pieces,
                     name: &record.name,
                     outcome: record.outcome,
                 });
             }
+        }
+        // One credit per entry, returned after its last piece: the window counts entries.
+        for _ in 0..flushed.entries {
             // The reader may already be gone; that is not a failure.
             let _ = credits.send(());
         }
@@ -620,6 +647,7 @@ fn read_entries<S: Entries>(
         };
         let entry = entry?;
         let job = Job {
+            // The reader hands over an entry; how many pieces it becomes is the worker's.
             key: (entry.index, 0),
             name: entry.name,
             format: entry.format,
@@ -686,7 +714,13 @@ fn process(
             source_bytes,
             encoded_bytes: bytes.len(),
         },
-        page: Page { key, name, bytes },
+        // One piece per entry: nothing splits one yet.
+        page: Page {
+            key,
+            pieces: NonZeroU32::MIN,
+            name,
+            bytes,
+        },
     })
 }
 
@@ -749,10 +783,23 @@ pub enum RunError {
         "{name}: two entries would be written under this name once renamed to the encoder's extension"
     )]
     NameCollision { name: String },
-    /// The ordering invariant broke: a page above the one being waited for was left over
-    /// after every worker finished.
-    #[error("page {expected} never arrived, but page {stranded} did")]
-    Incomplete { expected: u32, stranded: u32 },
+    /// The ordering invariant broke: the writer never reached the end of the archive. Either a
+    /// piece above the one it was waiting for was left over after every worker finished, or it
+    /// was left inside an entry whose remaining pieces never arrived.
+    #[error("{}", incomplete_message(*expected, *stranded))]
+    Incomplete {
+        expected: PageKey,
+        stranded: Option<PageKey>,
+    },
+    /// A piece claimed an index its own entry has no room for. A worker's bug rather than an
+    /// input condition, refused where both numbers are known instead of surfacing later as a
+    /// page nothing waits for.
+    #[error("{name}: piece {piece} of an entry that yields {pieces}")]
+    MisplacedPiece {
+        name: String,
+        piece: u32,
+        pieces: u32,
+    },
     /// A directory input with no name of its own — `.`, `..`, or the filesystem root — so
     /// there is nothing to derive an output name from. Reached only after the path has been
     /// resolved, so `.` is the directory the user is standing in rather than this case.
@@ -769,6 +816,20 @@ pub enum RunError {
     /// `-o`'s arms, so the bound is on the resolved path rather than on the value.
     #[error("{}: would be written inside the input {}", path.display(), input.display())]
     OutputInsideInput { path: PathBuf, input: PathBuf },
+}
+
+/// [`RunError::Incomplete`]'s two shapes, as one line.
+///
+/// Keys are printed `entry.piece`, because with pieces the entry index alone no longer says
+/// which output entry is missing.
+fn incomplete_message(expected: PageKey, stranded: Option<PageKey>) -> String {
+    let (entry, piece) = expected;
+    match stranded {
+        Some((stranded_entry, stranded_piece)) => format!(
+            "page {entry}.{piece} never arrived, but page {stranded_entry}.{stranded_piece} did"
+        ),
+        None => format!("page {entry}.{piece} never arrived, so entry {entry} is short"),
+    }
 }
 
 impl RunError {
@@ -808,6 +869,7 @@ impl RunError {
             | Self::StagePanicked { .. }
             | Self::Empty
             | Self::NameCollision { .. }
+            | Self::MisplacedPiece { .. }
             | Self::Incomplete { .. } => true,
             Self::OutputExists { .. }
             | Self::StrayOutput { .. }
@@ -822,10 +884,88 @@ impl RunError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Capacities, PageError, RunError, SourceError, WINDOW_PER_JOB};
+    use super::{
+        Capacities, Finished, Format, NonZeroU32, Outcome, Page, PageError, Plan, RunError, Sink,
+        SourceError, Trace, WINDOW_PER_JOB, bounded, write_in_order,
+    };
     use std::io;
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
+
+    /// One finished piece, with the outcome fields the writer only forwards left uniform.
+    fn finished(entry: u32, index: u32, pieces: u32) -> Finished {
+        Finished {
+            outcome: Outcome {
+                format: Format::Jpeg,
+                source_width: 1520,
+                source_height: 2150,
+                plan: Plan::Resize { width: 1280 },
+                composited: false,
+                source_bytes: 16,
+                encoded_bytes: 4,
+            },
+            page: Page {
+                key: (entry, index),
+                pieces: NonZeroU32::new(pieces).expect("a piece count is never zero"),
+                name: format!("{entry}-{index}.jpg"),
+                bytes: vec![0u8; 4],
+            },
+        }
+    }
+
+    /// The writer's whole contract for pieces, over a hand-fed channel: an entry's pieces are
+    /// written together and in order however they arrive, a later entry waits behind them, the
+    /// observer sees every piece once in write order, and **one credit comes back per entry**
+    /// rather than per piece — which is what keeps the read-ahead window counting entries.
+    #[test]
+    fn pieces_are_written_in_order_and_one_credit_returns_per_entry() {
+        let scratch = std::env::temp_dir().join(format!(
+            "comic-auto-resize-writer-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&scratch).expect("creates the scratch directory");
+        let output = scratch.join("out.zip");
+        let mut sink = Sink::create(&output).expect("the output is free");
+
+        let (done_tx, done_rx) = bounded::<Result<Finished, PageError>>(8);
+        let (credit_tx, credit_rx) = bounded::<()>(8);
+        // The second entry completes before the first entry's second piece.
+        for piece in [finished(0, 0, 2), finished(1, 0, 1), finished(0, 1, 2)] {
+            done_tx.send(Ok(piece)).expect("the channel has room");
+        }
+        drop(done_tx);
+
+        let mut traced = Vec::new();
+        let mut observe = |page: Trace<'_>| {
+            traced.push((
+                page.position,
+                page.piece,
+                page.pieces.get(),
+                page.name.to_owned(),
+            ));
+        };
+        write_in_order(&mut sink, &done_rx, &credit_tx, Some(&mut observe))
+            .expect("every piece was accepted");
+
+        assert_eq!(
+            traced,
+            vec![
+                (0, 0, 2, "0-0.jpg".to_owned()),
+                (0, 1, 2, "0-1.jpg".to_owned()),
+                (1, 0, 1, "1-0.jpg".to_owned()),
+            ],
+            "the observer sees pieces in write order, with the entry's position shared"
+        );
+        assert_eq!(
+            credit_rx.len(),
+            2,
+            "two entries were completed, so two read-ahead permits come back"
+        );
+        assert_eq!(sink.finish().expect("nothing was left over"), 3);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
 
     #[test]
     fn every_channel_has_a_finite_capacity_that_scales_with_the_worker_count() {
@@ -917,8 +1057,17 @@ mod tests {
                 name: "001.jpg".to_owned(),
             },
             RunError::Incomplete {
-                expected: 7,
-                stranded: 9,
+                expected: (7, 0),
+                stranded: Some((9, 0)),
+            },
+            RunError::Incomplete {
+                expected: (7, 1),
+                stranded: None,
+            },
+            RunError::MisplacedPiece {
+                name: "001.jpg".to_owned(),
+                piece: 2,
+                pieces: 2,
             },
             // The one variant about the input that names the input itself: a directory with no
             // name of its own is the input, and there is nothing to derive an output from.
@@ -946,6 +1095,7 @@ mod tests {
                 | RunError::StagePanicked { .. }
                 | RunError::Empty
                 | RunError::NameCollision { .. }
+                | RunError::MisplacedPiece { .. }
                 | RunError::Incomplete { .. } => None,
                 RunError::UnnamedInput { .. } => Some(INPUT),
                 RunError::OutputExists { .. }
