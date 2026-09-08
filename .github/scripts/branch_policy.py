@@ -2,7 +2,8 @@
 """Validate the pull-request branch flow used by comic-auto-resize.
 
 Topic branches merge into a development line; a development line merges into `main`.
-A topic branch may not reach `main` without passing through one.
+A topic branch may not reach `main` without passing through one. A development line is
+`dev/<topic>` with one non-empty path component; the topic is descriptive, not a version.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import re
 import sys
 
-DEVELOPMENT_BRANCH = re.compile(r"dev/[0-9]+\.[0-9]+\.x")
+DEVELOPMENT_BRANCH = re.compile(r"dev/[^/]+")
 DEPENDABOT_BRANCH = re.compile(r"dependabot/.+")
 TOPIC_BRANCH = re.compile(
     r"(?:feat|fix|perf|refactor|docs|test|build|ci|chore|revert)/.+"
@@ -45,7 +46,7 @@ def validate_branch_flow(
             return "pull requests into main must come from the base repository"
         if DEVELOPMENT_BRANCH.fullmatch(head):
             return None
-        return "pull requests into main must come from dev/<major>.<minor>.x"
+        return "pull requests into main must come from dev/<topic>"
 
     if DEVELOPMENT_BRANCH.fullmatch(base):
         if is_dependabot_update(head, base_repository, head_repository, author_login):
@@ -66,7 +67,7 @@ def validate_branch_flow(
             "topic branch with a non-empty slug, or from main to synchronize a promotion"
         )
 
-    return "the pull-request base must be main or dev/<major>.<minor>.x"
+    return "the pull-request base must be main or dev/<topic>"
 
 
 def main(arguments: list[str]) -> int:
