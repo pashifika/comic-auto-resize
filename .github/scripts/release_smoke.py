@@ -301,9 +301,10 @@ def smoke_spread(executable: Path, *, work_directory: Path) -> list[str]:
     trim = (f"--split={TRIM_PERCENT}", f"--split-pos={TRIM_OFFSET}")
     trimmed = convert_spread(executable, original, work_directory / "trimmed.zip", *trim)
     expect_geometry(trimmed, " ".join(trim), [(DEFAULT_AUTO_WIDTH, trim_height)] * 2)
-    if [page.digest for page in trimmed] == [page.digest for page in untrimmed]:
+    unshifted = {page.digest for page in untrimmed}
+    if any(page.digest in unshifted for page in trimmed):
         raise SmokeError(
-            f"--split-pos={TRIM_OFFSET} produced the unshifted pieces; the offset was ignored"
+            f"--split-pos={TRIM_OFFSET} left a piece on an unshifted window; both windows move"
         )
     if trimmed[0].digest == trimmed[1].digest:
         raise SmokeError(

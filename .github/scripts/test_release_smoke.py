@@ -151,14 +151,17 @@ else:
     if SPLIT_MODE == "geometry":
         height += 40
     offset = int(options.get("--split-pos") or 0)
-    if SPLIT_MODE == "inert-offset":
-        offset = 0
     order = options.get("--reading-order", "r")
     if SPLIT_MODE == "inert-order":
         order = "r"
     halves = ["right", "left"] if order == "r" else ["left", "right"]
+    offsets = [offset, offset]
+    if SPLIT_MODE == "inert-offset":
+        offsets = [0, 0]
+    elif SPLIT_MODE == "one-side-offset":
+        offsets = [offset, 0]
     members = [
-        (f"spread-001-{{index + 1}}.jpg", jpeg(TARGET, height, f"{{half}}+{{offset}}"))
+        (f"spread-001-{{index + 1}}.jpg", jpeg(TARGET, height, f"{{half}}+{{offsets[index]}}"))
         for index, half in enumerate(halves)
     ]
 
@@ -208,11 +211,14 @@ class FixtureTests(unittest.TestCase):
         half = SPREAD_WIDTH // 2 * 3
         self.assertNotEqual(row[:half], row[half:])
 
-    def test_a_spread_fixture_holds_one_landscape_page(self) -> None:
+    def test_a_spread_fixture_holds_one_page_inside_the_split_gate(self) -> None:
+        """Outside 1.05-1.60 the binary refuses to split, and the smoke fails at release."""
         path = write_spread_fixture(self.root / "spread.zip")
         with zipfile.ZipFile(path) as archive:
             self.assertEqual(archive.namelist(), ["spread-001.png"])
-        self.assertGreater(SPREAD_WIDTH, SPREAD_HEIGHT)
+        aspect = SPREAD_WIDTH * 100 // SPREAD_HEIGHT
+        self.assertGreaterEqual(aspect, 105)
+        self.assertLessEqual(aspect, 160)
 
 
 class JpegReadingTests(unittest.TestCase):
@@ -338,15 +344,16 @@ class BinarySmokeTests(unittest.TestCase):
                 self.root / "absent", version=VERSION, work_directory=self.work("absent")
             )
 
-    def test_a_correct_binary_splits_the_spread(self) -> None:
-        summary = smoke_spread(self.stand_in(), work_directory=self.work("spread-ok"))
-        self.assertEqual(len(summary), 5)
-
     def test_a_binary_that_leaves_the_spread_whole_fails(self) -> None:
-        """Ignoring --split is what a binary predating the feature does, and it exits 0."""
+        """Ignoring --split is what a binary predating the feature does, and it exits 0.
+
+        Routed through `smoke_binary` rather than `smoke_spread`, so dropping the split
+        checks out of the packaged and downloaded path cannot pass this suite.
+        """
         with self.assertRaises(SmokeError):
-            smoke_spread(
+            smoke_binary(
                 self.stand_in(split_mode="whole"),
+                version=VERSION,
                 work_directory=self.work("spread-whole"),
             )
 
@@ -365,13 +372,18 @@ class BinarySmokeTests(unittest.TestCase):
                 work_directory=self.work("spread-order"),
             )
 
-    def test_a_binary_that_ignores_the_split_offset_fails(self) -> None:
-        """--split-pos does not change piece dimensions, so only the pixels can catch it."""
-        with self.assertRaises(SmokeError):
-            smoke_spread(
-                self.stand_in(split_mode="inert-offset"),
-                work_directory=self.work("spread-offset"),
-            )
+    def test_a_binary_that_does_not_shift_both_windows_fails(self) -> None:
+        """--split-pos does not change piece dimensions, so only the pixels can catch it.
+
+        `one-side-offset` is the shape a whole-list comparison misses: one piece moves, so
+        the two runs differ, yet a window the option promised to shift did not.
+        """
+        for mode in ("inert-offset", "one-side-offset"):
+            with self.subTest(mode=mode), self.assertRaises(SmokeError):
+                smoke_spread(
+                    self.stand_in(split_mode=mode),
+                    work_directory=self.work(f"spread-{mode}"),
+                )
 
 
 class ExtractionTests(unittest.TestCase):

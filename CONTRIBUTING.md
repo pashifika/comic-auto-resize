@@ -189,15 +189,19 @@ that commit. Cut the Change branch from the topic's tip, using one of the prefix
 with a non-empty slug. Creation is an ordinary push and needs no pull request; the
 development ruleset does not enforce its rules on branch creation.
 
-Delivery is by pull request, along those two directions only. A Change branch targeting
-`main` directly is rejected by the branch-flow check, and so is a pull request into `main`
-from a fork, and so is one development topic targeting another.
+Delivery is by pull request. A Change branch targeting `main` directly is rejected by the
+branch-flow check, and so is a pull request into `main` from a fork, and so is one
+development topic targeting another.
+
+Dependabot is the exception, on either base: a `dependabot/...` head in the base
+repository authored by `dependabot[bot]` may target `main` or a topic directly. The three
+conditions bind together, and loosening any one of them is refused.
 
 `main` requires its head to be up to date with itself, so each promotion leaves the topic
 one merge commit behind. Catch a retained topic up by opening a pull request from `main`
-into it. That direction is the one exception to Change-branch-only heads, and it is the
-only way to do it: the development ruleset requires a pull request and the `ci` check, so
-a direct fast-forward push is refused with `GH013`. A topic whose work is finished is not
+into it. That direction is the one exception to Change-branch-only human heads, and it is
+the only way to do it: the development ruleset requires a pull request and the `ci` check,
+so a direct fast-forward push is refused with `GH013`. A topic whose work is finished is not
 synchronized — it is deleted once its tip is reachable from `main`.
 
 `main` and every `dev/*` branch are protected and require the `ci` status check. `main`
