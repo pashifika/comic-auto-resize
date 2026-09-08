@@ -61,7 +61,7 @@ See [prerequisites](CONTRIBUTING.md#prerequisites) for platform setup and Git au
 The commands below use Bash (Git Bash on Windows).
 
 ```bash
-git clone --branch dev/2.0.x https://github.com/pashifika/comic-auto-resize.git
+git clone https://github.com/pashifika/comic-auto-resize.git
 cd comic-auto-resize
 cargo build --locked --release
 ./target/release/comic-auto-resize --help

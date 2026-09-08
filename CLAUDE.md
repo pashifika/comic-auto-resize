@@ -24,9 +24,9 @@ zip reader to keep it.
 
 `master` holds the shipped Go implementation, v1.1.2. It is a reference rather than a
 development line: it cannot be deleted or force-pushed, and new work does not belong on it.
-`main` holds the Rust rewrite and is the branch a visitor is meant to land on once the
-cutover completes. `dev/2.0.x` is the integration line feeding `main`, and topic branches
-continue to reach `main` through it afterwards.
+`main` holds the Rust rewrite and is the repository default branch. Integration happens on
+a development topic `dev/<topic>` created from `main`, and Change branches reach `main`
+through it. A topic is retired once its work is reachable from `main`.
 
 The behavioural reference is the recorded revision
 `d840ccc84ed5ac5f09be0e08a5a17fb14449a029` — `master` at tag `v1.1.2`. Read it with
