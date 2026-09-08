@@ -4,7 +4,8 @@ Read [CLAUDE.md](CLAUDE.md) before changing architecture, dependency policy, or 
 resize strategy. It is the baseline this repository is verified against; this file
 covers building it and getting a change merged.
 
-The Rust implementation is developed on `dev/2.0.x` and promoted to `main` at parity.
+The Rust implementation lives on `main`. Work reaches it through a development topic
+branch, `dev/<topic>`, and a short-lived Change branch cut from that topic.
 See [`README.md`](README.md) to build and run the tool.
 
 ## Toolchain and lockfile
@@ -172,32 +173,37 @@ editing the workflow. CI does not, so a syntax error there costs a round trip.
 
 ## Branch flow and pull requests
 
+Branches are created downwards from `main`; work is delivered back upwards by pull
+request. The two directions are separate, and only the second one is validated by the
+branch-flow check.
+
 ```
-feat|fix|perf|refactor|docs|test|build|ci|chore|revert/<slug>
-        │
-        ▼
-   dev/2.0.x ◀── main   synchronize after each promotion
-        │
-        ▼  once, at parity with master
-      main
+create:   main ──▶ dev/<topic> ──▶ feat|fix|perf|refactor|docs|test|build|ci|chore|revert/<slug>
+deliver:  <type>/<slug> ──▶ dev/<topic> ──▶ main
+sync:     main ──▶ dev/<topic>            after each promotion, if the topic is retained
 ```
 
-Cut a short-lived topic branch from `dev/2.0.x`, using one of the prefixes above with a
-non-empty slug. Topic branches merge into `dev/2.0.x`. A topic branch targeting `main`
-directly is rejected by the branch-flow check, and so is a pull request into `main` from a
-fork.
+A development topic is `dev/<topic>` with exactly one non-empty path component, named for
+the work rather than for a version. Create it from an accepted `main` commit and record
+that commit. Cut the Change branch from the topic's tip, using one of the prefixes above
+with a non-empty slug. Creation is an ordinary push and needs no pull request; the
+development ruleset does not enforce its rules on branch creation.
 
-`dev/2.0.x` merges into `main` once, at parity with `master`. `main` requires its head to
-be up to date with itself, so each promotion leaves `dev/2.0.x` one merge commit behind.
-Catch it up by opening a pull request from `main` into `dev/2.0.x`. That direction is the
-one exception to topic-branch-only heads, and it is the only way to do it: the development
-ruleset requires a pull request and the `ci` check, so a direct fast-forward push is
-refused with `GH013`.
+Delivery is by pull request, along those two directions only. A Change branch targeting
+`main` directly is rejected by the branch-flow check, and so is a pull request into `main`
+from a fork, and so is one development topic targeting another.
 
-Both branches are protected and require the `ci` status check. `main` accepts merge
-commits only and requires every review thread resolved; `dev/2.0.x` is looser and accepts
-any merge method. `master` cannot be deleted or force-pushed; it is a reference branch
-and new work does not belong on it.
+`main` requires its head to be up to date with itself, so each promotion leaves the topic
+one merge commit behind. Catch a retained topic up by opening a pull request from `main`
+into it. That direction is the one exception to Change-branch-only heads, and it is the
+only way to do it: the development ruleset requires a pull request and the `ci` check, so
+a direct fast-forward push is refused with `GH013`. A topic whose work is finished is not
+synchronized — it is deleted once its tip is reachable from `main`.
+
+`main` and every `dev/*` branch are protected and require the `ci` status check. `main`
+accepts merge commits only and requires every review thread resolved; `dev/*` is looser
+and accepts any merge method. `master` cannot be deleted or force-pushed; it is a
+reference branch and new work does not belong on it.
 
 Use [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) for commit
 subjects.
@@ -257,10 +263,10 @@ image are not claimed to be, which is what the published SHA-256 values are for.
 
 ### Prepare a version
 
-Bump `version` in `Cargo.toml` through the normal topic-to-development flow, let Cargo
-rewrite the root entry in `Cargo.lock`, and confirm no dependency resolution changed. Run
-the verification sequence above, promote `dev/2.0.x` to `main`, and record the resulting
-`main` commit. Never tag a topic or development commit.
+Bump `version` in `Cargo.toml` through the normal Change-to-topic flow, let Cargo rewrite
+the root entry in `Cargo.lock`, and confirm no dependency resolution changed. Run the
+verification sequence above, promote the development topic to `main`, and record the
+resulting `main` commit. Never tag a Change or development commit.
 
 ### Rehearse without publishing
 

@@ -18,50 +18,54 @@ AUTHOR = "pashifika"
 DEPENDABOT = "dependabot[bot]"
 
 ACCEPTED: list[tuple[str, str, str, str, str]] = [
-    # A development line reaches main.
+    # A development line reaches main, whatever its topic is called.
+    ("main", "dev/spread-split", REPOSITORY, REPOSITORY, AUTHOR),
     ("main", "dev/2.0.x", REPOSITORY, REPOSITORY, AUTHOR),
-    ("main", "dev/10.11.x", REPOSITORY, REPOSITORY, AUTHOR),
     # Every supported topic prefix reaches a development line.
-    ("dev/2.0.x", "feat/split-spreads", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "fix/bmp-header-match", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "perf/scaled-decode", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "refactor/source-enum", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "docs/readme", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "test/fixtures", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "build/nasm", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "ci/gate", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "chore/deps", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "revert/bad-merge", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "feat/split-spreads", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "fix/bmp-header-match", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "perf/scaled-decode", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "refactor/source-enum", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "docs/readme", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "test/fixtures", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "build/nasm", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "ci/gate", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "chore/release-2-2-0", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "revert/bad-merge", REPOSITORY, REPOSITORY, AUTHOR),
     # Promotion synchronization: a promotion leaves the development line one merge commit
     # behind, and the development ruleset refuses a direct fast-forward push.
+    ("dev/spread-split", "main", REPOSITORY, REPOSITORY, AUTHOR),
     ("dev/2.0.x", "main", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/10.11.x", "main", REPOSITORY, REPOSITORY, AUTHOR),
     # Dependabot is exempt on both bases, from the base repository only.
     ("main", "dependabot/cargo/clap-4.6.7", REPOSITORY, REPOSITORY, DEPENDABOT),
-    ("dev/2.0.x", "dependabot/cargo/clap-4.6.7", REPOSITORY, REPOSITORY, DEPENDABOT),
+    ("dev/spread-split", "dependabot/cargo/clap-4.6.7", REPOSITORY, REPOSITORY, DEPENDABOT),
 ]
 
 REJECTED: list[tuple[str, str, str, str, str]] = [
     # A topic branch may not skip the development line.
     ("main", "feat/split-spreads", REPOSITORY, REPOSITORY, AUTHOR),
     ("main", "fix/urgent", REPOSITORY, REPOSITORY, AUTHOR),
+    ("main", "chore/release-2-2-0", REPOSITORY, REPOSITORY, AUTHOR),
     # A fork may not target main even with a well-formed head.
-    ("main", "dev/2.0.x", REPOSITORY, FORK, AUTHOR),
+    ("main", "dev/spread-split", REPOSITORY, FORK, AUTHOR),
     # An unrecognised prefix is not a topic branch.
-    ("dev/2.0.x", "wip/experiment", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "feature/split", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "wip/experiment", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "feature/split", REPOSITORY, REPOSITORY, AUTHOR),
     # A prefix with no slug is not a topic branch.
-    ("dev/2.0.x", "feat/", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "feat", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "feat/", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "feat", REPOSITORY, REPOSITORY, AUTHOR),
     # A development line is not a topic branch for another development line.
-    ("dev/2.0.x", "dev/2.1.x", REPOSITORY, REPOSITORY, AUTHOR),
-    # Malformed development lines are not development lines.
-    ("main", "dev/2.x", REPOSITORY, REPOSITORY, AUTHOR),
-    ("main", "dev/2.0.0", REPOSITORY, REPOSITORY, AUTHOR),
-    ("main", "dev/2.0.x-hotfix", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "dev/another-topic", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/2.0.x", "dev/spread-split", REPOSITORY, REPOSITORY, AUTHOR),
+    # A development name needs exactly one non-empty topic component, on either side.
+    ("main", "dev/", REPOSITORY, REPOSITORY, AUTHOR),
+    ("main", "dev", REPOSITORY, REPOSITORY, AUTHOR),
+    ("main", "dev/spread/split", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/", "feat/split-spreads", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread/split", "feat/split-spreads", REPOSITORY, REPOSITORY, AUTHOR),
     # `master` is frozen; nothing targets it, and it is not a valid base.
-    ("master", "dev/2.0.x", REPOSITORY, REPOSITORY, AUTHOR),
-    ("release", "dev/2.0.x", REPOSITORY, REPOSITORY, AUTHOR),
+    ("master", "dev/spread-split", REPOSITORY, REPOSITORY, AUTHOR),
+    ("release", "dev/spread-split", REPOSITORY, REPOSITORY, AUTHOR),
     # The Dependabot exemption is bound to the actor, the branch shape, and the
     # repository together; loosening any one of the three must not admit the request.
     ("main", "dependabot/cargo/clap-4.6.7", REPOSITORY, REPOSITORY, AUTHOR),
@@ -69,11 +73,11 @@ REJECTED: list[tuple[str, str, str, str, str]] = [
     ("main", "dependabot/cargo/clap-4.6.7", REPOSITORY, FORK, DEPENDABOT),
     # Synchronization is bound to the base repository: a fork's `main` is unrelated
     # content wearing a trusted name.
-    ("dev/2.0.x", "main", REPOSITORY, FORK, AUTHOR),
+    ("dev/spread-split", "main", REPOSITORY, FORK, AUTHOR),
     # Only `main` synchronizes. `master` is the Go reference branch, and its tree is not
     # what a development line catches up to.
-    ("dev/2.0.x", "master", REPOSITORY, REPOSITORY, AUTHOR),
-    ("dev/2.0.x", "main-sync", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "master", REPOSITORY, REPOSITORY, AUTHOR),
+    ("dev/spread-split", "main-sync", REPOSITORY, REPOSITORY, AUTHOR),
 ]
 
 
