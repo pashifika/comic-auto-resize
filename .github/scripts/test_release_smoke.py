@@ -24,13 +24,18 @@ from release_smoke import (
     FIXTURE_HEIGHT,
     FIXTURE_PAGES,
     FIXTURE_WIDTH,
+    SPREAD_HEIGHT,
+    SPREAD_WIDTH,
     SmokeError,
     extract_package,
     jpeg_dimensions,
     png_page,
+    png_spread,
     read_pages,
     smoke_binary,
+    smoke_spread,
     write_fixture,
+    write_spread_fixture,
 )
 from test_release import COMMIT, TAG, VERSION, macho, portable_executable
 
@@ -63,20 +68,27 @@ import sys
 import zipfile
 
 VERSION = {version!r}
-HELP = "--auto-width --ratio --out --quality"
+HELP = "--auto-width --ratio --out --quality --split --split-pos --reading-order"
 PAGES = {pages}
 WIDTH = {width}
 HEIGHT = {height}
 MODE = {mode!r}
+SPLIT_MODE = {split_mode!r}
+SPREAD_WIDTH = {spread_width}
+TARGET = {target}
 
 
-def jpeg(width, height):
+def jpeg(width, height, label):
+    comment = label.encode()
     application = b"JFIF\\0\\x01\\x02\\x00\\x00\\x01\\x00\\x01\\x00\\x00"
     frame = struct.pack(">BHHBB", 8, height, width, 1, 0)
     return (
         b"\\xff\\xd8\\xff\\xe0"
         + struct.pack(">H", len(application) + 2)
         + application
+        + b"\\xff\\xfe"
+        + struct.pack(">H", len(comment) + 2)
+        + comment
         + b"\\xff\\xc2"
         + struct.pack(">H", len(frame) + 2)
         + frame
@@ -84,25 +96,76 @@ def jpeg(width, height):
     )
 
 
-argument = sys.argv[1]
-if argument == "--version":
+def half_up(numerator, denominator):
+    return (numerator * 2 + denominator) // (denominator * 2)
+
+
+options = {{}}
+positional = []
+arguments = sys.argv[1:]
+index = 0
+while index < len(arguments):
+    item = arguments[index]
+    if item == "--out":
+        options["--out"] = arguments[index + 1]
+        index += 2
+        continue
+    if item.startswith("--"):
+        key, _, value = item.partition("=")
+        options[key] = value
+    else:
+        positional.append(item)
+    index += 1
+
+if "--version" in options:
     print(f"comic-auto-resize {{VERSION}}")
     raise SystemExit(0)
-if argument == "--help":
+if "--help" in options:
     print(HELP)
     raise SystemExit(0)
+
+source = positional[0]
+with zipfile.ZipFile(source) as archive:
+    first = archive.read(archive.namelist()[0])
+source_width, source_height = struct.unpack_from(">II", first, 16)
 
 if MODE == "no-output":
     print(f"{{PAGES}} page(s) written to nowhere")
     raise SystemExit(0)
 if MODE == "eat-input":
-    open(argument, "wb").close()
+    open(source, "wb").close()
 
-output = argument[: -len(".zip")] + "_resize.zip"
+output = options.get("--out") or source[: -len(".zip")] + "_resize.zip"
+
+if source_width != SPREAD_WIDTH:
+    members = [
+        (f"page-{{index + 1:03d}}.jpg", jpeg(WIDTH, HEIGHT, "page"))
+        for index in range(PAGES)
+    ]
+elif "--split" not in options or SPLIT_MODE == "whole":
+    height = half_up(source_height * TARGET, source_width)
+    members = [("spread-001.jpg", jpeg(TARGET, height, "whole"))]
+else:
+    window = half_up(source_width * int(options["--split"]), 100)
+    height = half_up(source_height * TARGET, window)
+    if SPLIT_MODE == "geometry":
+        height += 40
+    offset = int(options.get("--split-pos") or 0)
+    if SPLIT_MODE == "inert-offset":
+        offset = 0
+    order = options.get("--reading-order", "r")
+    if SPLIT_MODE == "inert-order":
+        order = "r"
+    halves = ["right", "left"] if order == "r" else ["left", "right"]
+    members = [
+        (f"spread-001-{{index + 1}}.jpg", jpeg(TARGET, height, f"{{half}}+{{offset}}"))
+        for index, half in enumerate(halves)
+    ]
+
 with zipfile.ZipFile(output, "w") as archive:
-    for index in range(PAGES):
-        archive.writestr(f"page-{{index + 1:03d}}.jpg", jpeg(WIDTH, HEIGHT))
-print(f"{{PAGES}} page(s) written to {{output}}")
+    for name, data in members:
+        archive.writestr(name, data)
+print(f"{{len(members)}} page(s) written to {{output}}")
 '''
 
 
@@ -131,6 +194,25 @@ class FixtureTests(unittest.TestCase):
     def test_a_fixture_needs_at_least_one_page(self) -> None:
         with self.assertRaises(SmokeError):
             write_fixture(self.root / "empty.zip", pages=0)
+
+    def test_the_generated_spread_has_two_different_halves(self) -> None:
+        """The reversed-order assertion is only meaningful on an asymmetric page."""
+        data = png_spread(SPREAD_WIDTH, SPREAD_HEIGHT)
+        width, height, depth, colour = struct.unpack_from(">IIBB", data, 16)
+        self.assertEqual((width, height, depth, colour), (SPREAD_WIDTH, SPREAD_HEIGHT, 8, 2))
+        start = 16 + 13 + 4 + 8
+        pixels = zlib.decompress(data[start : start + struct.unpack_from(">I", data, start - 8)[0]])
+        stride = 1 + SPREAD_WIDTH * 3
+        self.assertEqual(len(pixels), SPREAD_HEIGHT * stride)
+        row = pixels[1:stride]
+        half = SPREAD_WIDTH // 2 * 3
+        self.assertNotEqual(row[:half], row[half:])
+
+    def test_a_spread_fixture_holds_one_landscape_page(self) -> None:
+        path = write_spread_fixture(self.root / "spread.zip")
+        with zipfile.ZipFile(path) as archive:
+            self.assertEqual(archive.namelist(), ["spread-001.png"])
+        self.assertGreater(SPREAD_WIDTH, SPREAD_HEIGHT)
 
 
 class JpegReadingTests(unittest.TestCase):
@@ -172,6 +254,9 @@ class BinarySmokeTests(unittest.TestCase):
             "width": DEFAULT_AUTO_WIDTH,
             "height": round(FIXTURE_HEIGHT * DEFAULT_AUTO_WIDTH / FIXTURE_WIDTH),
             "mode": "ok",
+            "split_mode": "ok",
+            "spread_width": SPREAD_WIDTH,
+            "target": DEFAULT_AUTO_WIDTH,
         }
         settings.update(overrides)
         path = self.root / f"stand-in-{len(list(self.root.iterdir()))}"
@@ -251,6 +336,41 @@ class BinarySmokeTests(unittest.TestCase):
         with self.assertRaises(release_assets.ReleaseError):
             smoke_binary(
                 self.root / "absent", version=VERSION, work_directory=self.work("absent")
+            )
+
+    def test_a_correct_binary_splits_the_spread(self) -> None:
+        summary = smoke_spread(self.stand_in(), work_directory=self.work("spread-ok"))
+        self.assertEqual(len(summary), 5)
+
+    def test_a_binary_that_leaves_the_spread_whole_fails(self) -> None:
+        """Ignoring --split is what a binary predating the feature does, and it exits 0."""
+        with self.assertRaises(SmokeError):
+            smoke_spread(
+                self.stand_in(split_mode="whole"),
+                work_directory=self.work("spread-whole"),
+            )
+
+    def test_a_binary_with_wrong_piece_geometry_fails(self) -> None:
+        with self.assertRaises(SmokeError):
+            smoke_spread(
+                self.stand_in(split_mode="geometry"),
+                work_directory=self.work("spread-geometry"),
+            )
+
+    def test_a_binary_that_ignores_the_reading_order_fails(self) -> None:
+        """An accepted-but-inert flag writes the two pieces in the same order every time."""
+        with self.assertRaises(SmokeError):
+            smoke_spread(
+                self.stand_in(split_mode="inert-order"),
+                work_directory=self.work("spread-order"),
+            )
+
+    def test_a_binary_that_ignores_the_split_offset_fails(self) -> None:
+        """--split-pos does not change piece dimensions, so only the pixels can catch it."""
+        with self.assertRaises(SmokeError):
+            smoke_spread(
+                self.stand_in(split_mode="inert-offset"),
+                work_directory=self.work("spread-offset"),
             )
 
 
