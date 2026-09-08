@@ -155,13 +155,15 @@ else:
     if SPLIT_MODE == "inert-order":
         order = "r"
     halves = ["right", "left"] if order == "r" else ["left", "right"]
-    offsets = [offset, offset]
+    offsets = {{half: offset for half in halves}}
     if SPLIT_MODE == "inert-offset":
-        offsets = [0, 0]
+        offsets = {{half: 0 for half in halves}}
     elif SPLIT_MODE == "one-side-offset":
-        offsets = [offset, 0]
+        # Bound to the physical side, not the output index: an offset that follows the
+        # reading order would trip the order check instead of the offset check.
+        offsets = {{"right": offset, "left": 0}}
     members = [
-        (f"spread-001-{{index + 1}}.jpg", jpeg(TARGET, height, f"{{half}}+{{offsets[index]}}"))
+        (f"spread-001-{{index + 1}}.jpg", jpeg(TARGET, height, f"{{half}}+{{offsets[half]}}"))
         for index, half in enumerate(halves)
     ]
 
@@ -216,9 +218,10 @@ class FixtureTests(unittest.TestCase):
         path = write_spread_fixture(self.root / "spread.zip")
         with zipfile.ZipFile(path) as archive:
             self.assertEqual(archive.namelist(), ["spread-001.png"])
-        aspect = SPREAD_WIDTH * 100 // SPREAD_HEIGHT
-        self.assertGreaterEqual(aspect, 105)
-        self.assertLessEqual(aspect, 160)
+        # Cross-multiplied, as `policy::is_spread` does. A floored percentage would admit
+        # 1.6005, which the binary refuses to split.
+        self.assertLessEqual(105 * SPREAD_HEIGHT, 100 * SPREAD_WIDTH)
+        self.assertLessEqual(100 * SPREAD_WIDTH, 160 * SPREAD_HEIGHT)
 
 
 class JpegReadingTests(unittest.TestCase):
