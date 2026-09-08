@@ -123,6 +123,12 @@
 //! most one encoded piece per worker, not another roughly 100 MB decoded working set. Even
 //! that saving depended on the bounded `done` channel and writer accepting the first piece.
 //!
+//! On the 95-spread corpus at 50%, peak RSS was 98.17 MB at `J = 1` and 784.83 MB at `J = 9`.
+//! Using the measured one-worker footprint as a conservative product gives 883.56 MB at nine.
+//! This is a sample calibration, not a JPEG allocation bound: the libjpeg term below remains
+//! uncharged. At fixed `J = 4`, 100 versus 1000 identical 2612x2004 spreads used 131.17 and
+//! 131.84 MB (1.0051x), producing 200 and 2000 pieces. Credits still count input entries.
+//!
 //! `retained` sits under both stages rather than on one side of the maximum, and that is what
 //! this shape corrects. The buffer is `fast_image_resize`'s two-pass scratch
 //! (`resizer.rs:418-422`), and it lives in the per-worker `Resizer` rather than in the call, so
